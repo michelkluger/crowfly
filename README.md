@@ -1,6 +1,7 @@
 # crowfly
 
-<img width="1769" height="1008" alt="image" src="https://github.com/user-attachments/assets/4498fd8f-f1f4-4f02-a874-3e05fa8abc8c" />
+<img width="1769" height="1008" alt="image" src="https://github.com/user-attachments/assets/9a8bbb5c-553c-4cb7-9af8-cb7262302c1f" />
+
 
 
 Plan and validate "as-the-crow-flies" crossings of a country — the
