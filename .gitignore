@@ -1,0 +1,18 @@
+# Rust build
+/target
+.claude/
+
+# Cached data (large + regenerated on demand)
+/osm-cache
+/elevation-cache
+
+# Outputs from CLI runs
+/out
+/out_*
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+*.swp

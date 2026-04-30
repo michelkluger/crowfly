@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>crowfly — route suggestions</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<style>
+  :root { --accent: #e63946; --accent-dark: #c81d2c; --side-w: 420px; }
+  * { box-sizing: border-box; }
+  body, html { margin: 0; height: 100%; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; left: 0; right: var(--side-w); }
+  #side {
+    position: absolute; top: 0; bottom: 0; right: 0; width: var(--side-w);
+    background: #fafafa; border-left: 1px solid #ddd;
+    display: flex; flex-direction: column; min-width: 0;
+  }
+  header { padding: 12px 14px; background: #fff; border-bottom: 1px solid #eee; }
+  header h2 { margin: 0 0 4px 0; font-size: 17px; }
+  header .sub { color: #666; font-size: 12px; }
+  .actions {
+    padding: 12px 14px; background: #fff; border-bottom: 1px solid #eee;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .actions button {
+    padding: 10px 12px; border: none; border-radius: 6px; cursor: pointer;
+    font-size: 13.5px; font-weight: 600;
+  }
+  .btn-primary { background: var(--accent); color: white; }
+  .btn-primary:hover { background: var(--accent-dark); }
+  .btn-primary:disabled { background: #d9d9d9; color: #888; cursor: not-allowed; }
+  .btn-secondary { background: #2a8fe8; color: white; }
+  .btn-secondary:hover { background: #1670c4; }
+  .btn-cancel { background: #555; color: white; }
+  .btn-cancel:hover { background: #333; }
+  .btn-ghost {
+    background: transparent; color: #555; border: 1px solid #ccc !important;
+    padding: 6px 10px !important; font-weight: 500 !important;
+  }
+  .options {
+    padding: 8px 14px; background: #fff; border-bottom: 1px solid #eee;
+    font-size: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px;
+  }
+  .options label { display: flex; align-items: center; gap: 6px; color: #555; }
+  .options input[type="number"] { width: 70px; padding: 2px 4px; }
+  .points-row { display: flex; gap: 8px; align-items: center; font-size: 12px; color: #444; }
+  .pin {
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid white; box-shadow: 0 0 0 1px #333;
+  }
+  .pin.A { background: #2a8fe8; }
+  .pin.B { background: #e63946; }
+  #cards { flex: 1; overflow: auto; padding: 10px 12px; min-width: 0; }
+  .empty { color: #888; text-align: center; padding: 30px 12px; font-size: 13px; }
+  .card {
+    background: #fff; border: 1px solid #e3e3e3; border-radius: 6px;
+    padding: 10px 12px; margin-bottom: 10px; cursor: pointer;
+    transition: box-shadow .15s, border-color .15s;
+  }
+  .card:hover { border-color: #bcd2ff; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
+  .card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(230,57,70,0.18); }
+  .card .hd { font-size: 14px; }
+  .card .hd .score { color: #888; float: right; font-size: 12px; }
+  .card .row { color: #333; margin: 4px 0 6px 0; font-size: 12.5px; }
+  .bar-wrap { margin: 6px 0; }
+  .bar { display: flex; height: 10px; border-radius: 3px; overflow: hidden; background: #eee; }
+  .bar .seg { display: block; height: 100%; }
+  .swlegend { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 11px;
+              color: #555; margin-top: 4px; }
+  .swlegend span.sw { display:inline-block; width:10px; height:10px;
+                      margin-right:4px; vertical-align:middle; border-radius:2px; }
+  .elev-row { display: flex; gap: 12px; color: #555; font-size: 11.5px; margin-top: 6px; }
+  .spark { display: block; width: 100%; height: 50px; }
+  .actions-card { display: flex; gap: 6px; margin-top: 8px; }
+  .actions-card button {
+    flex: 1; padding: 4px 8px; border-radius: 4px; cursor: pointer;
+    border: 1px solid #ccc; background: #f6f6f6; font-size: 12px;
+  }
+  .actions-card button:hover { background: #ececec; }
+  .actions-card button.dl { background: var(--accent); color: white; border-color: var(--accent); }
+  .actions-card button.dl:hover { background: var(--accent-dark); }
+  .basemap { padding: 6px 14px; background: #fff; border-bottom: 1px solid #eee; font-size: 12px; }
+  .basemap label { margin-right: 10px; cursor: pointer; }
+  details.help { padding: 6px 14px 12px 14px; background: #fff; border-bottom: 1px solid #eee; font-size: 12px; color: #444; }
+  details.help summary { cursor: pointer; color: #2a8fe8; user-select: none; padding: 2px 0; }
+  details.help summary:hover { color: #1670c4; }
+  details.help dl { margin: 8px 0 0 0; }
+  details.help dt { font-weight: 600; color: #222; margin-top: 6px; }
+  details.help dd { margin: 2px 0 0 0; line-height: 1.45; }
+  .status {
+    padding: 8px 14px; font-size: 12px; color: #666; background: #fff;
+    border-top: 1px solid #eee;
+  }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid #ddd; border-top-color: var(--accent);
+    animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .swatches { display: flex; gap: 8px; font-size: 11px; color: #666; margin-top: 4px; }
+  .swatches span { display: inline-flex; align-items: center; gap: 4px; }
+  .swatches i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="side">
+  <header>
+    <h2>crowfly</h2>
+    <div class="sub">click two points → alternatives, or sample diverse lines across the country</div>
+  </header>
+  <div class="basemap">
+    <b>Basemap:</b>
+    <label><input type="radio" name="bm" value="voyager" checked> street</label>
+    <label><input type="radio" name="bm" value="topo"> terrain</label>
+  </div>
+  <div class="actions">
+    <div class="points-row">
+      <span class="pin A"></span><span id="lblA">A: click on map</span>
+      <span style="flex:1"></span>
+      <button class="btn-ghost" id="clearAB">clear A/B</button>
+    </div>
+    <div class="points-row">
+      <span class="pin B"></span><span id="lblB">B: click on map</span>
+    </div>
+    <button class="btn-primary" id="btnBetween" disabled>Find routes between A and B</button>
+    <button class="btn-secondary" id="btnCountry">Suggest routes across the country</button>
+    <button class="btn-cancel" id="btnCancel" style="display:none;">⨯ Cancel</button>
+  </div>
+  <div class="options">
+    <label title="Width of the band the route may stay within. Wider = more leeway around lakes/peaks; narrower = stricter 'straight line' rule.">
+      corridor (m) <input type="number" id="optWidth" value="8000" step="500" min="500"></label>
+    <label title="Which transport modes are allowed. The corresponding OSM ways are kept in the graph (paved roads, gravel tracks, MTB paths, etc.).">
+      modes
+      <select id="optModes">
+        <option value="foot,bike" selected>foot+bike</option>
+        <option value="foot">foot only</option>
+        <option value="bike">bike only</option>
+        <option value="bike,mtb">bike+mtb</option>
+        <option value="foot,bike,mtb">foot+bike+mtb</option>
+      </select>
+    </label>
+    <label title="How many top suggestions to keep after dedup. Country mode oversamples ~6× this number internally before ranking.">
+      candidates <input type="number" id="optCount" value="8" min="1" max="40"></label>
+    <label title="Number of points to sample along each route for the elevation profile. 0 disables the elevation lookup. More = smoother profile but more API calls.">
+      elevation pts <input type="number" id="optElev" value="30" min="0" max="100"></label>
+    <label title="Minimum great-circle distance (km) for country-mode candidate lines.">
+      distance min km <input type="number" id="optDmin" value="100" step="10"></label>
+    <label title="Maximum great-circle distance (km) for country-mode candidate lines. Switzerland's NW–SE diagonal is ~360 km.">
+      distance max km <input type="number" id="optDmax" value="220" step="10"></label>
+    <label style="grid-column: span 2;" title="Only sample lines whose start AND end land inside the border strip, on different sides — guarantees the line crosses the country.">
+      <input type="checkbox" id="optBorder">
+      border-to-border only (endpoints near opposite edges)
+    </label>
+    <label title="Width of the strip near each bbox edge that counts as 'border'. Larger = more flexibility on where endpoints can land.">
+      border strip km <input type="number" id="optStrip" value="25" min="5" max="100" step="5"></label>
+  </div>
+  <details class="help">
+    <summary>What do these parameters mean?</summary>
+    <dl>
+      <dt>corridor (m)</dt>
+      <dd>Total width of the corridor around the great-circle line A→B. The router pays a quadratic penalty for straying off the line, scaled to the corridor. <b>Smaller</b> = the route hugs the line tightly (and may fail in mountains). <b>Larger</b> = the router is allowed to detour further to find a viable path. Try 5 km for a strict line, 8–15 km for a doable one.</dd>
+      <dt>modes</dt>
+      <dd>Which OSM ways the router is allowed to use. <b>foot</b> includes paths and footways; <b>bike</b> wants surfaces a road bike tolerates; <b>mtb</b> opens up rough singletrack. Combinations widen the graph.</dd>
+      <dt>candidates</dt>
+      <dd>How many top suggestions to keep after scoring + deduplication. Country mode generates ~6× this number internally, then prunes near-duplicates so the cards you see are visually distinct lines.</dd>
+      <dt>elevation pts</dt>
+      <dd>Samples taken along each route for the elevation chart. 0 skips the lookup entirely (faster). Each batch of up to 100 points is one HTTP call to OpenTopoData (rate-limited to ~1/sec, so high values × many candidates = slower).</dd>
+      <dt>distance min/max km</dt>
+      <dd>Length range for country-mode candidate lines. The straight-line distance between start and end must fall in this band. Doesn't apply to "between A and B" mode.</dd>
+      <dt>border-to-border only</dt>
+      <dd>When ticked, country mode only proposes lines whose <i>start</i> and <i>end</i> both land in a strip near the country's bbox edges, on <i>different</i> sides — so every suggestion is a true country traversal. Set distance max generously (Switzerland's diagonal is ~360 km).</dd>
+      <dt>border strip km</dt>
+      <dd>How wide the "border strip" is. 25 km gives the sampler room to find graph nodes near the edge; smaller values force more extreme corner-to-corner candidates.</dd>
+      <dt>(internal) alpha</dt>
+      <dd>For "between A and B", the server runs A* with three different α values (0.5, 4, 12) to give qualitatively different alternatives — loose, balanced, strict.</dd>
+      <dt>(internal) score</dt>
+      <dd>Lower is easier. score = 100·(real_km/ref_km−1) + 5·long-edge km + 8·max-deviation km. Detour ratio dominates; long edges penalise unavoidable lake/glacier hops; max deviation flags lines that bulge wide.</dd>
+    </dl>
+  </details>
+  <div id="cards"><div class="empty">Pick endpoints or click <b>"Suggest routes across the country"</b> to see suggestions.</div></div>
+  <div class="status" id="status">graph: loading…</div>
+</div>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const SURFACE_COLORS = {
+  paved: '#444444', gravel: '#c9a64f', path: '#6aa84f',
+  unpaved: '#8b4513', other: '#888888', ferry: '#2a8fe8'
+};
+let A = null, B = null, results = [], activeRank = 1, info = null;
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: {
+    version: 8,
+    sources: {
+      voyager: {
+        type: 'raster',
+        tiles: ['https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
+                'https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
+                'https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
+                'https://d.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png'],
+        tileSize: 256, maxzoom: 19,
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+      },
+      topo: {
+        type: 'raster',
+        tiles: ['https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
+                'https://b.tile.opentopomap.org/{z}/{x}/{y}.png',
+                'https://c.tile.opentopomap.org/{z}/{x}/{y}.png'],
+        tileSize: 256, maxzoom: 17,
+        attribution: 'Map data &copy; OpenStreetMap contributors, SRTM | &copy; OpenTopoMap (CC-BY-SA)'
+      }
+    },
+    layers: [
+      { id: 'bm-voyager', type: 'raster', source: 'voyager', layout: { visibility: 'visible' } },
+      { id: 'bm-topo',    type: 'raster', source: 'topo',    layout: { visibility: 'none' } }
+    ]
+  },
+  center: [8.2, 46.8], zoom: 7
+});
+
+document.querySelectorAll('input[name="bm"]').forEach(r => {
+  r.addEventListener('change', () => {
+    const v = r.value;
+    map.setLayoutProperty('bm-voyager', 'visibility', v === 'voyager' ? 'visible' : 'none');
+    map.setLayoutProperty('bm-topo',    'visibility', v === 'topo'    ? 'visible' : 'none');
+  });
+});
+
+function setStatus(html) { document.getElementById('status').innerHTML = html; }
+function fmtPt(p) { return `${p[1].toFixed(4)}, ${p[0].toFixed(4)}`; }
+function fmtAB() {
+  document.getElementById('lblA').textContent = A ? 'A: ' + fmtPt(A) : 'A: click on map';
+  document.getElementById('lblB').textContent = B ? 'B: ' + fmtPt(B) : 'B: click on map';
+  document.getElementById('btnBetween').disabled = !(A && B);
+}
+
+const markerA = new maplibregl.Marker({ color: '#2a8fe8' });
+const markerB = new maplibregl.Marker({ color: '#e63946' });
+
+map.on('load', async () => {
+  // Empty data source for results.
+  map.addSource('routes', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addLayer({
+    id: 'routes-line', type: 'line', source: 'routes',
+    paint: {
+      'line-color': ['case', ['==', ['get', 'rank'], 1], '#e63946', '#f4a261'],
+      'line-width': ['case', ['==', ['get', 'rank'], 1], 5, 2.5],
+      'line-opacity': ['interpolate', ['linear'], ['get', 'rank'], 1, 1.0, 20, 0.4]
+    }
+  });
+  map.addLayer({
+    id: 'routes-end', type: 'circle', source: 'routes',
+    filter: ['==', ['geometry-type'], 'Point'],
+    paint: {
+      'circle-color': ['case', ['==', ['get', 'rank'], 1], '#e63946', '#f4a261'],
+      'circle-radius': ['case', ['==', ['get', 'rank'], 1], 6, 4],
+      'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5
+    }
+  });
+
+  try {
+    const r = await fetch('/api/info');
+    info = await r.json();
+    if (info.bbox) {
+      map.fitBounds([[info.bbox[0], info.bbox[1]], [info.bbox[2], info.bbox[3]]],
+                    { padding: 30, duration: 0 });
+    }
+    setStatus(`graph ready — ${info.graph_nodes.toLocaleString()} nodes`);
+  } catch (e) {
+    setStatus('failed to load /api/info');
+  }
+});
+
+map.on('click', (e) => {
+  const p = [e.lngLat.lng, e.lngLat.lat];
+  if (!A) { A = p; markerA.setLngLat(p).addTo(map); }
+  else if (!B) { B = p; markerB.setLngLat(p).addTo(map); }
+  else {
+    // Cycle: replace whichever is older.
+    A = B; B = p;
+    markerA.setLngLat(A); markerB.setLngLat(B);
+  }
+  fmtAB();
+});
+
+document.getElementById('clearAB').addEventListener('click', () => {
+  A = null; B = null;
+  markerA.remove(); markerB.remove();
+  fmtAB();
+});
+
+function commonPayload() {
+  return {
+    width_m: +document.getElementById('optWidth').value,
+    modes: document.getElementById('optModes').value,
+    elevation_samples: +document.getElementById('optElev').value,
+  };
+}
+
+let inFlight = null;
+async function postJson(path, body) {
+  if (inFlight) inFlight.abort();
+  const ac = new AbortController();
+  inFlight = ac;
+  setBusy(true);
+  try {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), signal: ac.signal
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({ error: 'request failed' }));
+      throw new Error(j.error || ('HTTP ' + r.status));
+    }
+    return await r.json();
+  } finally {
+    if (inFlight === ac) {
+      inFlight = null;
+      setBusy(false);
+    }
+  }
+}
+
+function setBusy(busy) {
+  document.getElementById('btnBetween').disabled = busy || !(A && B);
+  document.getElementById('btnCountry').disabled = busy;
+  document.getElementById('btnCancel').style.display = busy ? '' : 'none';
+}
+
+document.getElementById('btnCancel').addEventListener('click', () => {
+  if (inFlight) {
+    inFlight.abort();
+    setStatus('cancelled');
+    document.getElementById('cards').innerHTML = '<div class="empty">cancelled</div>';
+  }
+});
+
+function isAbort(e) { return e && (e.name === 'AbortError' || e.message === 'cancelled'); }
+
+document.getElementById('btnBetween').addEventListener('click', async () => {
+  if (!A || !B) return;
+  setStatus('<span class="spinner"></span> finding alternatives between A and B…');
+  document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
+  try {
+    const j = await postJson('/api/between', {
+      ...commonPayload(),
+      start: [A[1], A[0]],
+      end:   [B[1], B[0]],
+      alternatives: +document.getElementById('optCount').value,
+    });
+    renderResults(j.results);
+    setStatus(`got ${j.results.length} alternatives`);
+  } catch (e) {
+    if (isAbort(e)) return;
+    setStatus('error: ' + e.message);
+    document.getElementById('cards').innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+});
+
+document.getElementById('btnCountry').addEventListener('click', async () => {
+  setStatus('<span class="spinner"></span> sampling diverse country-wide lines…');
+  document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
+  try {
+    const j = await postJson('/api/country', {
+      ...commonPayload(),
+      count: +document.getElementById('optCount').value,
+      distance_min_km: +document.getElementById('optDmin').value,
+      distance_max_km: +document.getElementById('optDmax').value,
+      border_to_border: document.getElementById('optBorder').checked,
+      border_strip_km: +document.getElementById('optStrip').value,
+    });
+    renderResults(j.results);
+    setStatus(`got ${j.results.length} country-wide suggestions`);
+  } catch (e) {
+    if (isAbort(e)) return;
+    setStatus('error: ' + e.message);
+    document.getElementById('cards').innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+});
+
+function renderResults(rs) {
+  results = rs;
+  // Build GeoJSON.
+  const feats = [];
+  for (const r of rs) {
+    feats.push({
+      type: 'Feature',
+      properties: { rank: r.rank },
+      geometry: { type: 'LineString', coordinates: r.coords }
+    });
+    feats.push({
+      type: 'Feature',
+      properties: { rank: r.rank, kind: 'end' },
+      geometry: { type: 'Point', coordinates: r.end }
+    });
+    feats.push({
+      type: 'Feature',
+      properties: { rank: r.rank, kind: 'start' },
+      geometry: { type: 'Point', coordinates: r.start }
+    });
+  }
+  map.getSource('routes').setData({ type: 'FeatureCollection', features: feats });
+  document.getElementById('cards').innerHTML = rs.length
+    ? rs.map(cardHtml).join('')
+    : '<div class="empty">no viable routes — relax the corridor or modes</div>';
+  // Wire card events.
+  document.querySelectorAll('.card').forEach(card => {
+    const rank = +card.dataset.rank;
+    card.addEventListener('click', (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      selectRank(rank);
+    });
+    card.querySelector('.dl').addEventListener('click', (e) => {
+      e.stopPropagation();
+      downloadGpx(rank);
+    });
+    card.querySelector('.view').addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectRank(rank);
+    });
+  });
+  // Fit map to all results.
+  if (rs.length) {
+    const b = new maplibregl.LngLatBounds();
+    rs.forEach(r => r.coords.forEach(c => b.extend(c)));
+    map.fitBounds(b, { padding: 60, duration: 700 });
+    selectRank(1);
+  }
+}
+
+function cardHtml(r) {
+  const detour = r.ref_km > 0 ? (100 * (r.real_km / r.ref_km - 1)) : 0;
+  const surfaceTotal = r.surface.reduce((a, x) => a + x.km, 0) || 1;
+  const segs = r.surface.map(s =>
+    `<span class="seg" title="${s.label} ${s.km.toFixed(1)} km" style="width:${(100*s.km/surfaceTotal).toFixed(2)}%;background:${SURFACE_COLORS[s.label]||'#888'}"></span>`
+  ).join('');
+  let elev = '';
+  if (r.elevation && r.elevation.samples_m && r.elevation.samples_m.length > 1) {
+    const e = r.elevation;
+    elev = `<div class="elev-row"><span>↗ ${Math.round(e.ascent_m)} m</span>` +
+           `<span>↘ ${Math.round(e.descent_m)} m</span>` +
+           `<span>max ${Math.round(e.max_m)} m</span>` +
+           `<span>min ${Math.round(e.min_m)} m</span></div>` +
+           sparklineSvg(e.samples_m, 360, 50);
+  }
+  const ferryTxt = r.ferry_km > 0.05 ? ` · ferry ${r.ferry_km.toFixed(1)} km` : '';
+  return `<div class="card" data-rank="${r.rank}">
+    <div class="hd"><b>#${r.rank}</b> &nbsp; ${Math.round(r.bearing_deg)}°
+      <span class="score">score ${r.score.toFixed(1)}</span></div>
+    <div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
+      (${detour>=0?'+':''}${detour.toFixed(0)}%) · max dev ${Math.round(r.max_dev_m)} m${ferryTxt}</div>
+    <div class="bar-wrap"><div class="bar">${segs}</div></div>
+    <div class="swatches">
+      ${r.surface.map(s => `<span><i style="background:${SURFACE_COLORS[s.label]||'#888'}"></i>${s.label} ${s.km.toFixed(1)}</span>`).join('')}
+    </div>
+    ${elev}
+    <div class="actions-card"><button class="view">view</button>
+      <button class="dl">⬇ GPX</button></div>
+  </div>`;
+}
+
+function sparklineSvg(samples, w, h) {
+  const n = samples.length;
+  let mn = Infinity, mx = -Infinity;
+  for (const s of samples) { if (s < mn) mn = s; if (s > mx) mx = s; }
+  const span = Math.max(1, mx - mn);
+  const xs = samples.map((_, i) => i / (n - 1) * w);
+  const ys = samples.map(s => h - ((s - mn) / span) * (h - 4) - 2);
+  const pts = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ');
+  let area = `M${xs[0].toFixed(1)},${h} `;
+  for (let i = 0; i < n; i++) area += `L${xs[i].toFixed(1)},${ys[i].toFixed(1)} `;
+  area += `L${xs[n-1].toFixed(1)},${h} Z`;
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"
+    xmlns="http://www.w3.org/2000/svg">
+    <path d="${area}" fill="rgba(230,57,70,0.18)"/>
+    <polyline points="${pts}" fill="none" stroke="#e63946" stroke-width="1.6"/>
+    </svg>`;
+}
+
+function selectRank(rank) {
+  activeRank = rank;
+  document.querySelectorAll('.card').forEach(c =>
+    c.classList.toggle('active', +c.dataset.rank === rank));
+  if (map.getLayer('routes-line')) {
+    map.setPaintProperty('routes-line', 'line-color',
+      ['case', ['==', ['get', 'rank'], rank], '#e63946', '#f4a261']);
+    map.setPaintProperty('routes-line', 'line-width',
+      ['case', ['==', ['get', 'rank'], rank], 5, 2.5]);
+    map.setPaintProperty('routes-end', 'circle-color',
+      ['case', ['==', ['get', 'rank'], rank], '#e63946', '#f4a261']);
+    map.setPaintProperty('routes-end', 'circle-radius',
+      ['case', ['==', ['get', 'rank'], rank], 6, 4]);
+  }
+  const r = results.find(x => x.rank === rank);
+  if (r) {
+    const b = new maplibregl.LngLatBounds();
+    r.coords.forEach(c => b.extend(c));
+    map.fitBounds(b, { padding: 80, duration: 700 });
+  }
+}
+
+function downloadGpx(rank) {
+  const r = results.find(x => x.rank === rank);
+  if (!r) return;
+  const pts = r.coords.map(c =>
+    `    <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
+  ).join('\n');
+  const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="crowfly" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>rank ${rank}</name></metadata>
+  <trk><name>rank ${rank}</name><trkseg>
+${pts}
+  </trkseg></trk>
+</gpx>
+`;
+  const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `rank${rank}.gpx`; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 500);
+}
+
+fmtAB();
+</script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+[package]
+name = "crowfly"
+version = "0.1.0"
+edition = "2021"
+description = "Plan and validate straight-line crossings of a country: corridor + OSM-based routing + suggestions web app."
+license = "MIT"
+repository = "https://github.com/"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+geo = "0.28"
+indicatif = "0.17"
+osmpbfreader = "0.16"
+petgraph = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+rand = "0.8"
+rayon = "1"
+rstar = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
