@@ -1,5 +1,8 @@
 # crowfly
 
+<img width="1769" height="1008" alt="image" src="https://github.com/user-attachments/assets/4498fd8f-f1f4-4f02-a874-3e05fa8abc8c" />
+
+
 Plan and validate "as-the-crow-flies" crossings of a country — the
 [Project Azimut Nord](https://www.strava.com/activities/14070438269) idea
 (start at point A, end at point B, stay inside a 5–10 km corridor the whole
