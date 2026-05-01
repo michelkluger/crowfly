@@ -96,6 +96,18 @@
     animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-row {
+    padding: 0 14px 8px 14px; background: #fff; font-size: 11px; color: #666;
+    border-top: 1px solid #eee;
+  }
+  .progress-row progress {
+    width: 100%; height: 8px; appearance: none; -webkit-appearance: none;
+    border: none; border-radius: 4px; background: #eee; margin-top: 4px;
+  }
+  .progress-row progress::-webkit-progress-bar { background: #eee; border-radius: 4px; }
+  .progress-row progress::-webkit-progress-value { background: var(--accent); border-radius: 4px; }
+  .progress-row progress::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
+  .progress-row.hidden { display: none; }
   .swatches { display: flex; gap: 8px; font-size: 11px; color: #666; margin-top: 4px; }
   .swatches span { display: inline-flex; align-items: center; gap: 4px; }
   .swatches i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
@@ -147,6 +159,12 @@
       distance min km <input type="number" id="optDmin" value="100" step="10"></label>
     <label title="Maximum great-circle distance (km) for country-mode candidate lines. Switzerland's NW–SE diagonal is ~360 km.">
       distance max km <input type="number" id="optDmax" value="220" step="10"></label>
+    <label title="Country mode keeps generating new candidate batches until at least this many viable routes are found, up to 4 batches total. Defaults to `candidates`.">
+      min viable <input type="number" id="optMinViable" value="" min="0" placeholder="= candidates"></label>
+    <label style="grid-column: span 2;" title="Restrict routing to paved surfaces (asphalt, concrete, paving stones). Excludes gravel, paths, unpaved tracks, and ferries — useful for road bikes.">
+      <input type="checkbox" id="optPaved">
+      paved roads only
+    </label>
     <label style="grid-column: span 2;" title="Only sample lines whose start AND end land inside the border strip, on different sides — guarantees the line crosses the country.">
       <input type="checkbox" id="optBorder">
       border-to-border only (endpoints near opposite edges)
@@ -178,6 +196,10 @@
     </dl>
   </details>
   <div id="cards"><div class="empty">Pick endpoints or click <b>"Suggest routes across the country"</b> to see suggestions.</div></div>
+  <div class="progress-row hidden" id="progressRow">
+    <div id="progressLabel">searching…</div>
+    <progress id="progressBar" value="0" max="1"></progress>
+  </div>
   <div class="status" id="status">graph: loading…</div>
 </div>
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
@@ -239,10 +261,53 @@ const markerA = new maplibregl.Marker({ color: '#2a8fe8' });
 const markerB = new maplibregl.Marker({ color: '#e63946' });
 
 map.on('load', async () => {
-  // Empty data source for results.
+  // Corridor polygon source — one polygon per ranked route, only the active
+  // one is visible. Added before route lines so the line draws on top.
+  map.addSource('corridors', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addLayer({
+    id: 'corridor-fill', type: 'fill', source: 'corridors',
+    filter: ['==', ['get', 'rank'], 1],
+    paint: {
+      'fill-color': '#e63946',
+      'fill-opacity': 0.08,
+      'fill-outline-color': '#e63946'
+    }
+  });
+  map.addLayer({
+    id: 'corridor-outline', type: 'line', source: 'corridors',
+    filter: ['==', ['get', 'rank'], 1],
+    paint: {
+      'line-color': '#e63946',
+      'line-width': 1,
+      'line-opacity': 0.45,
+      'line-dasharray': [2, 2]
+    }
+  });
+  // Reference (great-circle) line A→B for the active route — drawn under the
+  // routed path so the deviation between intent and reality is visible.
+  map.addSource('reference', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addLayer({
+    id: 'reference-line', type: 'line', source: 'reference',
+    filter: ['==', ['get', 'rank'], 1],
+    paint: {
+      'line-color': '#888',
+      'line-width': 1.5,
+      'line-dasharray': [4, 3],
+      'line-opacity': 0.8
+    }
+  });
+  // Route lines + endpoint dots.
   map.addSource('routes', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  // Wide, transparent halo to give clicks generous tolerance even when the
+  // visible line is thin. Drawn under the visible line.
+  map.addLayer({
+    id: 'routes-hit', type: 'line', source: 'routes',
+    filter: ['==', ['geometry-type'], 'LineString'],
+    paint: { 'line-color': '#000', 'line-width': 18, 'line-opacity': 0 }
+  });
   map.addLayer({
     id: 'routes-line', type: 'line', source: 'routes',
+    filter: ['==', ['geometry-type'], 'LineString'],
     paint: {
       'line-color': ['case', ['==', ['get', 'rank'], 1], '#e63946', '#f4a261'],
       'line-width': ['case', ['==', ['get', 'rank'], 1], 5, 2.5],
@@ -251,13 +316,31 @@ map.on('load', async () => {
   });
   map.addLayer({
     id: 'routes-end', type: 'circle', source: 'routes',
-    filter: ['==', ['geometry-type'], 'Point'],
+    filter: ['all', ['==', ['geometry-type'], 'Point'], ['!=', ['get', 'kind'], 'snap']],
     paint: {
       'circle-color': ['case', ['==', ['get', 'rank'], 1], '#e63946', '#f4a261'],
       'circle-radius': ['case', ['==', ['get', 'rank'], 1], 6, 4],
       'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5
     }
   });
+  // "Snap dots": small white-ringed dots showing where the router actually
+  // started/ended after snapping the requested A/B to the nearest graph node.
+  // Only emitted when the snap displacement is large enough to be informative.
+  map.addLayer({
+    id: 'snap-line', type: 'line', source: 'routes',
+    filter: ['==', ['get', 'kind'], 'snap-leg'],
+    paint: { 'line-color': '#222', 'line-width': 1, 'line-dasharray': [2, 2], 'line-opacity': 0.6 }
+  });
+  map.addLayer({
+    id: 'snap-dot', type: 'circle', source: 'routes',
+    filter: ['==', ['get', 'kind'], 'snap'],
+    paint: {
+      'circle-color': '#222', 'circle-radius': 3.5,
+      'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5
+    }
+  });
+  map.on('mousemove', 'routes-hit', () => { map.getCanvas().style.cursor = 'pointer'; });
+  map.on('mouseleave', 'routes-hit', () => { map.getCanvas().style.cursor = ''; });
 
   try {
     const r = await fetch('/api/info');
@@ -273,6 +356,19 @@ map.on('load', async () => {
 });
 
 map.on('click', (e) => {
+  // If the click landed on (or near) a route line, treat it as "select that
+  // route" instead of placing an A/B marker. The invisible 'routes-hit' layer
+  // is 18 px wide so even thin background routes are clickable.
+  if (map.getLayer('routes-hit')) {
+    const hits = map.queryRenderedFeatures(e.point, { layers: ['routes-hit'] });
+    if (hits.length > 0) {
+      // If multiple routes overlap at the click, prefer the one whose
+      // rendered line is closest (lower rank → bolder, more likely intended).
+      hits.sort((x, y) => (+x.properties.rank) - (+y.properties.rank));
+      selectRank(+hits[0].properties.rank);
+      return;
+    }
+  }
   const p = [e.lngLat.lng, e.lngLat.lat];
   if (!A) { A = p; markerA.setLngLat(p).addTo(map); }
   else if (!B) { B = p; markerB.setLngLat(p).addTo(map); }
@@ -295,10 +391,76 @@ function commonPayload() {
     width_m: +document.getElementById('optWidth').value,
     modes: document.getElementById('optModes').value,
     elevation_samples: +document.getElementById('optElev').value,
+    paved_only: document.getElementById('optPaved').checked,
   };
 }
 
+// Persist all sidebar inputs to localStorage so a refresh keeps the user's
+// last-used corridor / modes / distance / etc. The schema is just `id ↦ value`
+// over every input/select inside `.options`.
+const PARAM_IDS = [
+  'optWidth','optModes','optCount','optElev','optDmin','optDmax',
+  'optBorder','optStrip','optMinViable','optPaved',
+];
+function loadParams() {
+  try {
+    const raw = localStorage.getItem('crowfly:params');
+    if (!raw) return;
+    const v = JSON.parse(raw);
+    for (const id of PARAM_IDS) {
+      const el = document.getElementById(id);
+      if (!el || !(id in v)) continue;
+      if (el.type === 'checkbox') el.checked = !!v[id];
+      else el.value = v[id];
+    }
+  } catch (_) { /* ignore corrupt state */ }
+}
+function saveParams() {
+  const v = {};
+  for (const id of PARAM_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    v[id] = el.type === 'checkbox' ? el.checked : el.value;
+  }
+  try { localStorage.setItem('crowfly:params', JSON.stringify(v)); } catch (_) {}
+}
+loadParams();
+for (const id of PARAM_IDS) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', saveParams);
+}
+
 let inFlight = null;
+let progressTimer = null;
+function showProgress(label) {
+  document.getElementById('progressRow').classList.remove('hidden');
+  document.getElementById('progressLabel').textContent = label;
+  const bar = document.getElementById('progressBar');
+  bar.removeAttribute('value');
+  bar.max = 1;
+}
+function hideProgress() {
+  document.getElementById('progressRow').classList.add('hidden');
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
+function startProgressPoll() {
+  if (progressTimer) clearInterval(progressTimer);
+  const startedAt = performance.now();
+  progressTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/progress').then(r => r.json());
+      if (!r.active) return;
+      const bar = document.getElementById('progressBar');
+      const elapsed = ((performance.now() - startedAt) / 1000).toFixed(0);
+      if (r.total > 0) {
+        bar.max = r.total;
+        bar.value = r.done;
+        document.getElementById('progressLabel').textContent =
+          `${r.kind === 'country' ? 'evaluating candidates' : 'finding alternatives'}: ${r.done}/${r.total} · ${elapsed}s`;
+      }
+    } catch (_) { /* ignore poll failures */ }
+  }, 400);
+}
 async function postJson(path, body) {
   if (inFlight) inFlight.abort();
   const ac = new AbortController();
@@ -319,6 +481,7 @@ async function postJson(path, body) {
       inFlight = null;
       setBusy(false);
     }
+    hideProgress();
   }
 }
 
@@ -333,6 +496,7 @@ document.getElementById('btnCancel').addEventListener('click', () => {
     inFlight.abort();
     setStatus('cancelled');
     document.getElementById('cards').innerHTML = '<div class="empty">cancelled</div>';
+    hideProgress();
   }
 });
 
@@ -342,6 +506,8 @@ document.getElementById('btnBetween').addEventListener('click', async () => {
   if (!A || !B) return;
   setStatus('<span class="spinner"></span> finding alternatives between A and B…');
   document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
+  showProgress('finding alternatives…');
+  startProgressPoll();
   try {
     const j = await postJson('/api/between', {
       ...commonPayload(),
@@ -361,7 +527,10 @@ document.getElementById('btnBetween').addEventListener('click', async () => {
 document.getElementById('btnCountry').addEventListener('click', async () => {
   setStatus('<span class="spinner"></span> sampling diverse country-wide lines…');
   document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
+  showProgress('preparing candidates…');
+  startProgressPoll();
   try {
+    const minViableRaw = document.getElementById('optMinViable').value.trim();
     const j = await postJson('/api/country', {
       ...commonPayload(),
       count: +document.getElementById('optCount').value,
@@ -369,6 +538,7 @@ document.getElementById('btnCountry').addEventListener('click', async () => {
       distance_max_km: +document.getElementById('optDmax').value,
       border_to_border: document.getElementById('optBorder').checked,
       border_strip_km: +document.getElementById('optStrip').value,
+      ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
     });
     renderResults(j.results);
     setStatus(`got ${j.results.length} country-wide suggestions`);
@@ -379,10 +549,21 @@ document.getElementById('btnCountry').addEventListener('click', async () => {
   }
 });
 
+function haversineMeters(a, b) {
+  const R = 6371008.8;
+  const toRad = d => d * Math.PI / 180;
+  const phi1 = toRad(a[1]); const phi2 = toRad(b[1]);
+  const dphi = toRad(b[1] - a[1]); const dlam = toRad(b[0] - a[0]);
+  const h = Math.sin(dphi/2)**2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlam/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 function renderResults(rs) {
   results = rs;
   // Build GeoJSON.
   const feats = [];
+  const corridorFeats = [];
+  const refFeats = [];
   for (const r of rs) {
     feats.push({
       type: 'Feature',
@@ -399,8 +580,49 @@ function renderResults(rs) {
       properties: { rank: r.rank, kind: 'start' },
       geometry: { type: 'Point', coordinates: r.start }
     });
+    // Snap-displacement indicators: the router started/ended at coords[0] /
+    // coords[last], not at the requested r.start / r.end. Show only when the
+    // gap is larger than 50 m so we don't clutter the map for clean snaps.
+    if (r.coords.length >= 2) {
+      const snapStart = r.coords[0];
+      const snapEnd = r.coords[r.coords.length - 1];
+      if (haversineMeters(r.start, snapStart) > 50) {
+        feats.push({
+          type: 'Feature', properties: { rank: r.rank, kind: 'snap' },
+          geometry: { type: 'Point', coordinates: snapStart }
+        });
+        feats.push({
+          type: 'Feature', properties: { rank: r.rank, kind: 'snap-leg' },
+          geometry: { type: 'LineString', coordinates: [r.start, snapStart] }
+        });
+      }
+      if (haversineMeters(r.end, snapEnd) > 50) {
+        feats.push({
+          type: 'Feature', properties: { rank: r.rank, kind: 'snap' },
+          geometry: { type: 'Point', coordinates: snapEnd }
+        });
+        feats.push({
+          type: 'Feature', properties: { rank: r.rank, kind: 'snap-leg' },
+          geometry: { type: 'LineString', coordinates: [r.end, snapEnd] }
+        });
+      }
+    }
+    if (r.corridor && r.corridor.length >= 4) {
+      corridorFeats.push({
+        type: 'Feature',
+        properties: { rank: r.rank },
+        geometry: { type: 'Polygon', coordinates: [r.corridor] }
+      });
+    }
+    refFeats.push({
+      type: 'Feature',
+      properties: { rank: r.rank },
+      geometry: { type: 'LineString', coordinates: [r.start, r.end] }
+    });
   }
   map.getSource('routes').setData({ type: 'FeatureCollection', features: feats });
+  map.getSource('corridors').setData({ type: 'FeatureCollection', features: corridorFeats });
+  map.getSource('reference').setData({ type: 'FeatureCollection', features: refFeats });
   document.getElementById('cards').innerHTML = rs.length
     ? rs.map(cardHtml).join('')
     : '<div class="empty">no viable routes — relax the corridor or modes</div>';
@@ -482,6 +704,9 @@ function selectRank(rank) {
   activeRank = rank;
   document.querySelectorAll('.card').forEach(c =>
     c.classList.toggle('active', +c.dataset.rank === rank));
+  // Scroll the active card into view if the user just clicked the map.
+  const activeCard = document.querySelector(`.card[data-rank="${rank}"]`);
+  if (activeCard) activeCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   if (map.getLayer('routes-line')) {
     map.setPaintProperty('routes-line', 'line-color',
       ['case', ['==', ['get', 'rank'], rank], '#e63946', '#f4a261']);
@@ -491,6 +716,13 @@ function selectRank(rank) {
       ['case', ['==', ['get', 'rank'], rank], '#e63946', '#f4a261']);
     map.setPaintProperty('routes-end', 'circle-radius',
       ['case', ['==', ['get', 'rank'], rank], 6, 4]);
+  }
+  if (map.getLayer('corridor-fill')) {
+    map.setFilter('corridor-fill', ['==', ['get', 'rank'], rank]);
+    map.setFilter('corridor-outline', ['==', ['get', 'rank'], rank]);
+  }
+  if (map.getLayer('reference-line')) {
+    map.setFilter('reference-line', ['==', ['get', 'rank'], rank]);
   }
   const r = results.find(x => x.rank === rank);
   if (r) {

@@ -83,6 +83,10 @@ struct CommonArgs {
     /// Deviation penalty strength: 0 = pure shortest path, ~10 = sticks tightly.
     #[arg(long, default_value_t = 4.0)]
     alpha: f64,
+    /// Restrict routing to paved surfaces only (asphalt/concrete/paving stones).
+    /// Skips gravel, paths, unpaved tracks, and ferries.
+    #[arg(long, default_value_t = false)]
+    paved_only: bool,
     /// Long-edge flagging threshold (metres) — likely ferries / graph gaps.
     #[arg(long, default_value_t = 800.0)]
     long_edge_threshold: f64,
@@ -255,6 +259,8 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             modes,
             half_width_m: half,
             alpha: args.common.alpha,
+            corridor_max_m: half,
+            paved_only: args.common.paved_only,
         };
         let r = route::shortest(&graph, start_idx, end_idx, start, end, &params)?;
         let rep = viability::analyse(&r, start, end, &no_go, args.common.long_edge_threshold);
@@ -359,7 +365,10 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         modes,
         half_width_m: half,
         alpha: args.common.alpha,
+        corridor_max_m: half,
+        paved_only: args.common.paved_only,
     };
+    let filter = explore::RouteFilter::lax(half.max(2_000.0));
     println!(
         "Routing {} candidates on a graph of {} nodes…",
         candidates.len(),
@@ -370,7 +379,9 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         candidates,
         &no_go,
         &params,
+        &filter,
         args.common.long_edge_threshold,
+        None,
     );
 
     let mut viable: Vec<explore::Scored> = Vec::new();
@@ -472,6 +483,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 long_edge_threshold_m: args.long_edge_threshold,
                 elevation_cache: args.elevation_cache.clone(),
                 elev: std::sync::Mutex::new(elev),
+                progress: std::sync::Mutex::new(None),
             },
         ));
         crowfly::server::serve(state, &args.bind).await

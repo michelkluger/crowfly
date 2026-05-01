@@ -17,6 +17,7 @@ use crate::osm::{BBox, Graph};
 use crate::route::{self, RouteParams, RouteResult};
 use crate::viability::{self, NoGoZone, Report};
 use anyhow::Result;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -36,6 +37,39 @@ impl Candidate {
             end,
             bearing_deg,
             distance_km,
+        }
+    }
+}
+
+/// Post-routing filters that reject candidates the cost function alone can't
+/// catch. The corridor cutoff lives in [`RouteParams`]; this struct covers the
+/// rest:
+/// - snap displacement: rejects candidates whose nearest graph node is too far
+///   from the requested A or B (e.g. country-mode `end` falling outside the OSM
+///   data bbox);
+/// - routed-distance bounds: ensures the suggestion respects the user's
+///   requested distance range;
+/// - corridor compliance: belt-and-braces check that `max_deviation_m` did
+///   not slip past the cost-closure cutoff (it shouldn't, but the post-filter
+///   guards against drift if either side is later relaxed).
+#[derive(Clone, Debug)]
+pub struct RouteFilter {
+    pub distance_min_km: Option<f64>,
+    pub distance_max_km: Option<f64>,
+    pub snap_tolerance_m: f64,
+    pub enforce_corridor: bool,
+}
+
+impl RouteFilter {
+    /// Permissive filter: only enforces snap tolerance and the corridor.
+    /// Use for `between` / `plan` / `explore` where the user pinned the
+    /// endpoints themselves.
+    pub fn lax(snap_tolerance_m: f64) -> Self {
+        Self {
+            distance_min_km: None,
+            distance_max_km: None,
+            snap_tolerance_m,
+            enforce_corridor: true,
         }
     }
 }
@@ -104,6 +138,44 @@ pub fn generate_country_candidates(
             bearing_deg: bearing,
             distance_km: dist,
         });
+    }
+    out
+}
+
+/// Sample candidates whose start AND end both fall inside the bbox, with
+/// great-circle distance in `[distance_min_km, distance_max_km]`. Picks two
+/// independent uniform points in the bbox and accepts the pair if the distance
+/// fits. This prevents country mode from proposing lines whose `end` falls
+/// outside the OSM data — those used to be silently snapped to a node back
+/// near `start`, producing the bogus "ref 390 km → real 3 km" suggestions.
+pub fn generate_country_candidates_in_bbox(
+    bbox: BBox,
+    n: usize,
+    distance_min_km: f64,
+    distance_max_km: f64,
+    seed: u64,
+) -> Vec<Candidate> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(n);
+    let max_attempts = (n * 80).max(2_000);
+    let mut attempts = 0;
+    while out.len() < n && attempts < max_attempts {
+        attempts += 1;
+        let start = LatLon::new(
+            rng.gen_range(bbox.lat_min..bbox.lat_max),
+            rng.gen_range(bbox.lon_min..bbox.lon_max),
+        );
+        let end = LatLon::new(
+            rng.gen_range(bbox.lat_min..bbox.lat_max),
+            rng.gen_range(bbox.lon_min..bbox.lon_max),
+        );
+        let d_km = haversine(start, end) / 1000.0;
+        if d_km < distance_min_km || d_km > distance_max_km {
+            continue;
+        }
+        out.push(Candidate::from_endpoints(start, end));
     }
     out
 }
@@ -226,12 +298,22 @@ pub fn route_one(
     candidate: Candidate,
     no_go: &[NoGoZone],
     params: &RouteParams,
+    filter: &RouteFilter,
     long_edge_threshold_m: f64,
 ) -> Result<Scored, (Candidate, String)> {
     let pair = graph.closest_connected_pair(candidate.start, candidate.end);
-    let Some((s_idx, e_idx, _, _)) = pair else {
+    let Some((s_idx, e_idx, sd, ed)) = pair else {
         return Err((candidate, "graph empty".into()));
     };
+    if sd > filter.snap_tolerance_m || ed > filter.snap_tolerance_m {
+        return Err((
+            candidate,
+            format!(
+                "endpoint too far from graph: start {:.0} m, end {:.0} m (tolerance {:.0} m)",
+                sd, ed, filter.snap_tolerance_m
+            ),
+        ));
+    }
     match route::shortest(graph, s_idx, e_idx, candidate.start, candidate.end, params) {
         Ok(r) => {
             let ref_km = haversine(candidate.start, candidate.end) / 1000.0;
@@ -256,6 +338,37 @@ pub fn route_one(
                     ),
                 ));
             }
+            if filter.enforce_corridor && report.max_deviation_m > params.half_width_m {
+                return Err((
+                    candidate,
+                    format!(
+                        "max deviation {:.0} m exceeds corridor half-width {:.0} m",
+                        report.max_deviation_m, params.half_width_m
+                    ),
+                ));
+            }
+            if let Some(min_km) = filter.distance_min_km {
+                if report.total_km < min_km {
+                    return Err((
+                        candidate,
+                        format!(
+                            "routed distance {:.1} km below minimum {:.1} km",
+                            report.total_km, min_km
+                        ),
+                    ));
+                }
+            }
+            if let Some(max_km) = filter.distance_max_km {
+                if report.total_km > max_km {
+                    return Err((
+                        candidate,
+                        format!(
+                            "routed distance {:.1} km above maximum {:.1} km",
+                            report.total_km, max_km
+                        ),
+                    ));
+                }
+            }
             let s = score(&report, ref_km);
             Ok(Scored {
                 candidate,
@@ -274,12 +387,20 @@ pub fn evaluate(
     candidates: Vec<Candidate>,
     no_go: &[NoGoZone],
     params: &RouteParams,
+    filter: &RouteFilter,
     long_edge_threshold_m: f64,
+    progress: Option<&AtomicUsize>,
 ) -> Vec<Result<Scored, (Candidate, String)>> {
     use rayon::prelude::*;
     candidates
         .into_par_iter()
-        .map(|c| route_one(graph, c, no_go, params, long_edge_threshold_m))
+        .map(|c| {
+            let r = route_one(graph, c, no_go, params, filter, long_edge_threshold_m);
+            if let Some(p) = progress {
+                p.fetch_add(1, Ordering::Relaxed);
+            }
+            r
+        })
         .collect()
 }
 

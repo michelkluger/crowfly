@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 rand = "0.8"
 rayon = "1"
 rstar = "0.12"
+rustc-hash = "2"
 
 [profile.release]
 opt-level = 3

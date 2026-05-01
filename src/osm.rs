@@ -7,7 +7,7 @@ use osmpbfreader::{OsmObj, OsmPbfReader};
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::unionfind::UnionFind;
 use petgraph::visit::EdgeRef;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -89,7 +89,7 @@ impl rstar::PointDistance for NodePoint {
 
 pub struct Graph {
     pub graph: UnGraph<LatLon, EdgeData>,
-    pub osm_to_idx: HashMap<i64, NodeIndex>,
+    pub osm_to_idx: FxHashMap<i64, NodeIndex>,
     /// Per-NodeIndex component representative. Computed once at build time so
     /// every routing query is O(1) for "which component is this node in".
     pub components: Vec<u32>,
@@ -305,7 +305,7 @@ where
 
     // Pass 1: find ways with passing tags, collect their node IDs, mode mask, surface.
     let mut keep_ways: Vec<(i64, Vec<i64>, u8, u8)> = Vec::new();
-    let mut needed_nodes: HashSet<i64> = HashSet::new();
+    let mut needed_nodes: FxHashSet<i64> = FxHashSet::default();
     {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut pbf = OsmPbfReader::new(f);
@@ -344,7 +344,8 @@ where
 
     eprintln!("Reading PBF (pass 2: nodes)");
     // Pass 2: read needed node coords.
-    let mut node_pos: HashMap<i64, LatLon> = HashMap::with_capacity(needed_nodes.len());
+    let mut node_pos: FxHashMap<i64, LatLon> =
+        FxHashMap::with_capacity_and_hasher(needed_nodes.len(), Default::default());
     {
         let f = File::open(path)?;
         let mut pbf = OsmPbfReader::new(f);
@@ -374,10 +375,11 @@ where
     eprintln!("Building graph (final edge filter)");
     let mut graph: UnGraph<LatLon, EdgeData> =
         UnGraph::with_capacity(node_pos.len(), node_pos.len() * 2);
-    let mut osm_to_idx: HashMap<i64, NodeIndex> = HashMap::with_capacity(node_pos.len());
+    let mut osm_to_idx: FxHashMap<i64, NodeIndex> =
+        FxHashMap::with_capacity_and_hasher(node_pos.len(), Default::default());
 
     let get_or_insert = |graph: &mut UnGraph<LatLon, EdgeData>,
-                         osm_to_idx: &mut HashMap<i64, NodeIndex>,
+                         osm_to_idx: &mut FxHashMap<i64, NodeIndex>,
                          id: i64,
                          p: LatLon|
      -> NodeIndex {

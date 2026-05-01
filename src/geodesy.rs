@@ -80,6 +80,79 @@ pub fn along_track(p: LatLon, a: LatLon, b: LatLon) -> f64 {
     sign * cos_at.acos() * R_EARTH
 }
 
+/// Precomputed terms for repeated cross-track queries against a fixed line `a -> b`.
+/// A* over a country graph evaluates `cross_track` once per edge expansion against
+/// the same reference line, so caching `bearing(a, b)` and the trig of `a` cuts
+/// the per-call cost roughly in half (saves 1 atan2, 3 sin/cos).
+pub struct CrossTrack {
+    a_lat_rad: f64,
+    a_lon_rad: f64,
+    cos_a_lat: f64,
+    sin_a_lat: f64,
+    bearing_ab: f64,
+}
+
+impl CrossTrack {
+    pub fn new(a: LatLon, b: LatLon) -> Self {
+        let a_lat_rad = to_rad(a.lat);
+        Self {
+            a_lat_rad,
+            a_lon_rad: to_rad(a.lon),
+            cos_a_lat: a_lat_rad.cos(),
+            sin_a_lat: a_lat_rad.sin(),
+            bearing_ab: bearing_rad(a, b),
+        }
+    }
+
+    /// |cross-track distance| from `p` to the reference line, metres.
+    pub fn abs(&self, p: LatLon) -> f64 {
+        let p_lat = to_rad(p.lat);
+        let dphi = p_lat - self.a_lat_rad;
+        let dlam = to_rad(p.lon) - self.a_lon_rad;
+        let cos_p_lat = p_lat.cos();
+        let sin_p_lat = p_lat.sin();
+        let sin_dlam = dlam.sin();
+        let cos_dlam = dlam.cos();
+        // angular haversine(a, p)
+        let h = (dphi * 0.5).sin().powi(2) + self.cos_a_lat * cos_p_lat * (dlam * 0.5).sin().powi(2);
+        let d_ap = 2.0 * h.sqrt().asin();
+        // bearing(a, p)
+        let y = sin_dlam * cos_p_lat;
+        let x = self.cos_a_lat * sin_p_lat - self.sin_a_lat * cos_p_lat * cos_dlam;
+        let theta_ap = y.atan2(x);
+        (d_ap.sin() * (theta_ap - self.bearing_ab).sin()).asin().abs() * R_EARTH
+    }
+}
+
+/// Precomputed terms for repeated haversine queries against a fixed target.
+/// Used as the A* heuristic: caches the target's lat/lon trig so each
+/// expansion only computes the source point's trig.
+pub struct HaversineToTarget {
+    target_lat_rad: f64,
+    target_lon_rad: f64,
+    cos_target_lat: f64,
+}
+
+impl HaversineToTarget {
+    pub fn new(target: LatLon) -> Self {
+        let target_lat_rad = to_rad(target.lat);
+        Self {
+            target_lat_rad,
+            target_lon_rad: to_rad(target.lon),
+            cos_target_lat: target_lat_rad.cos(),
+        }
+    }
+
+    pub fn distance(&self, p: LatLon) -> f64 {
+        let phi = to_rad(p.lat);
+        let dphi = self.target_lat_rad - phi;
+        let dlam = self.target_lon_rad - to_rad(p.lon);
+        let h = (dphi * 0.5).sin().powi(2)
+            + phi.cos() * self.cos_target_lat * (dlam * 0.5).sin().powi(2);
+        2.0 * R_EARTH * h.sqrt().asin()
+    }
+}
+
 /// Move from `a` along bearing (radians) by `dist` metres.
 pub fn destination(a: LatLon, bearing: f64, dist: f64) -> LatLon {
     let phi1 = to_rad(a.lat);
@@ -174,6 +247,38 @@ mod tests {
         // mid is on the meridian, cross-track should be small (not exactly 0
         // because the meridian on a sphere needs azimuth tracking, but close)
         assert!(cross_track(mid, a, b).abs() < 100.0);
+    }
+
+    #[test]
+    fn cross_track_struct_matches_function() {
+        let a = LatLon::new(46.17, 8.79);
+        let b = LatLon::new(47.68, 8.62);
+        let xt = CrossTrack::new(a, b);
+        for p in [
+            LatLon::new(47.0, 8.7),
+            LatLon::new(47.0, 6.0),
+            LatLon::new(46.5, 8.8),
+            LatLon::new(47.3, 9.5),
+        ] {
+            let expected = cross_track(p, a, b).abs();
+            let got = xt.abs(p);
+            assert!((expected - got).abs() < 1e-3, "{} vs {}", expected, got);
+        }
+    }
+
+    #[test]
+    fn haversine_to_target_matches_function() {
+        let target = LatLon::new(47.68, 8.62);
+        let h = HaversineToTarget::new(target);
+        for p in [
+            LatLon::new(46.17, 8.79),
+            LatLon::new(47.0, 6.0),
+            LatLon::new(47.3, 9.5),
+        ] {
+            let expected = haversine(p, target);
+            let got = h.distance(p);
+            assert!((expected - got).abs() < 1e-3, "{} vs {}", expected, got);
+        }
     }
 
     #[test]
