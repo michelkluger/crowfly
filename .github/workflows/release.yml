@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (must already exist on a commit)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            bin: crowfly
+            archive: tar.gz
+          - os: macos-latest
+            label: macos-arm64
+            target: aarch64-apple-darwin
+            bin: crowfly
+            archive: tar.gz
+          - os: macos-13
+            label: macos-x86_64
+            target: x86_64-apple-darwin
+            bin: crowfly
+            archive: tar.gz
+          - os: windows-latest
+            label: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            bin: crowfly.exe
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch may target a tag that isn't HEAD; check it out so
+          # `cargo build` sees the tagged code.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-release
+
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Test (release)
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="crowfly-${TAG}-${{ matrix.label }}"
+          cd "target/${{ matrix.target }}/release"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "../../../${NAME}.zip" "${{ matrix.bin }}" >/dev/null
+          else
+            tar czf "../../../${NAME}.tar.gz" "${{ matrix.bin }}"
+          fi
+          cd ../../..
+          echo "ARCHIVE_PATH=${NAME}.${{ matrix.archive }}" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE_PATH }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
