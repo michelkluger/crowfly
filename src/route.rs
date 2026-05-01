@@ -231,6 +231,68 @@ pub fn shortest(
     })
 }
 
+/// Per-leg failure detail returned by `route_loop` so the caller can report
+/// which leg of the shape is unroutable rather than a generic error.
+#[derive(Debug)]
+pub struct LegFailure {
+    pub leg_index: usize,
+    pub from: LatLon,
+    pub to: LatLon,
+    pub message: String,
+}
+
+/// Route a closed loop that visits the given vertices in order, returning a
+/// single concatenated path. Each leg is routed independently with the same
+/// `params` (mode mask, corridor cap, paved-only, α). Adjacent legs share a
+/// junction node; the duplicate is dropped from the concatenation so total
+/// length and edge counts stay correct.
+pub fn route_loop(
+    graph: &Graph,
+    vertices: &[LatLon],
+    params: &RouteParams,
+) -> Result<RouteResult, LegFailure> {
+    if vertices.len() < 2 {
+        return Err(LegFailure {
+            leg_index: 0,
+            from: vertices.first().copied().unwrap_or(LatLon::new(0.0, 0.0)),
+            to: vertices.last().copied().unwrap_or(LatLon::new(0.0, 0.0)),
+            message: "shape has no legs".into(),
+        });
+    }
+    let mut all_points: Vec<LatLon> = Vec::new();
+    let mut all_edges: Vec<EdgeData> = Vec::new();
+    let mut total_length = 0.0;
+    for (i, w) in vertices.windows(2).enumerate() {
+        let pair = graph.closest_connected_pair(w[0], w[1]).ok_or(LegFailure {
+            leg_index: i,
+            from: w[0],
+            to: w[1],
+            message: "graph empty for leg endpoints".into(),
+        })?;
+        let (s_idx, e_idx, _, _) = pair;
+        let leg = shortest(graph, s_idx, e_idx, w[0], w[1], params).map_err(|e| LegFailure {
+            leg_index: i,
+            from: w[0],
+            to: w[1],
+            message: e.to_string(),
+        })?;
+        if all_points.is_empty() {
+            all_points.extend(&leg.points);
+        } else {
+            // Skip the first point of subsequent legs to avoid a duplicate
+            // vertex at the junction with the previous leg.
+            all_points.extend(&leg.points[1..]);
+        }
+        all_edges.extend(&leg.edges);
+        total_length += leg.total_length_m;
+    }
+    Ok(RouteResult {
+        points: all_points,
+        edges: all_edges,
+        total_length_m: total_length,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

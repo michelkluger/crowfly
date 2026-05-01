@@ -10,7 +10,7 @@
 //! on `localhost` while you plan trips.
 
 use crate::elevation::ElevationClient;
-use crate::explore::{self, Candidate, RouteFilter, Scored};
+use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
 use crate::osm::{BBox, Graph, MODE_BIKE, MODE_FOOT, MODE_MTB, SURFACE_LABELS};
 use crate::route::RouteParams;
@@ -102,6 +102,29 @@ pub struct CountryReq {
     pub min_viable: Option<usize>,
     #[serde(default)]
     pub paved_only: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ShapeSearchReq {
+    /// Shape identifier (`circle`, `triangle`, `square`, `pentagon`, `hexagon`,
+    /// `star`, `heart`, `figure-8`, `swiss-cross`).
+    pub kind: String,
+    /// Loop length in km — every candidate is sized to this.
+    pub perimeter_km: f64,
+    #[serde(default = "default_modes")]
+    pub modes: String,
+    #[serde(default = "default_width")]
+    pub width_m: f64,
+    #[serde(default = "default_count")]
+    pub count: usize,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub paved_only: bool,
+    #[serde(default = "default_elev_samples")]
+    pub elevation_samples: usize,
+    #[serde(default)]
+    pub min_viable: Option<usize>,
 }
 
 fn default_border_strip() -> f64 {
@@ -414,6 +437,195 @@ async fn handle_country(
     Ok(Json(json!({ "results": resp })))
 }
 
+fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
+    let coords: Vec<[f64; 2]> = s.route.points.iter().map(|p| [p.lon, p.lat]).collect();
+    let surface_breakdown: Vec<Value> = SURFACE_LABELS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| s.surface_km[*i] > 0.001)
+        .map(|(i, label)| json!({ "label": label, "km": s.surface_km[i] }))
+        .collect();
+    let elev = s.elevation.as_ref().map(|p| {
+        json!({
+            "samples_m": p.samples_m,
+            "ascent_m": p.ascent_m,
+            "descent_m": p.descent_m,
+            "max_m": p.max_m,
+            "min_m": p.min_m,
+        })
+    });
+    let vertex_coords: Vec<[f64; 2]> = s.vertices.iter().map(|v| [v.lon, v.lat]).collect();
+    let real_km = s.route.total_length_m / 1000.0;
+    json!({
+        "rank": rank,
+        "score": s.score,
+        // Use the center as both start and end so the existing FE marker logic
+        // (which renders points labelled "start"/"end") drops a single dot at
+        // the loop's center.
+        "start": [s.candidate.center.lon, s.candidate.center.lat],
+        "end":   [s.candidate.center.lon, s.candidate.center.lat],
+        "bearing_deg": s.candidate.rotation_deg,
+        "ref_km": s.candidate.perimeter_km,
+        "real_km": real_km,
+        "max_dev_m": 0.0,
+        "ferry_km": s.ferry_km,
+        "surface": surface_breakdown,
+        "elevation": elev,
+        "coords": coords,
+        "corridor": Vec::<[f64; 2]>::new(),
+        "width_m": width_m,
+        "shape": {
+            "kind": format!("{:?}", s.candidate.kind).to_lowercase(),
+            "vertices": vertex_coords,
+            "rotation_deg": s.candidate.rotation_deg,
+            "perimeter_km": s.candidate.perimeter_km,
+            "leg_count": s.vertices.len().saturating_sub(1),
+        }
+    })
+}
+
+async fn handle_shape_search(
+    State(state): State<AppState>,
+    Json(req): Json<ShapeSearchReq>,
+) -> Result<Json<Value>, AppError> {
+    use crate::shape::ShapeKind;
+    let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
+    let kind = ShapeKind::parse(&req.kind)
+        .ok_or_else(|| AppError::bad(anyhow!("unknown shape: {}", req.kind)))?;
+    if !req.perimeter_km.is_finite() || req.perimeter_km <= 0.0 {
+        return Err(AppError::bad(anyhow!(
+            "perimeter_km must be > 0 (got {})",
+            req.perimeter_km
+        )));
+    }
+    let half = req.width_m / 2.0;
+    let count = req.count.clamp(1, 50);
+    // Shapes have lots of legs, so per-candidate failure rate is high — over-
+    // sample more aggressively than country mode (~6×) to give dedup something
+    // to chew on.
+    let n_sample = (count * 8).max(24);
+    let seed = req.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let min_viable = req.min_viable.unwrap_or(count).max(1);
+    const MAX_BATCHES: u64 = 4;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = Some(ProgressTracker {
+            kind: "shape-search",
+            total: 0,
+            done: counter.clone(),
+            started_ms: now_ms(),
+        });
+    }
+
+    let inner = state.0.clone();
+    let inner_for_task = inner.clone();
+    let counter_inner = counter.clone();
+    let bbox = inner.bbox;
+    let perimeter_km = req.perimeter_km;
+    let paved_only = req.paved_only;
+    let routed = tokio::task::spawn_blocking(move || -> Vec<ScoredShape> {
+        let params = RouteParams {
+            modes,
+            half_width_m: half,
+            alpha: 4.0,
+            corridor_max_m: half,
+            paved_only,
+        };
+        let filter = RouteFilter {
+            distance_min_km: None,
+            distance_max_km: None,
+            snap_tolerance_m: half.max(2_000.0),
+            enforce_corridor: true,
+        };
+        let mut all: Vec<ScoredShape> = Vec::new();
+        for batch in 0..MAX_BATCHES {
+            let batch_seed = seed.wrapping_add(batch.wrapping_mul(0x9E3779B97F4A7C15));
+            let candidates = explore::generate_shape_candidates_in_bbox(
+                bbox,
+                kind,
+                perimeter_km,
+                n_sample,
+                batch_seed,
+            );
+            if candidates.is_empty() {
+                break; // shape doesn't fit in bbox
+            }
+            {
+                let mut pl = inner_for_task.progress.lock().unwrap();
+                if let Some(pt) = pl.as_mut() {
+                    pt.total += candidates.len();
+                }
+            }
+            let results = explore::evaluate_shapes(
+                &inner_for_task.graph,
+                candidates,
+                &inner_for_task.no_go,
+                &params,
+                &filter,
+                Some(&counter_inner),
+            );
+            all.extend(results.into_iter().filter_map(|r| r.ok()));
+            if all.len() >= min_viable {
+                break;
+            }
+        }
+        all
+    })
+    .await;
+    {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+    }
+    let scored = routed.map_err(AppError::internal)?;
+
+    if scored.is_empty() {
+        return Err(AppError::bad(anyhow!(
+            "no {} of perimeter {:.0} km fits anywhere with the requested modes \
+             and corridor — try widening corridor, relaxing modes, or shrinking perimeter",
+            req.kind,
+            req.perimeter_km
+        )));
+    }
+    // Dedup by center proximity, scaled to the shape's diameter so two big
+    // shapes don't merge unless they really overlap.
+    let dedup_sep_km = (req.perimeter_km / 6.28).max(8.0);
+    let mut deduped = explore::rank_dedup_top_shapes(scored, count, dedup_sep_km);
+
+    // Optional elevation enrichment.
+    if req.elevation_samples > 0 {
+        let inner = state.0.clone();
+        let owned = std::mem::take(&mut deduped);
+        let updated = tokio::task::spawn_blocking(move || -> Vec<ScoredShape> {
+            let mut owned = owned;
+            let mut client = inner.elev.lock().unwrap();
+            for s in owned.iter_mut() {
+                s.elevation = client.profile(&s.route.points, req.elevation_samples);
+            }
+            let _ = client.save();
+            owned
+        })
+        .await
+        .unwrap_or_default();
+        deduped = updated;
+    }
+
+    let width_m = req.width_m;
+    let resp: Vec<Value> = deduped
+        .iter()
+        .enumerate()
+        .map(|(i, s)| shape_to_json(s, i + 1, width_m))
+        .collect();
+    Ok(Json(json!({ "results": resp })))
+}
+
+
 async fn enrich_elevation(state: &AppState, scored: &mut Vec<Scored>, n_samples: usize) {
     if n_samples == 0 || scored.is_empty() {
         return;
@@ -484,6 +696,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/progress", get(handle_progress))
         .route("/api/between", post(handle_between))
         .route("/api/country", post(handle_country))
+        .route("/api/shape-search", post(handle_shape_search))
         .with_state(state)
 }
 

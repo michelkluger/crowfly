@@ -13,8 +13,9 @@
 
 use crate::elevation::{ElevationClient, Profile};
 use crate::geodesy::{bearing_rad, destination, haversine, LatLon};
-use crate::osm::{BBox, Graph};
+use crate::osm::{BBox, EdgeData, Graph, MODE_FERRY};
 use crate::route::{self, RouteParams, RouteResult};
+use crate::shape::{place_shape, unit_max_radius, unit_shape_perimeter, ShapeKind};
 use crate::viability::{self, NoGoZone, Report};
 use anyhow::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -402,6 +403,195 @@ pub fn evaluate(
             r
         })
         .collect()
+}
+
+// ---- Closed-loop shape mode (country-search analogue for shapes) -------------
+
+#[derive(Clone, Debug)]
+pub struct ShapeCandidate {
+    pub center: LatLon,
+    pub kind: ShapeKind,
+    pub perimeter_km: f64,
+    pub rotation_deg: f64,
+}
+
+/// A successfully-routed closed-loop shape. Mirrors `Scored` but for shapes:
+/// the routed path is one continuous concatenation of legs and the metrics
+/// are aggregated across legs (max_deviation isn't meaningful since each leg
+/// has its own line).
+#[derive(Debug)]
+pub struct ScoredShape {
+    pub candidate: ShapeCandidate,
+    pub vertices: Vec<LatLon>,
+    pub route: RouteResult,
+    pub surface_km: [f64; 6],
+    pub ferry_km: f64,
+    pub score: f64,
+    pub elevation: Option<Profile>,
+}
+
+/// Sample N shape candidates whose center sits inside an inset bbox so the
+/// shape's outline cannot escape the OSM data. Random center + random
+/// rotation; perimeter is fixed (one shape "size" per search).
+pub fn generate_shape_candidates_in_bbox(
+    bbox: BBox,
+    kind: ShapeKind,
+    perimeter_km: f64,
+    n: usize,
+    seed: u64,
+) -> Vec<ShapeCandidate> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let unit_perim = unit_shape_perimeter(kind).max(1e-9);
+    let radius_m = perimeter_km * 1000.0 / unit_perim;
+    let max_extent_m = radius_m * unit_max_radius(kind);
+    // Inset the bbox so any vertex stays inside the data area.
+    let mid_lat = (bbox.lat_min + bbox.lat_max) * 0.5;
+    let lat_inset_deg = max_extent_m / 111_000.0;
+    let lon_inset_deg = max_extent_m / (111_000.0 * mid_lat.to_radians().cos().max(0.1));
+    let lat_lo = bbox.lat_min + lat_inset_deg;
+    let lat_hi = bbox.lat_max - lat_inset_deg;
+    let lon_lo = bbox.lon_min + lon_inset_deg;
+    let lon_hi = bbox.lon_max - lon_inset_deg;
+    if lat_lo >= lat_hi || lon_lo >= lon_hi {
+        // Shape is too large to fit anywhere in the bbox.
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let center = LatLon::new(rng.gen_range(lat_lo..lat_hi), rng.gen_range(lon_lo..lon_hi));
+        let rotation_deg = rng.gen_range(0.0..360.0);
+        out.push(ShapeCandidate {
+            center,
+            kind,
+            perimeter_km,
+            rotation_deg,
+        });
+    }
+    out
+}
+
+pub fn route_one_shape(
+    graph: &Graph,
+    candidate: ShapeCandidate,
+    _no_go: &[NoGoZone],
+    params: &RouteParams,
+    filter: &RouteFilter,
+) -> Result<ScoredShape, (ShapeCandidate, String)> {
+    let vertices = place_shape(
+        candidate.center,
+        candidate.kind,
+        candidate.perimeter_km,
+        candidate.rotation_deg,
+    );
+    if vertices.len() < 2 {
+        return Err((candidate, "shape has no legs".into()));
+    }
+    let mut all_points: Vec<LatLon> = Vec::new();
+    let mut all_edges: Vec<EdgeData> = Vec::new();
+    let mut total_length = 0.0_f64;
+    for (i, w) in vertices.windows(2).enumerate() {
+        let pair = match graph.closest_connected_pair(w[0], w[1]) {
+            Some(p) => p,
+            None => return Err((candidate, format!("leg {}: graph empty", i + 1))),
+        };
+        let (s_idx, e_idx, sd, ed) = pair;
+        if sd > filter.snap_tolerance_m || ed > filter.snap_tolerance_m {
+            return Err((
+                candidate,
+                format!(
+                    "leg {}: snap displacement too large ({:.0} m / {:.0} m)",
+                    i + 1,
+                    sd,
+                    ed
+                ),
+            ));
+        }
+        let leg = match route::shortest(graph, s_idx, e_idx, w[0], w[1], params) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err((candidate, format!("leg {}: {}", i + 1, e)));
+            }
+        };
+        if all_points.is_empty() {
+            all_points.extend(&leg.points);
+        } else {
+            all_points.extend(&leg.points[1..]);
+        }
+        all_edges.extend(&leg.edges);
+        total_length += leg.total_length_m;
+    }
+    let mut surface_km = [0.0_f64; 6];
+    let mut ferry_km = 0.0;
+    for e in &all_edges {
+        let s = (e.surface as usize).min(5);
+        surface_km[s] += e.length_m / 1000.0;
+        if (e.modes & MODE_FERRY) != 0 {
+            ferry_km += e.length_m / 1000.0;
+        }
+    }
+    let real_km = total_length / 1000.0;
+    let detour = (real_km / candidate.perimeter_km - 1.0).max(0.0);
+    let score = 100.0 * detour;
+    Ok(ScoredShape {
+        candidate,
+        vertices,
+        route: RouteResult {
+            points: all_points,
+            edges: all_edges,
+            total_length_m: total_length,
+        },
+        surface_km,
+        ferry_km,
+        score,
+        elevation: None,
+    })
+}
+
+pub fn evaluate_shapes(
+    graph: &Graph,
+    candidates: Vec<ShapeCandidate>,
+    no_go: &[NoGoZone],
+    params: &RouteParams,
+    filter: &RouteFilter,
+    progress: Option<&AtomicUsize>,
+) -> Vec<Result<ScoredShape, (ShapeCandidate, String)>> {
+    use rayon::prelude::*;
+    candidates
+        .into_par_iter()
+        .map(|c| {
+            let r = route_one_shape(graph, c, no_go, params, filter);
+            if let Some(p) = progress {
+                p.fetch_add(1, Ordering::Relaxed);
+            }
+            r
+        })
+        .collect()
+}
+
+/// Rank by score, drop near-duplicate centers, take top n. Two shapes are
+/// duplicates if their centers sit within `min_sep_km`.
+pub fn rank_dedup_top_shapes(
+    mut scored: Vec<ScoredShape>,
+    n: usize,
+    min_sep_km: f64,
+) -> Vec<ScoredShape> {
+    scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+    let mut out: Vec<ScoredShape> = Vec::with_capacity(n);
+    let sep_m = min_sep_km * 1000.0;
+    for s in scored {
+        if out.len() >= n {
+            break;
+        }
+        let dup = out
+            .iter()
+            .any(|kept| haversine(kept.candidate.center, s.candidate.center) < sep_m);
+        if !dup {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Sort the surviving Scored entries by ascending score (easiest first).

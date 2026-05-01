@@ -6,4 +6,5 @@ pub mod osm;
 pub mod output;
 pub mod route;
 pub mod server;
+pub mod shape;
 pub mod viability;

@@ -136,6 +136,7 @@
     </div>
     <button class="btn-primary" id="btnBetween" disabled>Find routes between A and B</button>
     <button class="btn-secondary" id="btnCountry">Suggest routes across the country</button>
+    <button class="btn-secondary" id="btnShapeSearch">Suggest shapes across the country</button>
     <button class="btn-cancel" id="btnCancel" style="display:none;">⨯ Cancel</button>
   </div>
   <div class="options">
@@ -171,6 +172,22 @@
     </label>
     <label title="Width of the strip near each bbox edge that counts as 'border'. Larger = more flexibility on where endpoints can land.">
       border strip km <input type="number" id="optStrip" value="25" min="5" max="100" step="5"></label>
+    <label title="Shape to trace, centered on point A. The route returns to its starting point — a closed loop.">
+      shape
+      <select id="optShape">
+        <option value="circle">circle</option>
+        <option value="triangle">triangle</option>
+        <option value="square">square</option>
+        <option value="pentagon">pentagon</option>
+        <option value="hexagon">hexagon</option>
+        <option value="star">star</option>
+        <option value="heart">heart</option>
+        <option value="figure-8">figure-8</option>
+        <option value="swiss-cross">Swiss cross</option>
+      </select>
+    </label>
+    <label title="Total perimeter of the shape, in km — i.e. the loop length. Each candidate is sized to (approximately) hit this.">
+      perimeter km <input type="number" id="optPerim" value="50" min="2" step="5"></label>
   </div>
   <details class="help">
     <summary>What do these parameters mean?</summary>
@@ -283,6 +300,22 @@ map.on('load', async () => {
       'line-dasharray': [2, 2]
     }
   });
+  // Country borders overlay — Natural Earth admin-0 (1:50m) drawn over the
+  // basemap so country lines are clearly visible regardless of which basemap
+  // is active.
+  map.addSource('borders', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addLayer({
+    id: 'borders-line', type: 'line', source: 'borders',
+    paint: {
+      'line-color': '#1a1a1a',
+      'line-width': 1.6,
+      'line-opacity': 0.7
+    }
+  });
+  fetch('https://d2ad6b4ur7yvpq.cloudfront.net/naturalearth-3.3.0/ne_50m_admin_0_boundary_lines_land.geojson')
+    .then(r => r.json())
+    .then(data => map.getSource('borders').setData(data))
+    .catch(() => { /* offline / blocked: silently fall back to basemap-only borders */ });
   // Reference (great-circle) line A→B for the active route — drawn under the
   // routed path so the deviation between intent and reality is visible.
   map.addSource('reference', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
@@ -401,6 +434,7 @@ function commonPayload() {
 const PARAM_IDS = [
   'optWidth','optModes','optCount','optElev','optDmin','optDmax',
   'optBorder','optStrip','optMinViable','optPaved',
+  'optShape','optPerim',
 ];
 function loadParams() {
   try {
@@ -412,6 +446,9 @@ function loadParams() {
       if (!el || !(id in v)) continue;
       if (el.type === 'checkbox') el.checked = !!v[id];
       else el.value = v[id];
+      // Fire `input` so live-display side effects (rotation slider readout)
+      // refresh after restore.
+      el.dispatchEvent(new Event('input', { bubbles: true }));
     }
   } catch (_) { /* ignore corrupt state */ }
 }
@@ -488,6 +525,7 @@ async function postJson(path, body) {
 function setBusy(busy) {
   document.getElementById('btnBetween').disabled = busy || !(A && B);
   document.getElementById('btnCountry').disabled = busy;
+  document.getElementById('btnShapeSearch').disabled = busy;
   document.getElementById('btnCancel').style.display = busy ? '' : 'none';
 }
 
@@ -517,6 +555,31 @@ document.getElementById('btnBetween').addEventListener('click', async () => {
     });
     renderResults(j.results);
     setStatus(`got ${j.results.length} alternatives`);
+  } catch (e) {
+    if (isAbort(e)) return;
+    setStatus('error: ' + e.message);
+    document.getElementById('cards').innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+});
+
+document.getElementById('btnShapeSearch').addEventListener('click', async () => {
+  const kind = document.getElementById('optShape').value;
+  const perim = +document.getElementById('optPerim').value;
+  setStatus(`<span class="spinner"></span> searching for ${kind}s of ${perim} km across the country…`);
+  document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
+  showProgress(`searching ${kind}s…`);
+  startProgressPoll();
+  try {
+    const minViableRaw = document.getElementById('optMinViable').value.trim();
+    const j = await postJson('/api/shape-search', {
+      ...commonPayload(),
+      kind,
+      perimeter_km: perim,
+      count: +document.getElementById('optCount').value,
+      ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
+    });
+    renderResults(j.results);
+    setStatus(`got ${j.results.length} ${kind}${j.results.length === 1 ? '' : 's'}`);
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
@@ -565,60 +628,65 @@ function renderResults(rs) {
   const corridorFeats = [];
   const refFeats = [];
   for (const r of rs) {
+    const isShape = !!r.shape; // shapes are closed loops, no start/end/corridor/reference
     feats.push({
       type: 'Feature',
       properties: { rank: r.rank },
       geometry: { type: 'LineString', coordinates: r.coords }
     });
-    feats.push({
-      type: 'Feature',
-      properties: { rank: r.rank, kind: 'end' },
-      geometry: { type: 'Point', coordinates: r.end }
-    });
-    feats.push({
-      type: 'Feature',
-      properties: { rank: r.rank, kind: 'start' },
-      geometry: { type: 'Point', coordinates: r.start }
-    });
-    // Snap-displacement indicators: the router started/ended at coords[0] /
-    // coords[last], not at the requested r.start / r.end. Show only when the
-    // gap is larger than 50 m so we don't clutter the map for clean snaps.
-    if (r.coords.length >= 2) {
-      const snapStart = r.coords[0];
-      const snapEnd = r.coords[r.coords.length - 1];
-      if (haversineMeters(r.start, snapStart) > 50) {
-        feats.push({
-          type: 'Feature', properties: { rank: r.rank, kind: 'snap' },
-          geometry: { type: 'Point', coordinates: snapStart }
-        });
-        feats.push({
-          type: 'Feature', properties: { rank: r.rank, kind: 'snap-leg' },
-          geometry: { type: 'LineString', coordinates: [r.start, snapStart] }
+    if (!isShape) {
+      feats.push({
+        type: 'Feature',
+        properties: { rank: r.rank, kind: 'end' },
+        geometry: { type: 'Point', coordinates: r.end }
+      });
+      feats.push({
+        type: 'Feature',
+        properties: { rank: r.rank, kind: 'start' },
+        geometry: { type: 'Point', coordinates: r.start }
+      });
+      // Snap-displacement indicators: the router started/ended at coords[0] /
+      // coords[last], not at the requested r.start / r.end. Show only when
+      // the gap is larger than 50 m so we don't clutter the map for clean
+      // snaps. Skipped for shapes since "requested start" = center is just
+      // a placement detail, not a routing endpoint.
+      if (r.coords.length >= 2) {
+        const snapStart = r.coords[0];
+        const snapEnd = r.coords[r.coords.length - 1];
+        if (haversineMeters(r.start, snapStart) > 50) {
+          feats.push({
+            type: 'Feature', properties: { rank: r.rank, kind: 'snap' },
+            geometry: { type: 'Point', coordinates: snapStart }
+          });
+          feats.push({
+            type: 'Feature', properties: { rank: r.rank, kind: 'snap-leg' },
+            geometry: { type: 'LineString', coordinates: [r.start, snapStart] }
+          });
+        }
+        if (haversineMeters(r.end, snapEnd) > 50) {
+          feats.push({
+            type: 'Feature', properties: { rank: r.rank, kind: 'snap' },
+            geometry: { type: 'Point', coordinates: snapEnd }
+          });
+          feats.push({
+            type: 'Feature', properties: { rank: r.rank, kind: 'snap-leg' },
+            geometry: { type: 'LineString', coordinates: [r.end, snapEnd] }
+          });
+        }
+      }
+      if (r.corridor && r.corridor.length >= 4) {
+        corridorFeats.push({
+          type: 'Feature',
+          properties: { rank: r.rank },
+          geometry: { type: 'Polygon', coordinates: [r.corridor] }
         });
       }
-      if (haversineMeters(r.end, snapEnd) > 50) {
-        feats.push({
-          type: 'Feature', properties: { rank: r.rank, kind: 'snap' },
-          geometry: { type: 'Point', coordinates: snapEnd }
-        });
-        feats.push({
-          type: 'Feature', properties: { rank: r.rank, kind: 'snap-leg' },
-          geometry: { type: 'LineString', coordinates: [r.end, snapEnd] }
-        });
-      }
-    }
-    if (r.corridor && r.corridor.length >= 4) {
-      corridorFeats.push({
+      refFeats.push({
         type: 'Feature',
         properties: { rank: r.rank },
-        geometry: { type: 'Polygon', coordinates: [r.corridor] }
+        geometry: { type: 'LineString', coordinates: [r.start, r.end] }
       });
     }
-    refFeats.push({
-      type: 'Feature',
-      properties: { rank: r.rank },
-      geometry: { type: 'LineString', coordinates: [r.start, r.end] }
-    });
   }
   map.getSource('routes').setData({ type: 'FeatureCollection', features: feats });
   map.getSource('corridors').setData({ type: 'FeatureCollection', features: corridorFeats });
