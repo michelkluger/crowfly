@@ -1,6 +1,6 @@
 [package]
 name = "crowfly"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Plan and validate straight-line crossings of a country: corridor + OSM-based routing + suggestions web app."
 license = "MIT"
