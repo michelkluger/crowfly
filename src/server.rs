@@ -17,7 +17,7 @@ use crate::route::RouteParams;
 use crate::viability::NoGoZone;
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -42,6 +42,92 @@ pub struct ServerState {
     /// Latest in-flight search progress. Cleared when no work is running. The
     /// server is single-user (README), so a single slot is enough.
     pub progress: Mutex<Option<ProgressTracker>>,
+    /// Slot for the most recent async job (background elevation + re-rank).
+    /// Single-user assumption: only one outstanding job at a time. Cleared
+    /// when a new search starts; the FE polls `/api/results/:id` to learn
+    /// when re-ranking is finished and pick up the final order.
+    pub async_job: Mutex<Option<AsyncJob>>,
+}
+
+/// Bookkeeping for one in-flight async re-rank. `kind` carries the result
+/// pool typed for either country or shape responses; the BG task fills in
+/// `final_*` once elevation enrichment + re-dedup completes.
+pub struct AsyncJob {
+    pub id: String,
+    pub width_m: f64,
+    pub completed: bool,
+    pub failures: Value,
+    pub kind: AsyncJobKind,
+}
+
+pub enum AsyncJobKind {
+    Country {
+        final_results: Option<Vec<Scored>>,
+    },
+    Shape {
+        final_results: Option<Vec<ScoredShape>>,
+    },
+}
+
+/// Counters bucketing why candidates were rejected during a search. Returned
+/// alongside the route list so the empty-state UI can tell the user *which*
+/// knob to relax (corridor too tight, endpoints unreachable, etc.) instead of
+/// a generic "no viable routes" message.
+#[derive(Default, Clone, Debug)]
+pub struct RejectionStats {
+    pub snap_too_far: usize,
+    pub corridor_violated: usize,
+    pub no_route: usize,
+    pub no_go: usize,
+    pub too_short: usize,
+    pub too_long: usize,
+    pub other: usize,
+}
+
+impl RejectionStats {
+    pub fn classify(&mut self, msg: &str) {
+        let m = msg.to_ascii_lowercase();
+        if m.contains("endpoint too far from graph") || m.contains("snap displacement") {
+            self.snap_too_far += 1;
+        } else if m.contains("exceeds corridor half-width") {
+            self.corridor_violated += 1;
+        } else if m.starts_with("no-go") || m.contains(": no-go") {
+            self.no_go += 1;
+        } else if m.contains("below minimum") {
+            self.too_short += 1;
+        } else if m.contains("above maximum") {
+            self.too_long += 1;
+        } else if m.contains("no route") || m.contains("graph empty") {
+            self.no_route += 1;
+        } else {
+            self.other += 1;
+        }
+    }
+    pub fn merge(&mut self, other: &RejectionStats) {
+        self.snap_too_far     += other.snap_too_far;
+        self.corridor_violated += other.corridor_violated;
+        self.no_route         += other.no_route;
+        self.no_go            += other.no_go;
+        self.too_short        += other.too_short;
+        self.too_long         += other.too_long;
+        self.other            += other.other;
+    }
+    pub fn total(&self) -> usize {
+        self.snap_too_far + self.corridor_violated + self.no_route + self.no_go
+            + self.too_short + self.too_long + self.other
+    }
+    pub fn to_json(&self) -> Value {
+        json!({
+            "snap_too_far":      self.snap_too_far,
+            "corridor_violated": self.corridor_violated,
+            "no_route":          self.no_route,
+            "no_go":             self.no_go,
+            "too_short":         self.too_short,
+            "too_long":          self.too_long,
+            "other":             self.other,
+            "total":             self.total(),
+        })
+    }
 }
 
 /// In-flight search progress. `done` is mutated lock-free from the rayon worker
@@ -102,6 +188,11 @@ pub struct CountryReq {
     pub min_viable: Option<usize>,
     #[serde(default)]
     pub paved_only: bool,
+    /// When true, every retry batch uses the exact requested corridor — no
+    /// widening to recover from empty batches. Search may end with zero
+    /// results if the requested corridor is infeasible.
+    #[serde(default)]
+    pub strict_corridor: bool,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +216,8 @@ pub struct ShapeSearchReq {
     pub elevation_samples: usize,
     #[serde(default)]
     pub min_viable: Option<usize>,
+    #[serde(default)]
+    pub strict_corridor: bool,
 }
 
 fn default_border_strip() -> f64 {
@@ -219,6 +312,7 @@ fn scored_to_json(s: &Scored, rank: usize, width_m: f64) -> Value {
         "coords": coords,
         "corridor": corridor,
         "width_m": width_m,
+        "corridor_used_m": s.corridor_used_m,
     })
 }
 
@@ -277,13 +371,11 @@ async fn handle_between(
         (out, errors)
     })
     .await;
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-    }
     let (scored, errors) = scored_result.map_err(AppError::internal)?;
 
     if scored.is_empty() {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
         let detail = if errors.is_empty() {
             String::new()
         } else {
@@ -304,6 +396,10 @@ async fn handle_between(
         .enumerate()
         .map(|(i, s)| scored_to_json(s, i + 1, width_m))
         .collect();
+    {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+    }
     Ok(Json(json!({ "results": resp })))
 }
 
@@ -312,9 +408,9 @@ async fn handle_country(
     Json(req): Json<CountryReq>,
 ) -> Result<Json<Value>, AppError> {
     let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
-    let half = req.width_m / 2.0;
+    let base_half = req.width_m / 2.0;
     let count = req.count.clamp(1, 50);
-    let n_sample = (count * 6).max(20); // oversample, then dedupe to top N
+    let base_sample = (count * 6).max(20); // oversample, then dedupe to top N
     let seed = req.seed.unwrap_or_else(|| {
         // Use system time so refresh gives new lines each click.
         std::time::SystemTime::now()
@@ -330,8 +426,14 @@ async fn handle_country(
     let border = req.border_to_border;
     let long_edge = inner.long_edge_threshold_m;
     let min_viable = req.min_viable.unwrap_or(count).max(1);
-    // Initial batch + up to 3 retries when the viable count falls short.
-    const MAX_BATCHES: u64 = 4;
+    // Persistence schedule: more batches than before, oversample grows late so
+    // the first few attempts stay snappy, and the corridor widens by an
+    // absolute delta (km of full corridor) so the worst case is request +2 km
+    // — never a multiplicative blow-up. Strict mode zeroes out the deltas.
+    const SAMPLE_FACTORS: [f64; 8] = [1.0, 1.0, 1.5, 1.5, 2.0, 2.0, 2.5, 2.5];
+    const WIDEN_DELTA_KM: [f64; 8] = [0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0];
+    const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
+    let strict = req.strict_corridor;
 
     let counter = Arc::new(AtomicUsize::new(0));
     {
@@ -346,25 +448,31 @@ async fn handle_country(
     let counter_inner = counter.clone();
     let inner_for_task = inner.clone();
     let paved_only = req.paved_only;
-    let scored_result = tokio::task::spawn_blocking(move || -> Vec<Scored> {
-        let params = RouteParams {
-            modes,
-            half_width_m: half,
-            alpha: 4.0,
-            corridor_max_m: half,
-            paved_only,
-        };
-        let filter = RouteFilter {
-            distance_min_km: Some(dmin),
-            distance_max_km: Some(dmax),
-            snap_tolerance_m: half.max(2_000.0),
-            enforce_corridor: true,
-        };
+    let scored_result = tokio::task::spawn_blocking(move || -> (Vec<Scored>, RejectionStats) {
         let mut all: Vec<Scored> = Vec::new();
+        let mut stats = RejectionStats::default();
         for batch in 0..MAX_BATCHES {
+            let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
+            let sample_mul = SAMPLE_FACTORS[batch];
+            // Half-width grows by half of the full-corridor delta.
+            let half = base_half + delta_km * 500.0;
+            let n_sample = ((base_sample as f64) * sample_mul).round() as usize;
+            let params = RouteParams {
+                modes,
+                half_width_m: half,
+                alpha: 4.0,
+                corridor_max_m: half,
+                paved_only,
+            };
+            let filter = RouteFilter {
+                distance_min_km: Some(dmin),
+                distance_max_km: Some(dmax),
+                snap_tolerance_m: half.max(2_000.0),
+                enforce_corridor: true,
+            };
             // Each batch uses a different seed so we don't redraw the same
             // candidates we already proved infeasible.
-            let batch_seed = seed.wrapping_add(batch.wrapping_mul(0x9E3779B97F4A7C15));
+            let batch_seed = seed.wrapping_add((batch as u64).wrapping_mul(0x9E3779B97F4A7C15));
             let candidates = if border {
                 explore::generate_border_to_border_candidates(
                     bbox,
@@ -403,38 +511,145 @@ async fn handle_country(
                 long_edge,
                 Some(&counter_inner),
             );
-            all.extend(results.into_iter().filter_map(|r| r.ok()));
+            for r in results {
+                match r {
+                    Ok(s) => all.push(s),
+                    Err((_, msg)) => stats.classify(&msg),
+                }
+            }
             if all.len() >= min_viable {
                 break;
             }
         }
-        all
+        (all, stats)
     })
     .await;
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-    }
-    let scored = scored_result.map_err(AppError::internal)?;
+    let (scored, stats) = scored_result.map_err(AppError::internal)?;
 
     if scored.is_empty() {
-        return Err(AppError::bad(anyhow!(
-            "no candidate produced a viable route — relax the corridor or distance range"
-        )));
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+        return Ok(Json(json!({
+            "results": Vec::<Value>::new(),
+            "failures": stats.to_json(),
+        })));
     }
 
-    // Country lines are diverse by construction; dedup with a generous
-    // separation to avoid serving near-duplicates.
-    let mut deduped = explore::rank_dedup_top(scored, count, 8.0);
-    enrich_elevation(&state, &mut deduped, req.elevation_samples).await;
-
+    // Per-section dedup with an over-keep pool so the BG elevation re-rank
+    // has alternatives to promote. The synchronous response shows the top
+    // `count` of each section by *pre-elevation* score.
+    let pool_size = if req.elevation_samples > 0 {
+        (count * 3).max(count + 4)
+    } else {
+        count
+    };
     let width_m = req.width_m;
-    let resp: Vec<Value> = deduped
+    let (tight, loose): (Vec<Scored>, Vec<Scored>) = scored
+        .into_iter()
+        .partition(|s| s.corridor_used_m <= width_m + 1.0);
+    let tight_pool = explore::rank_dedup_top(tight, pool_size, 8.0);
+    let loose_pool = explore::rank_dedup_top(loose, pool_size, 8.0);
+
+    // Initial display set (no elevation): top `count` of each section.
+    let mut initial: Vec<Scored> = tight_pool.iter().take(count).cloned().collect();
+    initial.extend(loose_pool.iter().take(count).cloned());
+    let resp_initial: Vec<Value> = initial
         .iter()
         .enumerate()
         .map(|(i, s)| scored_to_json(s, i + 1, width_m))
         .collect();
-    Ok(Json(json!({ "results": resp })))
+
+    // Set up an async job for elevation enrichment + re-rank. The FE polls
+    // /api/results/:id and animates cards into the new order on completion.
+    let elevation_pending = req.elevation_samples > 0;
+    let request_id = next_async_id();
+    let failures_json = stats.to_json();
+    if elevation_pending {
+        {
+            let mut slot = state.0.async_job.lock().unwrap();
+            *slot = Some(AsyncJob {
+                id: request_id.clone(),
+                width_m,
+                completed: false,
+                failures: failures_json.clone(),
+                kind: AsyncJobKind::Country { final_results: None },
+            });
+        }
+        let state_for_bg = state.clone();
+        let request_id_bg = request_id.clone();
+        let elevation_samples = req.elevation_samples;
+        tokio::spawn(async move {
+            run_country_rerank(
+                state_for_bg,
+                request_id_bg,
+                tight_pool,
+                loose_pool,
+                count,
+                width_m,
+                elevation_samples,
+            )
+            .await;
+        });
+    } else {
+        // No elevation requested → clear progress, no async job.
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+    }
+
+    Ok(Json(json!({
+        "request_id": request_id,
+        "elevation_pending": elevation_pending,
+        "results": resp_initial,
+        "failures": failures_json,
+    })))
+}
+
+/// Background re-rank for country mode: enrich the entire over-keep pool with
+/// elevation, recompute scores, dedup again per-section, and store the final
+/// order in the async-job slot for the FE to poll.
+async fn run_country_rerank(
+    state: AppState,
+    request_id: String,
+    tight_pool: Vec<Scored>,
+    loose_pool: Vec<Scored>,
+    count: usize,
+    width_m: f64,
+    elevation_samples: usize,
+) {
+    let mut combined: Vec<Scored> = Vec::with_capacity(tight_pool.len() + loose_pool.len());
+    combined.extend(tight_pool);
+    combined.extend(loose_pool);
+    enrich_elevation(&state, &mut combined, elevation_samples).await;
+    for s in combined.iter_mut() {
+        explore::rescore_with_elevation(s);
+    }
+    let (tight2, loose2): (Vec<Scored>, Vec<Scored>) = combined
+        .into_iter()
+        .partition(|s| s.corridor_used_m <= width_m + 1.0);
+    let tight_final = explore::rank_dedup_top(tight2, count, 8.0);
+    let loose_final = explore::rank_dedup_top(loose2, count, 8.0);
+    let mut all_final: Vec<Scored> = tight_final;
+    all_final.extend(loose_final);
+    {
+        let mut slot = state.0.async_job.lock().unwrap();
+        if let Some(job) = slot.as_mut() {
+            if job.id == request_id {
+                if let AsyncJobKind::Country { final_results } = &mut job.kind {
+                    *final_results = Some(all_final);
+                }
+                job.completed = true;
+            }
+        }
+    }
+    let mut p = state.0.progress.lock().unwrap();
+    *p = None;
+}
+
+fn next_async_id() -> String {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}", now_ms(), n)
 }
 
 fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
@@ -474,6 +689,7 @@ fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
         "coords": coords,
         "corridor": Vec::<[f64; 2]>::new(),
         "width_m": width_m,
+        "corridor_used_m": s.corridor_used_m,
         "shape": {
             "kind": format!("{:?}", s.candidate.kind).to_lowercase(),
             "vertices": vertex_coords,
@@ -498,12 +714,12 @@ async fn handle_shape_search(
             req.perimeter_km
         )));
     }
-    let half = req.width_m / 2.0;
+    let base_half = req.width_m / 2.0;
     let count = req.count.clamp(1, 50);
     // Shapes have lots of legs, so per-candidate failure rate is high — over-
-    // sample more aggressively than country mode (~6×) to give dedup something
+    // sample more aggressively than country mode (~8×) to give dedup something
     // to chew on.
-    let n_sample = (count * 8).max(24);
+    let base_sample = (count * 8).max(24);
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -511,7 +727,10 @@ async fn handle_shape_search(
             .unwrap_or(0)
     });
     let min_viable = req.min_viable.unwrap_or(count).max(1);
-    const MAX_BATCHES: u64 = 4;
+    const SAMPLE_FACTORS: [f64; 8] = [1.0, 1.0, 1.5, 1.5, 2.0, 2.0, 2.5, 2.5];
+    const WIDEN_DELTA_KM: [f64; 8] = [0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0];
+    const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
+    let strict = req.strict_corridor;
 
     let counter = Arc::new(AtomicUsize::new(0));
     {
@@ -530,23 +749,28 @@ async fn handle_shape_search(
     let bbox = inner.bbox;
     let perimeter_km = req.perimeter_km;
     let paved_only = req.paved_only;
-    let routed = tokio::task::spawn_blocking(move || -> Vec<ScoredShape> {
-        let params = RouteParams {
-            modes,
-            half_width_m: half,
-            alpha: 4.0,
-            corridor_max_m: half,
-            paved_only,
-        };
-        let filter = RouteFilter {
-            distance_min_km: None,
-            distance_max_km: None,
-            snap_tolerance_m: half.max(2_000.0),
-            enforce_corridor: true,
-        };
+    let routed = tokio::task::spawn_blocking(move || -> (Vec<ScoredShape>, RejectionStats) {
         let mut all: Vec<ScoredShape> = Vec::new();
+        let mut stats = RejectionStats::default();
         for batch in 0..MAX_BATCHES {
-            let batch_seed = seed.wrapping_add(batch.wrapping_mul(0x9E3779B97F4A7C15));
+            let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
+            let sample_mul = SAMPLE_FACTORS[batch];
+            let half = base_half + delta_km * 500.0;
+            let n_sample = ((base_sample as f64) * sample_mul).round() as usize;
+            let params = RouteParams {
+                modes,
+                half_width_m: half,
+                alpha: 4.0,
+                corridor_max_m: half,
+                paved_only,
+            };
+            let filter = RouteFilter {
+                distance_min_km: None,
+                distance_max_km: None,
+                snap_tolerance_m: half.max(2_000.0),
+                enforce_corridor: true,
+            };
+            let batch_seed = seed.wrapping_add((batch as u64).wrapping_mul(0x9E3779B97F4A7C15));
             let candidates = explore::generate_shape_candidates_in_bbox(
                 bbox,
                 kind,
@@ -571,58 +795,164 @@ async fn handle_shape_search(
                 &filter,
                 Some(&counter_inner),
             );
-            all.extend(results.into_iter().filter_map(|r| r.ok()));
+            for r in results {
+                match r {
+                    Ok(s) => all.push(s),
+                    Err((_, msg)) => stats.classify(&msg),
+                }
+            }
             if all.len() >= min_viable {
                 break;
             }
         }
-        all
+        (all, stats)
     })
     .await;
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-    }
-    let scored = routed.map_err(AppError::internal)?;
+    let (scored, stats) = routed.map_err(AppError::internal)?;
 
     if scored.is_empty() {
-        return Err(AppError::bad(anyhow!(
-            "no {} of perimeter {:.0} km fits anywhere with the requested modes \
-             and corridor — try widening corridor, relaxing modes, or shrinking perimeter",
-            req.kind,
-            req.perimeter_km
-        )));
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+        return Ok(Json(json!({
+            "results": Vec::<Value>::new(),
+            "failures": stats.to_json(),
+        })));
     }
     // Dedup by center proximity, scaled to the shape's diameter so two big
     // shapes don't merge unless they really overlap.
     let dedup_sep_km = (req.perimeter_km / 6.28).max(8.0);
-    let mut deduped = explore::rank_dedup_top_shapes(scored, count, dedup_sep_km);
+    // Over-keep ahead of elevation enrichment so the ascent re-score can
+    // promote a flatter loop over a marginally tighter but climbier one.
+    let pool_size = if req.elevation_samples > 0 {
+        (count * 3).max(count + 4)
+    } else {
+        count
+    };
+    let width_m = req.width_m;
+    let (tight, loose): (Vec<ScoredShape>, Vec<ScoredShape>) = scored
+        .into_iter()
+        .partition(|s| s.corridor_used_m <= width_m + 1.0);
+    let tight_pool = explore::rank_dedup_top_shapes(tight, pool_size, dedup_sep_km);
+    let loose_pool = explore::rank_dedup_top_shapes(loose, pool_size, dedup_sep_km);
 
-    // Optional elevation enrichment.
-    if req.elevation_samples > 0 {
+    // Initial display set (no elevation): top `count` of each section.
+    let mut initial: Vec<ScoredShape> = tight_pool.iter().take(count).cloned().collect();
+    initial.extend(loose_pool.iter().take(count).cloned());
+    let resp_initial: Vec<Value> = initial
+        .iter()
+        .enumerate()
+        .map(|(i, s)| shape_to_json(s, i + 1, width_m))
+        .collect();
+
+    // Spawn background elevation + re-rank (same async-job pattern as country).
+    let elevation_pending = req.elevation_samples > 0;
+    let request_id = next_async_id();
+    let failures_json = stats.to_json();
+    if elevation_pending {
+        {
+            let mut slot = state.0.async_job.lock().unwrap();
+            *slot = Some(AsyncJob {
+                id: request_id.clone(),
+                width_m,
+                completed: false,
+                failures: failures_json.clone(),
+                kind: AsyncJobKind::Shape { final_results: None },
+            });
+        }
+        let state_for_bg = state.clone();
+        let request_id_bg = request_id.clone();
+        let elevation_samples = req.elevation_samples;
+        tokio::spawn(async move {
+            run_shape_rerank(
+                state_for_bg,
+                request_id_bg,
+                tight_pool,
+                loose_pool,
+                count,
+                width_m,
+                dedup_sep_km,
+                elevation_samples,
+            )
+            .await;
+        });
+    } else {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+    }
+
+    Ok(Json(json!({
+        "request_id": request_id,
+        "elevation_pending": elevation_pending,
+        "results": resp_initial,
+        "failures": failures_json,
+    })))
+}
+
+async fn run_shape_rerank(
+    state: AppState,
+    request_id: String,
+    tight_pool: Vec<ScoredShape>,
+    loose_pool: Vec<ScoredShape>,
+    count: usize,
+    width_m: f64,
+    dedup_sep_km: f64,
+    elevation_samples: usize,
+) {
+    let mut combined: Vec<ScoredShape> = Vec::with_capacity(tight_pool.len() + loose_pool.len());
+    combined.extend(tight_pool);
+    combined.extend(loose_pool);
+    if !combined.is_empty() {
+        let total = combined.len();
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let mut p = state.0.progress.lock().unwrap();
+            *p = Some(ProgressTracker {
+                kind: "elevation",
+                total,
+                done: counter.clone(),
+                started_ms: now_ms(),
+            });
+        }
         let inner = state.0.clone();
-        let owned = std::mem::take(&mut deduped);
+        let owned = std::mem::take(&mut combined);
+        let counter_inner = counter.clone();
         let updated = tokio::task::spawn_blocking(move || -> Vec<ScoredShape> {
             let mut owned = owned;
             let mut client = inner.elev.lock().unwrap();
             for s in owned.iter_mut() {
-                s.elevation = client.profile(&s.route.points, req.elevation_samples);
+                s.elevation = client.profile(&s.route.points, elevation_samples);
+                counter_inner.fetch_add(1, Ordering::Relaxed);
             }
             let _ = client.save();
             owned
         })
         .await
         .unwrap_or_default();
-        deduped = updated;
+        combined = updated;
+        for s in combined.iter_mut() {
+            explore::rescore_shape_with_elevation(s);
+        }
     }
-
-    let width_m = req.width_m;
-    let resp: Vec<Value> = deduped
-        .iter()
-        .enumerate()
-        .map(|(i, s)| shape_to_json(s, i + 1, width_m))
-        .collect();
-    Ok(Json(json!({ "results": resp })))
+    let (tight2, loose2): (Vec<ScoredShape>, Vec<ScoredShape>) = combined
+        .into_iter()
+        .partition(|s| s.corridor_used_m <= width_m + 1.0);
+    let tight_final = explore::rank_dedup_top_shapes(tight2, count, dedup_sep_km);
+    let loose_final = explore::rank_dedup_top_shapes(loose2, count, dedup_sep_km);
+    let mut all_final: Vec<ScoredShape> = tight_final;
+    all_final.extend(loose_final);
+    {
+        let mut slot = state.0.async_job.lock().unwrap();
+        if let Some(job) = slot.as_mut() {
+            if job.id == request_id {
+                if let AsyncJobKind::Shape { final_results } = &mut job.kind {
+                    *final_results = Some(all_final);
+                }
+                job.completed = true;
+            }
+        }
+    }
+    let mut p = state.0.progress.lock().unwrap();
+    *p = None;
 }
 
 
@@ -630,13 +960,26 @@ async fn enrich_elevation(state: &AppState, scored: &mut Vec<Scored>, n_samples:
     if n_samples == 0 || scored.is_empty() {
         return;
     }
+    let total = scored.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+    {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = Some(ProgressTracker {
+            kind: "elevation",
+            total,
+            done: counter.clone(),
+            started_ms: now_ms(),
+        });
+    }
     let inner = state.0.clone();
     let owned = std::mem::take(scored);
+    let counter_inner = counter.clone();
     let updated = tokio::task::spawn_blocking(move || -> Vec<Scored> {
         let mut owned = owned;
         let mut client = inner.elev.lock().unwrap();
         for s in owned.iter_mut() {
             s.elevation = client.profile(&s.route.points, n_samples);
+            counter_inner.fetch_add(1, Ordering::Relaxed);
         }
         let _ = client.save();
         owned
@@ -644,6 +987,51 @@ async fn enrich_elevation(state: &AppState, scored: &mut Vec<Scored>, n_samples:
     .await
     .unwrap_or_default();
     *scored = updated;
+}
+
+async fn handle_results(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Json<Value> {
+    let slot = state.0.async_job.lock().unwrap();
+    let Some(job) = slot.as_ref() else {
+        return Json(json!({ "error": "no active async job" }));
+    };
+    if job.id != id {
+        return Json(json!({ "error": "unknown request_id" }));
+    }
+    match &job.kind {
+        AsyncJobKind::Country { final_results: Some(rs) } => {
+            let resp: Vec<Value> = rs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| scored_to_json(s, i + 1, job.width_m))
+                .collect();
+            Json(json!({
+                "request_id": job.id,
+                "completed": true,
+                "results": resp,
+                "failures": job.failures,
+            }))
+        }
+        AsyncJobKind::Shape { final_results: Some(rs) } => {
+            let resp: Vec<Value> = rs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| shape_to_json(s, i + 1, job.width_m))
+                .collect();
+            Json(json!({
+                "request_id": job.id,
+                "completed": true,
+                "results": resp,
+                "failures": job.failures,
+            }))
+        }
+        _ => Json(json!({
+            "request_id": job.id,
+            "completed": false,
+        })),
+    }
 }
 
 async fn handle_progress(State(state): State<AppState>) -> Json<Value> {
@@ -688,12 +1076,31 @@ async fn handle_index() -> Response {
         .into_response()
 }
 
+async fn handle_style() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+        .into_response()
+}
+
+async fn handle_app_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        APP_JS,
+    )
+        .into_response()
+}
+
 /// Build the axum router given a fully-prepared `AppState`.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handle_index))
+        .route("/style.css", get(handle_style))
+        .route("/app.js", get(handle_app_js))
         .route("/api/info", get(handle_info))
         .route("/api/progress", get(handle_progress))
+        .route("/api/results/:id", get(handle_results))
         .route("/api/between", post(handle_between))
         .route("/api/country", post(handle_country))
         .route("/api/shape-search", post(handle_shape_search))
@@ -760,3 +1167,5 @@ fn pick_alphas(n: usize) -> Vec<f64> {
 }
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
+const STYLE_CSS:  &str = include_str!("../assets/style.css");
+const APP_JS:     &str = include_str!("../assets/app.js");
