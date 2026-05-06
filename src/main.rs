@@ -43,6 +43,21 @@ struct ServeArgs {
     /// Cache dir for elevation lookups.
     #[arg(long, default_value = "./elevation-cache")]
     elevation_cache: PathBuf,
+    /// Directory holding SRTM `.hgt` tiles (NxxEyyy.hgt). If empty, the named
+    /// `--dem-pack` is downloaded from viewfinderpanoramas.org on first run.
+    /// Every graph node is then stamped with its elevation, and the router
+    /// penalises descending edges on non-rideable surfaces (steps / footway /
+    /// path) so bike+hike combos prefer a rideable line on the way down.
+    #[arg(long, default_value = "./dem-cache")]
+    dem_dir: PathBuf,
+    /// viewfinderpanoramas DEM3 pack(s) to download, comma-separated. Each
+    /// pack covers a 6°×4° square: `L32` is N44–48 / E6–12 (most of
+    /// Switzerland and the Alps); `L31` is N44–48 / E0–6 (Geneva, Jura).
+    /// Already-fetched packs are skipped via a marker file in `--dem-dir`.
+    /// Set to an empty string to disable DEM loading entirely. See
+    /// <https://viewfinderpanoramas.org/dem3.html> for the world grid.
+    #[arg(long, default_value = "L31,L32")]
+    dem_pack: String,
     /// Repeatable: GeoJSON polygon files to forbid.
     #[arg(long)]
     no_go: Vec<PathBuf>,
@@ -460,9 +475,27 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         .build()?;
     rt.block_on(async move {
         let pbf_for_build = pbf.clone();
+        let dem_dir_for_build = args.dem_dir.clone();
+        let dem_pack_for_build = args.dem_pack.clone();
         let graph = tokio::task::spawn_blocking(move || -> Result<crowfly::osm::Graph> {
             eprintln!("Building graph from {} …", pbf_for_build.display());
-            crowfly::osm::build(&pbf_for_build, loose_bbox, modes, |_, _| true)
+            let mut g = crowfly::osm::build(&pbf_for_build, loose_bbox, modes, |_, _| true)?;
+            if !dem_pack_for_build.trim().is_empty() {
+                let packs: Vec<&str> = dem_pack_for_build
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                crowfly::dem::ensure_packs(&dem_dir_for_build, &packs)?;
+                let dem = crowfly::dem::Dem::load_dir(&dem_dir_for_build)?;
+                if dem.is_empty() {
+                    eprintln!("  (no tiles found — slope-aware routing disabled)");
+                } else {
+                    eprintln!("  loaded {} tile(s)", dem.tiles.len());
+                    g.stamp_elevations(&dem);
+                }
+            }
+            Ok(g)
         })
         .await??;
         let real_bbox = graph_bbox(&graph);
@@ -484,6 +517,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 elevation_cache: args.elevation_cache.clone(),
                 elev: std::sync::Mutex::new(elev),
                 progress: std::sync::Mutex::new(None),
+                async_job: std::sync::Mutex::new(None),
             },
         ));
         crowfly::server::serve(state, &args.bind).await

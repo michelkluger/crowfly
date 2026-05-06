@@ -2,11 +2,13 @@
 
 use crate::geodesy::{haversine, LatLon};
 use anyhow::{Context, Result};
+use geo::{Contains, Coord, LineString, Polygon};
 use indicatif::{ProgressBar, ProgressStyle};
 use osmpbfreader::{OsmObj, OsmPbfReader};
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::unionfind::UnionFind;
 use petgraph::visit::EdgeRef;
+use rstar::{RTree, RTreeObject, AABB};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs::File;
 use std::path::Path;
@@ -95,6 +97,11 @@ pub struct Graph {
     pub components: Vec<u32>,
     /// Spatial index over node coordinates for fast nearest-neighbour queries.
     pub rtree: rstar::RTree<NodePoint>,
+    /// Per-NodeIndex elevation in metres, populated by `stamp_elevations`.
+    /// `None` until a DEM has been loaded; `f32::NAN` for nodes outside the
+    /// loaded tile coverage. The router uses these to penalise descending on
+    /// non-rideable surfaces when bike is in the mode set.
+    pub elevations_m: Option<Vec<f32>>,
 }
 
 impl Graph {
@@ -120,6 +127,47 @@ impl Graph {
             .collect();
         let rtree = rstar::RTree::bulk_load(points);
         (components, rtree)
+    }
+
+    /// Stamp every graph node with its elevation (metres) from the supplied
+    /// DEM. Nodes that fall outside the DEM's tile coverage get `f32::NAN`.
+    /// Logs a coverage summary including which integer-degree tiles are
+    /// missing so the user knows what to download next.
+    pub fn stamp_elevations(&mut self, dem: &crate::dem::Dem) {
+        let n = self.graph.node_count();
+        let mut elev: Vec<f32> = Vec::with_capacity(n);
+        let mut hits = 0usize;
+        let mut missing_tiles: FxHashSet<(i32, i32)> = FxHashSet::default();
+        for ni in self.graph.node_indices() {
+            let p = self.graph[ni];
+            match dem.elevation_at(p) {
+                Some(z) => {
+                    elev.push(z as f32);
+                    hits += 1;
+                }
+                None => {
+                    elev.push(f32::NAN);
+                    missing_tiles.insert((p.lat.floor() as i32, p.lon.floor() as i32));
+                }
+            }
+        }
+        eprintln!(
+            "DEM coverage: {}/{} nodes have elevation ({:.1}%)",
+            hits,
+            n,
+            100.0 * hits as f64 / (n.max(1)) as f64
+        );
+        if !missing_tiles.is_empty() {
+            let mut list: Vec<String> = missing_tiles
+                .iter()
+                .map(|(lat, lon)| format!("{}{:02}{}{:03}",
+                    if *lat >= 0 { 'N' } else { 'S' }, lat.abs(),
+                    if *lon >= 0 { 'E' } else { 'W' }, lon.abs()))
+                .collect();
+            list.sort();
+            eprintln!("  (missing tiles: {})", list.join(", "));
+        }
+        self.elevations_m = Some(elev);
     }
 
     /// Closest graph node to `p`, via the R-tree. None if graph is empty.
@@ -304,7 +352,10 @@ where
     );
 
     // Pass 1: find ways with passing tags, collect their node IDs, mode mask, surface.
+    // Also collect `natural=glacier` closed ways so we can skip edges that cross
+    // them — glaciers aren't passable terrain even if a path is tagged through them.
     let mut keep_ways: Vec<(i64, Vec<i64>, u8, u8)> = Vec::new();
+    let mut glacier_ways: Vec<Vec<i64>> = Vec::new();
     let mut needed_nodes: FxHashSet<i64> = FxHashSet::default();
     {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -324,6 +375,16 @@ where
                     pb.set_position(scanned);
                     pb.set_message(format!("kept {}", keep_ways.len()));
                 }
+                if w.tags.get("natural").map(|s| s.as_str()) == Some("glacier") {
+                    let nodes: Vec<i64> = w.nodes.iter().map(|n| n.0).collect();
+                    if nodes.len() >= 3 {
+                        for n in &nodes {
+                            needed_nodes.insert(*n);
+                        }
+                        glacier_ways.push(nodes);
+                    }
+                    continue;
+                }
                 let (m, s) = classify(&w.tags, want_modes);
                 if m == 0 {
                     continue;
@@ -336,9 +397,10 @@ where
             }
         }
         pb.finish_with_message(format!(
-            "kept {} ways referencing {} nodes",
+            "kept {} ways referencing {} nodes (+{} glacier ways)",
             keep_ways.len(),
-            needed_nodes.len()
+            needed_nodes.len(),
+            glacier_ways.len(),
         ));
     }
 
@@ -372,6 +434,18 @@ where
         pb.finish_with_message(format!("resolved {} nodes in bbox", node_pos.len()));
     }
 
+    // Build glacier polygons + spatial index from the closed ways collected in
+    // pass 1. Edges whose midpoint falls inside any of these polygons are
+    // dropped from the graph, so the router can't suggest a path that goes
+    // over a glacier (even if OSM has a track tagged across it).
+    let glacier_index = build_glacier_index(&glacier_ways, &node_pos);
+    if !glacier_index.polys.is_empty() {
+        eprintln!(
+            "Glacier exclusion: {} polygons indexed",
+            glacier_index.polys.len()
+        );
+    }
+
     eprintln!("Building graph (final edge filter)");
     let mut graph: UnGraph<LatLon, EdgeData> =
         UnGraph::with_capacity(node_pos.len(), node_pos.len() * 2);
@@ -392,6 +466,7 @@ where
     };
 
     let mut edges_added = 0usize;
+    let mut edges_skipped_glacier = 0usize;
     for (way_id, nodes, modes, surface) in &keep_ways {
         for w in nodes.windows(2) {
             let (Some(p0), Some(p1)) = (node_pos.get(&w[0]).copied(), node_pos.get(&w[1]).copied())
@@ -399,6 +474,11 @@ where
                 continue;
             };
             if !keep_edge(p0, p1) {
+                continue;
+            }
+            let mid = LatLon::new((p0.lat + p1.lat) * 0.5, (p0.lon + p1.lon) * 0.5);
+            if glacier_index.contains(mid) {
+                edges_skipped_glacier += 1;
                 continue;
             }
             let length = haversine(p0, p1);
@@ -422,9 +502,10 @@ where
     }
 
     eprintln!(
-        "Graph built: {} nodes, {} edges",
+        "Graph built: {} nodes, {} edges ({} skipped over glaciers)",
         graph.node_count(),
-        edges_added
+        edges_added,
+        edges_skipped_glacier,
     );
 
     eprintln!("Computing connected components + spatial index…");
@@ -435,5 +516,96 @@ where
         osm_to_idx,
         components,
         rtree,
+        elevations_m: None,
     })
+}
+
+/// Spatial index over `natural=glacier` polygons. AABB pre-filter via rstar,
+/// precise containment via `geo::Contains` for the small candidate set.
+struct GlacierIndex {
+    polys: Vec<Polygon<f64>>,
+    rtree: RTree<GlacierBox>,
+}
+
+#[derive(Clone, Copy)]
+struct GlacierBox {
+    min: [f64; 2],
+    max: [f64; 2],
+    idx: usize,
+}
+
+impl RTreeObject for GlacierBox {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_corners(self.min, self.max)
+    }
+}
+
+impl GlacierIndex {
+    fn empty() -> Self {
+        Self {
+            polys: Vec::new(),
+            rtree: RTree::new(),
+        }
+    }
+    fn contains(&self, p: LatLon) -> bool {
+        if self.polys.is_empty() {
+            return false;
+        }
+        let pt = [p.lon, p.lat];
+        let env = AABB::from_point(pt);
+        for gb in self.rtree.locate_in_envelope_intersecting(&env) {
+            let coord = Coord { x: p.lon, y: p.lat };
+            if self.polys[gb.idx].contains(&coord) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn build_glacier_index(
+    glacier_ways: &[Vec<i64>],
+    node_pos: &FxHashMap<i64, LatLon>,
+) -> GlacierIndex {
+    if glacier_ways.is_empty() {
+        return GlacierIndex::empty();
+    }
+    let mut polys: Vec<Polygon<f64>> = Vec::new();
+    let mut boxes: Vec<GlacierBox> = Vec::new();
+    for nodes in glacier_ways {
+        let mut coords: Vec<Coord<f64>> = Vec::with_capacity(nodes.len());
+        for id in nodes {
+            if let Some(p) = node_pos.get(id) {
+                coords.push(Coord { x: p.lon, y: p.lat });
+            }
+        }
+        if coords.len() < 3 {
+            continue;
+        }
+        // Close the ring if the way isn't already closed (most are, but the
+        // bbox-clipping in pass 2 can drop trailing nodes).
+        if coords.first() != coords.last() {
+            coords.push(coords[0]);
+        }
+        let mut lon_min = f64::INFINITY;
+        let mut lon_max = f64::NEG_INFINITY;
+        let mut lat_min = f64::INFINITY;
+        let mut lat_max = f64::NEG_INFINITY;
+        for c in &coords {
+            if c.x < lon_min { lon_min = c.x; }
+            if c.x > lon_max { lon_max = c.x; }
+            if c.y < lat_min { lat_min = c.y; }
+            if c.y > lat_max { lat_max = c.y; }
+        }
+        let idx = polys.len();
+        polys.push(Polygon::new(LineString::from(coords), vec![]));
+        boxes.push(GlacierBox {
+            min: [lon_min, lat_min],
+            max: [lon_max, lat_max],
+            idx,
+        });
+    }
+    let rtree = RTree::bulk_load(boxes);
+    GlacierIndex { polys, rtree }
 }

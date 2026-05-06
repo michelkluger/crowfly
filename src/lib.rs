@@ -1,3 +1,4 @@
+pub mod dem;
 pub mod elevation;
 pub mod explore;
 pub mod fetch;

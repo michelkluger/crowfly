@@ -75,13 +75,18 @@ impl RouteFilter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scored {
     pub candidate: Candidate,
     pub route: RouteResult,
     pub report: Report,
     pub score: f64,
     pub elevation: Option<Profile>,
+    /// Full-width corridor (metres) actually used to produce this route.
+    /// Equals the user request unless the search loop widened it on retry to
+    /// recover from empty batches; the UI surfaces this as a "looser corridor"
+    /// badge so the user can tell when persistence kicked in.
+    pub corridor_used_m: f64,
 }
 
 pub fn generate_candidates(
@@ -285,13 +290,32 @@ pub fn enclosing_bbox(start: LatLon, candidates: &[Candidate], pad_deg: f64) -> 
     }
 }
 
-/// Combined difficulty score (lower is better).
-fn score(report: &Report, ref_km: f64) -> f64 {
+/// Combined difficulty score (lower is better). Ascent is in metres of
+/// cumulative elevation gain across the route; pass 0.0 (or `None` upstream)
+/// to fall back to a flat scoring that ignores it.
+fn score(report: &Report, ref_km: f64, ascent_m: f64) -> f64 {
     let excess_ratio = (report.total_km / ref_km - 1.0).max(0.0);
     let long_edge_total_km: f64 =
         report.long_edges.iter().map(|le| le.length_m / 1000.0).sum();
     let max_dev_pct = report.max_deviation_m / 1000.0;
-    100.0 * excess_ratio + 5.0 * long_edge_total_km + 8.0 * max_dev_pct
+    // Per-km ascent puts a 100 km flat ride next to a 100 km hilly ride on a
+    // comparable footing with the detour term — 10 m/km is +0.5 score, 50 m/km
+    // is +2.5.
+    let per_km = if report.total_km > 0.0 {
+        ascent_m / report.total_km
+    } else {
+        0.0
+    };
+    100.0 * excess_ratio + 5.0 * long_edge_total_km + 8.0 * max_dev_pct + 0.05 * per_km
+}
+
+/// Recompute `Scored.score` after elevation has been filled in. Country and
+/// shape-search call this so the final ranking picks the lowest-ascent route
+/// that still satisfies the corridor constraints.
+pub fn rescore_with_elevation(s: &mut Scored) {
+    let ref_km = haversine(s.candidate.start, s.candidate.end) / 1000.0;
+    let ascent = s.elevation.as_ref().map(|e| e.ascent_m).unwrap_or(0.0);
+    s.score = score(&s.report, ref_km, ascent);
 }
 
 pub fn route_one(
@@ -370,13 +394,14 @@ pub fn route_one(
                     ));
                 }
             }
-            let s = score(&report, ref_km);
+            let s = score(&report, ref_km, 0.0);
             Ok(Scored {
                 candidate,
                 route: r,
                 report,
                 score: s,
                 elevation: None,
+                corridor_used_m: params.half_width_m * 2.0,
             })
         }
         Err(e) => Err((candidate, e.to_string())),
@@ -419,7 +444,7 @@ pub struct ShapeCandidate {
 /// the routed path is one continuous concatenation of legs and the metrics
 /// are aggregated across legs (max_deviation isn't meaningful since each leg
 /// has its own line).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScoredShape {
     pub candidate: ShapeCandidate,
     pub vertices: Vec<LatLon>,
@@ -428,6 +453,9 @@ pub struct ScoredShape {
     pub ferry_km: f64,
     pub score: f64,
     pub elevation: Option<Profile>,
+    /// Full-width corridor (metres) actually used to produce this route — see
+    /// `Scored::corridor_used_m`.
+    pub corridor_used_m: f64,
 }
 
 /// Sample N shape candidates whose center sits inside an inset bbox so the
@@ -546,6 +574,7 @@ pub fn route_one_shape(
         ferry_km,
         score,
         elevation: None,
+        corridor_used_m: params.half_width_m * 2.0,
     })
 }
 
@@ -568,6 +597,20 @@ pub fn evaluate_shapes(
             r
         })
         .collect()
+}
+
+/// Recompute a shape's score after elevation is filled in. Detour ratio plus
+/// a per-km ascent term so flat loops outrank steeply climbing ones.
+pub fn rescore_shape_with_elevation(s: &mut ScoredShape) {
+    let real_km = s.route.total_length_m / 1000.0;
+    let detour = if s.candidate.perimeter_km > 0.0 {
+        (real_km / s.candidate.perimeter_km - 1.0).max(0.0)
+    } else {
+        0.0
+    };
+    let ascent = s.elevation.as_ref().map(|e| e.ascent_m).unwrap_or(0.0);
+    let per_km = if real_km > 0.0 { ascent / real_km } else { 0.0 };
+    s.score = 100.0 * detour + 0.05 * per_km;
 }
 
 /// Rank by score, drop near-duplicate centers, take top n. Two shapes are

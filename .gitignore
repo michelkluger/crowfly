@@ -5,6 +5,7 @@
 # Cached data (large + regenerated on demand)
 /osm-cache
 /elevation-cache
+/dem-cache
 
 # Outputs from CLI runs
 /out

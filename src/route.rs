@@ -16,7 +16,10 @@
 //! routing inner loop.
 
 use crate::geodesy::{CrossTrack, HaversineToTarget, LatLon};
-use crate::osm::{EdgeData, Graph, SURFACE_PAVED};
+use crate::osm::{
+    EdgeData, Graph, MODE_BIKE, SURFACE_FERRY, SURFACE_GRAVEL, SURFACE_OTHER, SURFACE_PATH,
+    SURFACE_PAVED, SURFACE_UNPAVED,
+};
 use anyhow::{anyhow, Result};
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
@@ -166,7 +169,29 @@ pub fn shortest(
     let heur = HaversineToTarget::new(target_pos);
 
     let paved_only = params.paved_only;
-    let cost = |p0: LatLon, p1: LatLon, e: &EdgeData| -> f64 {
+    let elevations = graph.elevations_m.as_deref();
+    // Per-surface "fictional metres added per metre of descent" when bike is in
+    // the active mode mask. Steeper drops on path/footway/steps become
+    // disproportionately expensive, so the router prefers a longer rideable
+    // alternative on the way down. Uphill traversal is unaffected (descent ≤ 0).
+    let descent_factor = |surface: u8| -> f64 {
+        if (modes & MODE_BIKE) == 0 {
+            return 0.0;
+        }
+        match surface {
+            SURFACE_PAVED | SURFACE_FERRY => 0.0,
+            SURFACE_GRAVEL => 1.0,
+            SURFACE_UNPAVED => 8.0,
+            SURFACE_OTHER => 4.0,
+            SURFACE_PATH => 25.0,
+            _ => 0.0,
+        }
+    };
+    let cost = |p0: LatLon,
+                p1: LatLon,
+                e: &EdgeData,
+                elev_pair: Option<(f32, f32)>|
+     -> f64 {
         if (e.modes & modes) == 0 {
             return f64::INFINITY;
         }
@@ -179,7 +204,25 @@ pub fn shortest(
             return f64::INFINITY;
         }
         let rel = dev * inv_half;
-        e.length_m * (1.0 + alpha * rel * rel)
+        let mut c = e.length_m * (1.0 + alpha * rel * rel);
+        if let Some((zs, zt)) = elev_pair {
+            if zs.is_finite() && zt.is_finite() {
+                let drop_m = (zs - zt) as f64;
+                if drop_m > 1.0 {
+                    c += drop_m * descent_factor(e.surface);
+                }
+            }
+        }
+        c
+    };
+
+    let elev_for = |s: petgraph::graph::NodeIndex,
+                    t: petgraph::graph::NodeIndex|
+     -> Option<(f32, f32)> {
+        let el = elevations?;
+        let zs = *el.get(s.index())?;
+        let zt = *el.get(t.index())?;
+        Some((zs, zt))
     };
 
     let result = astar_fx(
@@ -187,9 +230,11 @@ pub fn shortest(
         start,
         end,
         |er| {
-            let p0 = g[er.source()];
-            let p1 = g[er.target()];
-            cost(p0, p1, er.weight())
+            let s = er.source();
+            let t = er.target();
+            let p0 = g[s];
+            let p1 = g[t];
+            cost(p0, p1, er.weight(), elev_for(s, t))
         },
         |n| heur.distance(g[n]),
     );
@@ -207,13 +252,14 @@ pub fn shortest(
     for w in path.windows(2) {
         let p0 = g[w[0]];
         let p1 = g[w[1]];
+        let elev_pair = elev_for(w[0], w[1]);
         let mut best: Option<(EdgeData, f64)> = None;
         for er in g.edges_connecting(w[0], w[1]) {
             let e = er.weight();
             if (e.modes & modes) == 0 {
                 continue;
             }
-            let c = cost(p0, p1, e);
+            let c = cost(p0, p1, e, elev_pair);
             if best.map_or(true, |(_, bc)| c < bc) {
                 best = Some((*e, c));
             }
@@ -345,6 +391,7 @@ mod tests {
             osm_to_idx: FxHashMap::default(),
             components,
             rtree,
+            elevations_m: None,
         }
     }
 
