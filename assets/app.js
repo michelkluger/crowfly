@@ -111,6 +111,10 @@ map.on('load', async () => {
       'line-opacity': 0.8
     }
   });
+  // Intended-shape outline source — added here, but the layer is added below
+  // (after the route layers) so the dashed guide is drawn on TOP of the red
+  // route line and stays visible.
+  map.addSource('shape-guides', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
   // Route lines + endpoint dots.
   map.addSource('routes', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
   // Wide, transparent halo to give clicks generous tolerance even when the
@@ -152,6 +156,19 @@ map.on('load', async () => {
     paint: {
       'circle-color': '#222', 'circle-radius': 3.5,
       'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5
+    }
+  });
+  // Intended-shape outline. Bright cyan dashed, drawn ON TOP of the route so
+  // you can see "what we asked for" overlaid on "what we got". Filter to the
+  // active rank only — multiple shape outlines on top of each other is noisy.
+  map.addLayer({
+    id: 'shape-guide-line', type: 'line', source: 'shape-guides',
+    filter: ['==', ['get', 'rank'], 1],
+    paint: {
+      'line-color': '#0096dc',
+      'line-width': 2.5,
+      'line-dasharray': [2, 2.5],
+      'line-opacity': 0.95,
     }
   });
   map.on('mousemove', 'routes-hit', () => { map.getCanvas().style.cursor = 'pointer'; });
@@ -475,6 +492,7 @@ function renderResults(rs, failures, _opts) {
   const feats = [];
   const corridorFeats = [];
   const refFeats = [];
+  const shapeGuideFeats = [];
   for (const r of rs) {
     const isShape = !!r.shape; // shapes are closed loops, no start/end/corridor/reference
     feats.push({
@@ -482,6 +500,13 @@ function renderResults(rs, failures, _opts) {
       properties: { rank: r.rank },
       geometry: { type: 'LineString', coordinates: r.coords }
     });
+    if (isShape && r.shape.vertices && r.shape.vertices.length >= 2) {
+      shapeGuideFeats.push({
+        type: 'Feature',
+        properties: { rank: r.rank },
+        geometry: { type: 'LineString', coordinates: r.shape.vertices }
+      });
+    }
     if (!isShape) {
       feats.push({
         type: 'Feature',
@@ -539,6 +564,7 @@ function renderResults(rs, failures, _opts) {
   map.getSource('routes').setData({ type: 'FeatureCollection', features: feats });
   map.getSource('corridors').setData({ type: 'FeatureCollection', features: corridorFeats });
   map.getSource('reference').setData({ type: 'FeatureCollection', features: refFeats });
+  map.getSource('shape-guides').setData({ type: 'FeatureCollection', features: shapeGuideFeats });
   // Split into primary (route fit inside the requested corridor) and
   // alternatives (search had to widen). Cards keep their server-assigned
   // ranks so the existing map filters / GPX downloads still work.
@@ -804,6 +830,9 @@ function selectRank(rank) {
   if (map.getLayer('corridor-fill')) {
     map.setFilter('corridor-fill', ['==', ['get', 'rank'], rank]);
     map.setFilter('corridor-outline', ['==', ['get', 'rank'], rank]);
+  }
+  if (map.getLayer('shape-guide-line')) {
+    map.setFilter('shape-guide-line', ['==', ['get', 'rank'], rank]);
   }
   if (map.getLayer('reference-line')) {
     map.setFilter('reference-line', ['==', ['get', 'rank'], rank]);

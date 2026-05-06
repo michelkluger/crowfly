@@ -487,9 +487,10 @@ pub fn generate_shape_candidates_in_bbox(
         return Vec::new();
     }
     let mut out = Vec::with_capacity(n);
+    let lock_rotation = kind.has_natural_orientation();
     for _ in 0..n {
         let center = LatLon::new(rng.gen_range(lat_lo..lat_hi), rng.gen_range(lon_lo..lon_hi));
-        let rotation_deg = rng.gen_range(0.0..360.0);
+        let rotation_deg = if lock_rotation { 0.0 } else { rng.gen_range(0.0..360.0) };
         out.push(ShapeCandidate {
             center,
             kind,
@@ -519,6 +520,11 @@ pub fn route_one_shape(
     let mut all_points: Vec<LatLon> = Vec::new();
     let mut all_edges: Vec<EdgeData> = Vec::new();
     let mut total_length = 0.0_f64;
+    // Track per-leg fidelity: how much each routed leg stretches beyond the
+    // straight-line distance between consecutive polyline vertices. A loop
+    // with one wildly detouring leg should rank below a loop where every leg
+    // hugs the polyline, even if their total lengths match.
+    let mut max_leg_detour: f64 = 0.0;
     for (i, w) in vertices.windows(2).enumerate() {
         let pair = match graph.closest_connected_pair(w[0], w[1]) {
             Some(p) => p,
@@ -542,6 +548,11 @@ pub fn route_one_shape(
                 return Err((candidate, format!("leg {}: {}", i + 1, e)));
             }
         };
+        let intended = haversine(w[0], w[1]).max(1.0);
+        let leg_detour = (leg.total_length_m / intended - 1.0).max(0.0);
+        if leg_detour > max_leg_detour {
+            max_leg_detour = leg_detour;
+        }
         if all_points.is_empty() {
             all_points.extend(&leg.points);
         } else {
@@ -561,7 +572,11 @@ pub fn route_one_shape(
     }
     let real_km = total_length / 1000.0;
     let detour = (real_km / candidate.perimeter_km - 1.0).max(0.0);
-    let score = 100.0 * detour;
+    // Combined score: total detour as before, plus a heavy penalty on the
+    // worst single leg. A loop where one leg detours 200% but the rest are
+    // tight will end up scoring worse than a loop where every leg detours
+    // ~50% — exactly what the user wants for shape fidelity.
+    let score = 100.0 * detour + 80.0 * max_leg_detour;
     Ok(ScoredShape {
         candidate,
         vertices,
