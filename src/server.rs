@@ -13,7 +13,9 @@ use crate::elevation::ElevationClient;
 use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
 use crate::osm::{BBox, Graph, MODE_BIKE, MODE_FOOT, MODE_MTB, SURFACE_LABELS};
+use crate::hershey_fonts::Font;
 use crate::route::RouteParams;
+use crate::text;
 use crate::viability::NoGoZone;
 use anyhow::{anyhow, Result};
 use axum::{
@@ -218,6 +220,60 @@ pub struct ShapeSearchReq {
     pub min_viable: Option<usize>,
     #[serde(default)]
     pub strict_corridor: bool,
+}
+
+#[derive(Deserialize)]
+pub struct TextReq {
+    /// What to write. Newlines force line breaks; non-ASCII glyphs are
+    /// dropped (counted in `missing_glyphs`).
+    pub text: String,
+    /// Capital-letter height in metres. Below ~5 km the routed letters
+    /// generally lose legibility because the road grid spacing dominates
+    /// stroke length; default is 15 km.
+    #[serde(default = "default_text_letter")]
+    pub letter_height_m: f64,
+    /// Wrap to a new line when a line's horizontal extent would exceed this
+    /// many metres. 0 disables wrapping.
+    #[serde(default = "default_text_wrap")]
+    pub wrap_m: f64,
+    /// Font name: `simplex` or `cursive`.
+    #[serde(default = "default_text_font")]
+    pub font: String,
+    /// Per-stroke detour cap. A placement is accepted only if every stroke
+    /// routes within `intended × this`. Lower = stricter shape fidelity but
+    /// more candidate placements rejected. 1.6 means up to +60 % detour.
+    #[serde(default = "default_text_detour_cap")]
+    pub detour_cap: f64,
+    /// Number of (centre, bearing) candidates the search tries before giving
+    /// up. Each candidate roughly costs `~stroke_count` short A* routes;
+    /// mountain candidates abort on the first stroke. 200 fans well across a
+    /// country-sized graph.
+    #[serde(default = "default_text_candidates")]
+    pub candidates: usize,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default = "default_modes")]
+    pub modes: String,
+    #[serde(default)]
+    pub paved_only: bool,
+    #[serde(default = "default_elev_samples")]
+    pub elevation_samples: usize,
+}
+
+fn default_text_letter() -> f64 {
+    15_000.0
+}
+fn default_text_wrap() -> f64 {
+    100_000.0
+}
+fn default_text_font() -> String {
+    "simplex".into()
+}
+fn default_text_detour_cap() -> f64 {
+    1.6
+}
+fn default_text_candidates() -> usize {
+    200
 }
 
 fn default_border_strip() -> f64 {
@@ -888,6 +944,308 @@ async fn handle_shape_search(
     })))
 }
 
+/// Search across candidate placements (centre × bearing) inside the loaded
+/// graph's bbox and return the placement where every stroke routed within
+/// the detour cap. The user explicitly does NOT want "skipping" semantics:
+/// a placement is either accepted whole or discarded — partial successes
+/// produce gappy, unreadable letters.
+async fn handle_text(
+    State(state): State<AppState>,
+    Json(req): Json<TextReq>,
+) -> Result<Json<Value>, AppError> {
+    let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
+    if req.text.trim().is_empty() {
+        return Err(AppError::bad(anyhow!("text is empty")));
+    }
+    if !req.letter_height_m.is_finite() || req.letter_height_m < 500.0 {
+        return Err(AppError::bad(anyhow!(
+            "letter_height_m must be ≥ 500 (got {})",
+            req.letter_height_m
+        )));
+    }
+    let font = Font::parse(&req.font)
+        .ok_or_else(|| AppError::bad(anyhow!("unknown font: {}", req.font)))?;
+
+    // Stroke-tight corridor: ≈ 10 % of letter height, clamped both sides so
+    // small letters still have *some* leeway and giant letters don't get a
+    // ribbon so wide that letters read as smudges. Higher α than other modes
+    // because letters need shape fidelity, not road preference.
+    let stroke_half_m = (0.10 * req.letter_height_m).clamp(300.0, 1_500.0);
+    let params = RouteParams {
+        modes,
+        half_width_m: stroke_half_m,
+        alpha: 30.0,
+        corridor_max_m: stroke_half_m,
+        paved_only: req.paved_only,
+    };
+    let detour_cap = req.detour_cap.max(1.0);
+    let n_candidates = req.candidates.clamp(20, 1000);
+    let seed = req.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let bbox = state.0.bbox;
+    let wrap_m = if req.wrap_m > 0.0 { req.wrap_m } else { 0.0 };
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    // Total tracked = number of (centre, bearing) candidates the search will
+    // visit. The search bumps this counter once per candidate, accept or
+    // reject — gives the FE a meaningful "evaluated N/M placements" readout.
+    let progress_total = {
+        // Mirror the candidate count expansion in search_text_placements:
+        // 5 bearings per sampled position, ceil-divide to fit n_candidates.
+        let bearings = 5usize;
+        let n_pos = n_candidates.div_ceil(bearings).max(1);
+        n_pos * bearings
+    };
+    {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = Some(ProgressTracker {
+            kind: "text",
+            total: progress_total,
+            done: counter.clone(),
+            started_ms: now_ms(),
+        });
+    }
+
+    let inner = state.0.clone();
+    let counter_inner = counter.clone();
+    let text_owned = req.text.clone();
+    let placements = tokio::task::spawn_blocking(move || -> Vec<text::MessagePlacement> {
+        text::search_text_placements(
+            &inner.graph,
+            &text_owned,
+            req.letter_height_m,
+            wrap_m,
+            font,
+            &params,
+            bbox,
+            detour_cap,
+            n_candidates,
+            seed,
+            Some(&counter_inner),
+            &inner.no_go,
+        )
+    })
+    .await
+    .map_err(AppError::internal)?;
+
+    {
+        let mut p = state.0.progress.lock().unwrap();
+        *p = None;
+    }
+
+    // Probe layout to surface missing-glyph count.
+    let probe = text::layout_text(
+        &req.text,
+        LatLon::new((bbox.lat_min + bbox.lat_max) * 0.5, (bbox.lon_min + bbox.lon_max) * 0.5),
+        std::f64::consts::FRAC_PI_2,
+        req.letter_height_m,
+        wrap_m,
+        font,
+    );
+
+    let Some(best) = placements.into_iter().next() else {
+        return Ok(Json(json!({
+            "results": Vec::<Value>::new(),
+            "failures": json!({
+                "snap_too_far": 0, "corridor_violated": 0, "no_route": 0,
+                "no_go": 0, "too_short": 0, "too_long": 0, "other": 0,
+                "total": progress_total,
+            }),
+            "text_render_meta": {
+                "evaluated": progress_total,
+                "missing_glyphs": probe.missing_glyphs,
+                "hint": "no placement found where every letter routes within the detour cap — try larger letter_km, shorter text, or higher detour_cap",
+            },
+        })));
+    };
+
+    let total_routed_m = best.total_routed_m;
+    let total_intended_m = best.total_intended_m;
+    let total_pen_up_m = best.total_pen_up_m;
+    let detour = if total_intended_m > 0.0 {
+        (total_routed_m / total_intended_m - 1.0).max(0.0)
+    } else {
+        0.0
+    };
+    let score = text::text_score(total_routed_m, total_intended_m, probe.missing_glyphs);
+
+    // Surface breakdown spans both letter strokes and pen-up segments —
+    // pen-ups are part of the rideable track, so treat them the same.
+    let mut surface = [0.0_f64; 6];
+    let mut ferry_km = 0.0;
+    let mut accumulate_edge = |e: &crate::osm::EdgeData| {
+        let s = (e.surface as usize).min(5);
+        surface[s] += e.length_m / 1000.0;
+        if (e.modes & crate::osm::MODE_FERRY) != 0 {
+            ferry_km += e.length_m / 1000.0;
+        }
+    };
+    for letter in &best.letters {
+        for sr in &letter.stroke_routes {
+            for e in &sr.edges {
+                accumulate_edge(e);
+            }
+        }
+    }
+    let surface_breakdown: Vec<Value> = SURFACE_LABELS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| surface[*i] > 0.001)
+        .map(|(i, label)| json!({ "label": label, "km": surface[i] }))
+        .collect();
+
+    // Build per-letter JSON (each letter contains its character + array of
+    // routed strokes) and a parallel array of pen-up polylines. The FE
+    // renders strokes thick, pen-ups thin/dashed.
+    let letters_json: Vec<Value> = best
+        .letters
+        .iter()
+        .map(|l| {
+            let strokes: Vec<Vec<[f64; 2]>> = l
+                .stroke_routes
+                .iter()
+                .map(|r| r.points.iter().map(|p| [p.lon, p.lat]).collect())
+                .collect();
+            json!({
+                "char": l.ch.to_string(),
+                "strokes": strokes,
+                "center": [l.centre_chosen.lon, l.centre_chosen.lat],
+                "bearing_deg": l.bearing_rad.to_degrees(),
+                "max_stroke_detour_pct": ((l.max_stroke_detour - 1.0) * 100.0).max(0.0).round(),
+            })
+        })
+        .collect();
+
+    let pen_ups_json: Vec<Vec<[f64; 2]>> = best
+        .pen_ups
+        .iter()
+        .map(|p| p.points.iter().map(|q| [q.lon, q.lat]).collect())
+        .collect();
+
+    // For map fitBounds + GPX flattening, concatenate letters + pen-ups in
+    // ride order (letter[0].strokes ++ pen_up[0..k0] ++ letter[1].strokes …).
+    let mut all_coords: Vec<[f64; 2]> = Vec::new();
+    let mut pu_idx = 0usize;
+    let mut first_stroke_overall = true;
+    for letter in &best.letters {
+        for sr in &letter.stroke_routes {
+            if !first_stroke_overall {
+                if let Some(pu) = best.pen_ups.get(pu_idx) {
+                    for p in &pu.points {
+                        all_coords.push([p.lon, p.lat]);
+                    }
+                }
+                pu_idx += 1;
+            }
+            for p in &sr.points {
+                all_coords.push([p.lon, p.lat]);
+            }
+            first_stroke_overall = false;
+        }
+    }
+
+    let stroke_count: usize = best.letters.iter().map(|l| l.stroke_routes.len()).sum();
+    let total_track_m = total_routed_m + total_pen_up_m;
+
+    let elevation_json = if req.elevation_samples > 0 {
+        let inner = state.0.clone();
+        // Sample over the full rideable track (strokes + pen-ups in order)
+        // so the elevation profile matches what someone actually rides.
+        let pts: Vec<LatLon> = {
+            let mut out: Vec<LatLon> = Vec::new();
+            let mut pu_idx = 0usize;
+            let mut first = true;
+            for letter in &best.letters {
+                for sr in &letter.stroke_routes {
+                    if !first {
+                        if let Some(pu) = best.pen_ups.get(pu_idx) {
+                            out.extend_from_slice(&pu.points);
+                        }
+                        pu_idx += 1;
+                    }
+                    out.extend_from_slice(&sr.points);
+                    first = false;
+                }
+            }
+            out
+        };
+        let n = req.elevation_samples;
+        let prof = tokio::task::spawn_blocking(move || -> Option<crate::elevation::Profile> {
+            let mut client = inner.elev.lock().unwrap();
+            let p = client.profile(&pts, n);
+            let _ = client.save();
+            p
+        })
+        .await
+        .ok()
+        .flatten();
+        prof.map(|p| {
+            json!({
+                "samples_m": p.samples_m,
+                "ascent_m": p.ascent_m,
+                "descent_m": p.descent_m,
+                "max_m": p.max_m,
+                "min_m": p.min_m,
+            })
+        })
+    } else {
+        None
+    };
+
+    let result = json!({
+        "rank": 1,
+        "score": score,
+        "kind": "text",
+        "text": req.text,
+        "start": [best.anchor_centre.lon, best.anchor_centre.lat],
+        "end":   [best.anchor_centre.lon, best.anchor_centre.lat],
+        "bearing_deg": best.anchor_bearing_rad.to_degrees(),
+        "ref_km": total_intended_m / 1000.0,
+        "real_km": total_track_m / 1000.0,
+        "max_dev_m": 0.0,
+        "ferry_km": ferry_km,
+        "surface": surface_breakdown,
+        "elevation": elevation_json,
+        "coords": all_coords,
+        "corridor": Vec::<[f64; 2]>::new(),
+        "width_m": stroke_half_m * 2.0,
+        "corridor_used_m": stroke_half_m * 2.0,
+        "text_render": {
+            "letters": letters_json,
+            "pen_ups": pen_ups_json,
+            "stroke_count": stroke_count,
+            "pen_up_count": best.pen_ups.len(),
+            "skipped_strokes": 0,
+            "missing_glyphs": probe.missing_glyphs,
+            "letter_height_m": req.letter_height_m,
+            "wrap_m": req.wrap_m,
+            "bbox_along_m": best.bbox_along_m,
+            "bbox_across_m": best.bbox_across_m,
+            "detour_pct": (detour * 100.0).round(),
+            "max_stroke_detour_pct": ((best.max_stroke_detour - 1.0) * 100.0).max(0.0).round(),
+            "pen_up_km": total_pen_up_m / 1000.0,
+            "stroke_km": total_routed_m / 1000.0,
+            "candidates_evaluated": progress_total,
+            "font": req.font,
+            "center": [best.anchor_centre.lon, best.anchor_centre.lat],
+            "bearing_deg": best.anchor_bearing_rad.to_degrees(),
+        },
+    });
+
+    Ok(Json(json!({
+        "results": [result],
+        "failures": json!({
+            "snap_too_far": 0, "corridor_violated": 0, "no_route": 0,
+            "no_go": 0, "too_short": 0, "too_long": 0, "other": 0,
+            "total": 0,
+        }),
+    })))
+}
+
 async fn run_shape_rerank(
     state: AppState,
     request_id: String,
@@ -1104,6 +1462,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/between", post(handle_between))
         .route("/api/country", post(handle_country))
         .route("/api/shape-search", post(handle_shape_search))
+        .route("/api/text", post(handle_text))
         .with_state(state)
 }
 

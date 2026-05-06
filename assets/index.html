@@ -19,6 +19,8 @@
       <span class="ico">⌖</span> Country</button>
     <button id="tabShape" data-mode="shape" title="Trace closed-loop shapes (circle, triangle, …)">
       <span class="ico">⬡</span> Shapes</button>
+    <button id="tabText" data-mode="text" title="Write text on the map — server searches for the best place to put it">
+      <span class="ico">✎</span> Text</button>
   </div>
   <div class="scroll">
 
@@ -118,6 +120,44 @@
     <div class="actions">
       <button class="btn-secondary" id="btnShapeSearch">
         <span class="ico">⬡</span>Suggest shapes</button>
+    </div>
+  </div>
+
+  <!-- Text mode -->
+  <div class="mode-panel" id="panelText">
+    <div class="options-group">
+      <div class="group-head"><span class="ico">✎</span> message</div>
+      <div class="options">
+        <label style="grid-column: span 2;" title="What to write. Newlines force line breaks. ASCII printable only; other characters are skipped.">
+          <span style="grid-column: 1 / -1;">text</span>
+          <textarea id="optText" rows="3" style="grid-column: 1 / -1; width: 100%;"
+            placeholder="Type your message…"></textarea>
+        </label>
+      </div>
+    </div>
+    <div class="options-group">
+      <div class="group-head"><span class="ico">⇲</span> size &amp; font</div>
+      <div class="options">
+        <label title="Capital-letter height in km. Below ~5 km the routed letters become hard to read because road-grid spacing dominates stroke length. Bigger = more legible.">
+          letter km <input type="number" id="optLetterKm" value="15" step="1" min="1"></label>
+        <label title="Wrap to a new line when the horizontal extent would exceed this many km. 0 disables wrapping (single long line).">
+          wrap km <input type="number" id="optWrapKm" value="100" step="10" min="0"></label>
+        <label style="grid-column: span 2;" title="Hershey vector font. Simplex is geometric and routes well. Cursive has fewer pen-up gaps but more curvature, so legibility is more sensitive to road density.">
+          font
+          <select id="optFont">
+            <option value="simplex" selected>simplex (clean sans)</option>
+            <option value="cursive">cursive (more connected)</option>
+          </select>
+        </label>
+        <label title="A placement is accepted only if EVERY stroke routes within (intended × this). Lower = stricter shape fidelity but harder to find a viable spot. 1.6 = up to +60 % detour per stroke.">
+          detour cap <input type="number" id="optDetourCap" value="1.6" step="0.1" min="1.0"></label>
+        <label title="How many candidate placements (centre × bearing) the server tries before giving up. More = better chance of finding a spot, but slower.">
+          candidates <input type="number" id="optTextCandidates" value="200" step="50" min="20" max="1000"></label>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn-secondary" id="btnText">
+        <span class="ico">✎</span>Find a place &amp; write</button>
     </div>
   </div>
 

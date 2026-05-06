@@ -171,6 +171,31 @@ map.on('load', async () => {
       'line-opacity': 0.95,
     }
   });
+  // Text-mode strokes: each letter's strokes become separate LineStrings.
+  // Drawn red and bold. Pen-up connectors between strokes go in a separate
+  // source (`text-penups`) and render thinner + grey, so the eye reads the
+  // letters as the primary content.
+  map.addSource('text-strokes', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addSource('text-penups',  { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addLayer({
+    id: 'text-penup-line', type: 'line', source: 'text-penups',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color': '#888',
+      'line-width': 1.5,
+      'line-opacity': 0.65,
+      'line-dasharray': [2, 3],
+    }
+  });
+  map.addLayer({
+    id: 'text-stroke-line', type: 'line', source: 'text-strokes',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color': '#e63946',
+      'line-width': 4,
+      'line-opacity': 0.95,
+    }
+  });
   map.on('mousemove', 'routes-hit', () => { map.getCanvas().style.cursor = 'pointer'; });
   map.on('mouseleave', 'routes-hit', () => { map.getCanvas().style.cursor = ''; });
 
@@ -201,8 +226,8 @@ map.on('click', (e) => {
       return;
     }
   }
-  // A/B placement is only meaningful in "between" mode — country and shape
-  // searches don't use endpoints, so we ignore map clicks there.
+  // A/B placement is only meaningful in "between" mode — country, shape,
+  // and text searches don't use endpoints, so we ignore map clicks there.
   if (currentMode !== 'between') return;
   const p = [e.lngLat.lng, e.lngLat.lat];
   if (!A) { A = p; markerA.setLngLat(p).addTo(map); }
@@ -222,6 +247,7 @@ function switchMode(mode) {
   document.getElementById('panelBetween').classList.toggle('active', mode === 'between');
   document.getElementById('panelCountry').classList.toggle('active', mode === 'country');
   document.getElementById('panelShape').classList.toggle('active', mode === 'shape');
+  document.getElementById('panelText').classList.toggle('active', mode === 'text');
   saveParams();
 }
 document.querySelectorAll('.tabs button').forEach(b => {
@@ -277,6 +303,7 @@ const PARAM_IDS = [
   'optElev','optDmin','optDmax',
   'optBorder','optStrip','optMinViable','optShapeMinViable','optPaved','optStrict',
   'optShape','optPerim',
+  'optText','optLetterKm','optWrapKm','optFont','optDetourCap','optTextCandidates',
 ];
 function loadParams() {
   try {
@@ -292,7 +319,7 @@ function loadParams() {
       // refresh after restore.
       el.dispatchEvent(new Event('input', { bubbles: true }));
     }
-    if (typeof v.__mode === 'string' && ['between','country','shape'].includes(v.__mode)) {
+    if (typeof v.__mode === 'string' && ['between','country','shape','text'].includes(v.__mode)) {
       switchMode(v.__mode);
     }
     // Migration: corridor used to be stored in metres (e.g. 8000). Now it's
@@ -348,6 +375,7 @@ function startProgressPoll() {
           'country':      'evaluating candidates',
           'shape-search': 'evaluating shapes',
           'between':      'finding alternatives',
+          'text':         'evaluating placements',
           'elevation':    'fetching elevation profiles',
         })[r.kind] || r.kind;
         document.getElementById('progressLabel').textContent =
@@ -384,6 +412,8 @@ function setBusy(busy) {
   document.getElementById('btnBetween').disabled = busy || !(A && B);
   document.getElementById('btnCountry').disabled = busy;
   document.getElementById('btnShapeSearch').disabled = busy;
+  const tb = document.getElementById('btnText');
+  if (tb) tb.disabled = busy;
   document.getElementById('btnCancel').style.display = busy ? '' : 'none';
 }
 
@@ -414,6 +444,59 @@ document.getElementById('btnBetween').addEventListener('click', async () => {
     });
     renderResults(j.results, j.failures);
     setStatus(`got ${j.results.length} alternatives`);
+  } catch (e) {
+    if (isAbort(e)) return;
+    setStatus('error: ' + e.message);
+    document.getElementById('cards').innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+});
+
+document.getElementById('btnText').addEventListener('click', async () => {
+  const text = document.getElementById('optText').value;
+  if (!text.trim()) {
+    setStatus('error: text is empty');
+    return;
+  }
+  const letterKm = parseFloat(document.getElementById('optLetterKm').value);
+  const wrapKm   = parseFloat(document.getElementById('optWrapKm').value);
+  const detour   = parseFloat(document.getElementById('optDetourCap').value);
+  const cands    = parseInt(document.getElementById('optTextCandidates').value, 10);
+  const teaser = text.length > 32 ? text.slice(0, 32) + '…' : text;
+  setStatus(`<span class="spinner"></span> searching for a place to write "${teaser}"…`);
+  document.getElementById('cards').innerHTML = '<div class="empty">searching placements…</div>';
+  showProgress('searching placements…');
+  startProgressPoll();
+  try {
+    const j = await postJson('/api/text', {
+      modes: document.getElementById('optModes').value,
+      elevation_samples: +document.getElementById('optElev').value,
+      paved_only: document.getElementById('optPaved').checked,
+      text,
+      letter_height_m: Math.round((Number.isFinite(letterKm) ? letterKm : 15) * 1000),
+      wrap_m:          Math.round((Number.isFinite(wrapKm)   ? wrapKm   : 0)  * 1000),
+      font: document.getElementById('optFont').value,
+      detour_cap: Number.isFinite(detour) && detour >= 1.0 ? detour : 1.6,
+      candidates: Number.isFinite(cands) && cands > 0 ? cands : 200,
+    });
+    stopAsyncPoll();
+    renderResults(j.results, j.failures);
+    if (j.results.length === 0) {
+      const m = j.text_render_meta || {};
+      const evald = m.evaluated || 0;
+      const hint = m.hint || 'try larger letter km, shorter text, or higher detour cap';
+      setStatus(`no viable placement after ${evald} candidates — ${hint}`);
+    } else {
+      const r = j.results[0];
+      const tr = r.text_render || {};
+      const total = tr.stroke_count || 0;
+      const miss = tr.missing_glyphs || 0;
+      const evald = tr.candidates_evaluated || 0;
+      const detPct = tr.detour_pct;
+      const parts = [`placed "${teaser}" (${total} stroke${total === 1 ? '' : 's'}, ${detPct ?? 0}% detour)`];
+      parts.push(`evaluated ${evald} candidates`);
+      if (miss) parts.push(`${miss} non-ASCII glyph${miss === 1 ? '' : 's'} dropped`);
+      setStatus(parts.join(' · '));
+    }
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
@@ -493,8 +576,37 @@ function renderResults(rs, failures, _opts) {
   const corridorFeats = [];
   const refFeats = [];
   const shapeGuideFeats = [];
+  const textStrokeFeats = [];
+  const textPenUpFeats = [];
   for (const r of rs) {
     const isShape = !!r.shape; // shapes are closed loops, no start/end/corridor/reference
+    const isText = r.kind === 'text' && r.text_render && Array.isArray(r.text_render.letters);
+    if (isText) {
+      // Each letter contributes one LineString per Hershey stroke; pen-ups
+      // (within a letter and between adjacent letters) go to a separate
+      // source so they can render thinner/dashed.
+      for (const letter of r.text_render.letters) {
+        for (const stroke of (letter.strokes || [])) {
+          if (stroke && stroke.length >= 2) {
+            textStrokeFeats.push({
+              type: 'Feature',
+              properties: { rank: r.rank, ch: letter.char || '' },
+              geometry: { type: 'LineString', coordinates: stroke }
+            });
+          }
+        }
+      }
+      for (const pu of (r.text_render.pen_ups || [])) {
+        if (pu && pu.length >= 2) {
+          textPenUpFeats.push({
+            type: 'Feature',
+            properties: { rank: r.rank },
+            geometry: { type: 'LineString', coordinates: pu }
+          });
+        }
+      }
+      continue; // skip generic LineString / endpoints / corridor below
+    }
     feats.push({
       type: 'Feature',
       properties: { rank: r.rank },
@@ -565,6 +677,12 @@ function renderResults(rs, failures, _opts) {
   map.getSource('corridors').setData({ type: 'FeatureCollection', features: corridorFeats });
   map.getSource('reference').setData({ type: 'FeatureCollection', features: refFeats });
   map.getSource('shape-guides').setData({ type: 'FeatureCollection', features: shapeGuideFeats });
+  if (map.getSource('text-strokes')) {
+    map.getSource('text-strokes').setData({ type: 'FeatureCollection', features: textStrokeFeats });
+  }
+  if (map.getSource('text-penups')) {
+    map.getSource('text-penups').setData({ type: 'FeatureCollection', features: textPenUpFeats });
+  }
   // Split into primary (route fit inside the requested corridor) and
   // alternatives (search had to widen). Cards keep their server-assigned
   // ranks so the existing map filters / GPX downloads still work.
@@ -777,11 +895,39 @@ function cardHtml(r) {
       style="background:#fff3cd;color:#7a5800;border:1px solid #ffe28a;
       border-radius:3px;padding:1px 6px;font-size:11px;">↔ corridor ${usedKm} km</span>`;
   }
+  // Text-mode header replaces bearing/max-dev with the message + stroke
+  // counts. ref_km / real_km still apply (ideal-vs-routed total length).
+  let textBadge = '', textRow = '', headerLeft;
+  if (r.kind === 'text' && r.text_render) {
+    const t = r.text || '';
+    const shown = t.length > 48 ? t.slice(0, 48) + '…' : t;
+    const missing = r.text_render.missing_glyphs || 0;
+    const penUps = r.text_render.pen_up_count || 0;
+    const safe = shown.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    textBadge = `<span style="background:#eaf3ff;color:#143b75;border:1px solid #b8d4f6;
+      border-radius:3px;padding:1px 6px;font-size:11px;">"${safe}"</span>`;
+    const sCount = r.text_render.stroke_count || 0;
+    const sKm = r.text_render.stroke_km;
+    const puKm = r.text_render.pen_up_km;
+    const parts = [`${sCount} letter stroke${sCount===1?'':'s'}`];
+    if (Number.isFinite(sKm)) parts.push(`${sKm.toFixed(1)} km drawn`);
+    if (penUps) parts.push(`+ ${penUps} pen-up${penUps===1?'':'s'}${Number.isFinite(puKm)?` (${puKm.toFixed(1)} km)`:''}`);
+    if (missing) parts.push(`${missing} non-ASCII glyph${missing===1?'':'s'} dropped`);
+    textRow = `<div class="row" style="color:#444;">${parts.join(' · ')}</div>`;
+    headerLeft = textBadge;
+  } else {
+    headerLeft = `${Math.round(r.bearing_deg)}°`;
+  }
+  const metricsRow = (r.kind === 'text')
+    ? `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
+        (${detour>=0?'+':''}${detour.toFixed(0)}% detour)${ferryTxt}</div>`
+    : `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
+        (${detour>=0?'+':''}${detour.toFixed(0)}%) · max dev ${Math.round(r.max_dev_m)} m${ferryTxt}</div>`;
   return `<div class="card" data-rank="${r.rank}" data-key="${r._key || ''}">
-    <div class="hd"><b>#${r.rank}</b> &nbsp; ${Math.round(r.bearing_deg)}°${widenBadge}
+    <div class="hd"><b>#${r.rank}</b> &nbsp; ${headerLeft}${widenBadge}
       <span class="score">score ${r.score.toFixed(1)}</span></div>
-    <div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
-      (${detour>=0?'+':''}${detour.toFixed(0)}%) · max dev ${Math.round(r.max_dev_m)} m${ferryTxt}</div>
+    ${textRow}
+    ${metricsRow}
     <div class="bar-wrap"><div class="bar">${segs}</div></div>
     <div class="swatches">
       ${r.surface.map(s => `<span><i style="background:${SURFACE_COLORS[s.label]||'#888'}"></i>${s.label} ${s.km.toFixed(1)}</span>`).join('')}
@@ -848,15 +994,51 @@ function selectRank(rank) {
 function downloadGpx(rank) {
   const r = results.find(x => x.rank === rank);
   if (!r) return;
-  const pts = r.coords.map(c =>
-    `    <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
-  ).join('\n');
+  // Text mode: bundle every letter stroke + pen-up connector into ONE
+  // continuous <trkseg> in ride order so the rider's GPS plays the message
+  // as one continuous track. Pen-ups are still part of the rideable line.
+  let trkBody;
+  if (r.kind === 'text' && r.text_render && Array.isArray(r.text_render.letters)) {
+    const ordered = [];
+    let puIdx = 0;
+    let first = true;
+    for (const letter of r.text_render.letters) {
+      for (const stroke of (letter.strokes || [])) {
+        if (!stroke || stroke.length < 1) continue;
+        if (!first) {
+          const pu = (r.text_render.pen_ups || [])[puIdx++];
+          if (pu && pu.length >= 2) {
+            for (const c of pu) ordered.push(c);
+          }
+        }
+        for (const c of stroke) ordered.push(c);
+        first = false;
+      }
+    }
+    const pts = ordered.map(c =>
+      `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
+    ).join('\n');
+    trkBody = `    <trkseg>\n${pts}\n    </trkseg>`;
+  } else if (r.kind === 'text' && r.text_render && Array.isArray(r.text_render.strokes)) {
+    // Backward-compat for any old shape — should not be hit any more.
+    trkBody = r.text_render.strokes.map(stroke => {
+      const pts = stroke.map(c =>
+        `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
+      ).join('\n');
+      return `    <trkseg>\n${pts}\n    </trkseg>`;
+    }).join('\n');
+  } else {
+    const pts = r.coords.map(c =>
+      `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
+    ).join('\n');
+    trkBody = `    <trkseg>\n${pts}\n    </trkseg>`;
+  }
   const gpx = `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="crowfly" xmlns="http://www.topografix.com/GPX/1/1">
   <metadata><name>rank ${rank}</name></metadata>
-  <trk><name>rank ${rank}</name><trkseg>
-${pts}
-  </trkseg></trk>
+  <trk><name>rank ${rank}</name>
+${trkBody}
+  </trk>
 </gpx>
 `;
   const blob = new Blob([gpx], { type: 'application/gpx+xml' });
