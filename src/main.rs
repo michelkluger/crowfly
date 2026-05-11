@@ -287,6 +287,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             points: vec![start, end],
             edges: vec![],
             total_length_m: 0.0,
+            node_indices: vec![],
         };
         let report = viability::analyse(
             &preview,
@@ -493,6 +494,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 } else {
                     eprintln!("  loaded {} tile(s)", dem.tiles.len());
                     g.stamp_elevations(&dem);
+                    g.smooth_elevations(2);
                 }
             }
             Ok(g)

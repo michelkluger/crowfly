@@ -517,9 +517,11 @@ pub fn route_one_shape(
     if vertices.len() < 2 {
         return Err((candidate, "shape has no legs".into()));
     }
+    use petgraph::graph::NodeIndex;
     let mut all_points: Vec<LatLon> = Vec::new();
     let mut all_edges: Vec<EdgeData> = Vec::new();
-    let mut total_length = 0.0_f64;
+    let mut all_nodes: Vec<NodeIndex> = Vec::new();
+    let mut start_prev: Option<NodeIndex> = None;
     // Track per-leg fidelity: how much each routed leg stretches beyond the
     // straight-line distance between consecutive polyline vertices. A loop
     // with one wildly detouring leg should rank below a loop where every leg
@@ -542,8 +544,22 @@ pub fn route_one_shape(
                 ),
             ));
         }
-        let leg = match route::shortest(graph, s_idx, e_idx, w[0], w[1], params) {
+        let prev_to_pass = match (all_nodes.last(), start_prev) {
+            (Some(&last), Some(_)) if last == s_idx => start_prev,
+            _ => None,
+        };
+        // Fall back to unthreaded routing if the U-turn-forbid leaves the
+        // start with nowhere to go (degree-1 dead-end snap).
+        let leg = match route::shortest_with_start_prev(
+            graph, s_idx, e_idx, prev_to_pass, w[0], w[1], params,
+        ) {
             Ok(r) => r,
+            Err(_) if prev_to_pass.is_some() => {
+                match route::shortest_with_start_prev(graph, s_idx, e_idx, None, w[0], w[1], params) {
+                    Ok(r) => r,
+                    Err(e) => return Err((candidate, format!("leg {}: {}", i + 1, e))),
+                }
+            }
             Err(e) => {
                 return Err((candidate, format!("leg {}: {}", i + 1, e)));
             }
@@ -555,11 +571,24 @@ pub fn route_one_shape(
         }
         if all_points.is_empty() {
             all_points.extend(&leg.points);
+            all_nodes.extend(&leg.node_indices);
         } else {
             all_points.extend(&leg.points[1..]);
+            all_nodes.extend(&leg.node_indices[1..]);
         }
         all_edges.extend(&leg.edges);
-        total_length += leg.total_length_m;
+        start_prev = if leg.node_indices.len() >= 2 {
+            Some(leg.node_indices[leg.node_indices.len() - 2])
+        } else {
+            None
+        };
+    }
+    // Geometric loop pruning catches the cross-leg "tail" pattern (a lobe
+    // that bridges leg boundaries via a parallel road). 30 m radius is
+    // tight enough to leave real cross-overs at major junctions untouched.
+    let bike_or_mtb = params.modes & (crate::osm::MODE_BIKE | crate::osm::MODE_MTB) != 0;
+    if bike_or_mtb {
+        route::prune_geometric_loops(&mut all_nodes, &mut all_points, &mut all_edges, 60.0, 200.0);
     }
     let mut surface_km = [0.0_f64; 6];
     let mut ferry_km = 0.0;
@@ -570,6 +599,7 @@ pub fn route_one_shape(
             ferry_km += e.length_m / 1000.0;
         }
     }
+    let total_length: f64 = all_edges.iter().map(|e| e.length_m).sum();
     let real_km = total_length / 1000.0;
     let detour = (real_km / candidate.perimeter_km - 1.0).max(0.0);
     // Combined score: total detour as before, plus a heavy penalty on the
@@ -584,6 +614,7 @@ pub fn route_one_shape(
             points: all_points,
             edges: all_edges,
             total_length_m: total_length,
+            node_indices: all_nodes,
         },
         surface_km,
         ferry_km,

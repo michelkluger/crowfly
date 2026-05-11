@@ -29,11 +29,41 @@ pub const SURFACE_FERRY: u8 = 5;
 pub const SURFACE_LABELS: [&str; 6] =
     ["paved", "gravel", "path", "unpaved", "other", "ferry"];
 
+/// Coarse bike-routing class derived from `highway=*` plus bicycle access tags.
+/// Stored in the low 4 bits of `EdgeData::bike_attrs`. The router uses these
+/// to apply per-class cost multipliers (cycleway/residential favoured,
+/// primary/secondary penalised), so suggestions reflect what cyclists actually
+/// pick — not just the cartographically shortest line.
+pub const BCLASS_CYCLEWAY: u8 = 0;
+pub const BCLASS_RESIDENTIAL: u8 = 1; // residential, living_street
+pub const BCLASS_TERTIARY: u8 = 2; // tertiary, unclassified
+pub const BCLASS_SERVICE: u8 = 3; // service
+pub const BCLASS_SECONDARY: u8 = 4;
+pub const BCLASS_PRIMARY: u8 = 5;
+pub const BCLASS_TRACK: u8 = 6; // track, bridleway
+pub const BCLASS_PATH: u8 = 7; // path, footway, pedestrian, steps
+pub const BCLASS_FERRY: u8 = 8;
+pub const BCLASS_OTHER: u8 = 9;
+pub const BCLASS_MASK: u8 = 0x0F;
+/// `bicycle=designated` set on the way — strong cyclist preference, regardless
+/// of highway class. Stored in bit 4 of `bike_attrs`.
+pub const BATTR_DESIGNATED: u8 = 1 << 4;
+/// Way is part of a marked cycle network (`lcn`/`rcn`/`ncn=yes` on the way
+/// itself). Stored in bit 5. Relation membership is *not* parsed — only
+/// way-level tags, which is what most local OSM mappers set on signed routes.
+pub const BATTR_CYCLE_NETWORK: u8 = 1 << 5;
+
 #[derive(Copy, Clone, Debug)]
 pub struct EdgeData {
     pub length_m: f64,
     pub modes: u8,
     pub surface: u8,
+    /// Packed bike-routing attributes: low 4 bits = `BCLASS_*`, bit 4 =
+    /// `BATTR_DESIGNATED`, bit 5 = `BATTR_CYCLE_NETWORK`. See module-level
+    /// constants. Zero for non-bike-routable edges (foot-only ferries, etc.)
+    /// and harmless because `route.rs` only consults this byte when bike or
+    /// mtb is in the active mode mask.
+    pub bike_attrs: u8,
     pub way_id: i64,
 }
 
@@ -170,6 +200,50 @@ impl Graph {
         self.elevations_m = Some(elev);
     }
 
+    /// Low-pass filter `elevations_m` along the road graph: each node becomes
+    /// the average of itself plus its routed neighbours. DEM noise (~1–2 m at
+    /// SRTM-30 m resolution) on edges only 5–20 m long otherwise registers as
+    /// 15–20 % "phantom grades" and skews the cost function's ascent term —
+    /// the router would obediently treat each spurious spike as a wall to
+    /// detour around. One or two passes is enough to wash out that noise
+    /// without flattening genuine climbs (the averaging window is one edge
+    /// wide so a 2 km hill still reads as a hill).
+    pub fn smooth_elevations(&mut self, iterations: usize) {
+        let Some(elev) = self.elevations_m.as_mut() else {
+            return;
+        };
+        if iterations == 0 || elev.is_empty() {
+            return;
+        }
+        let n = elev.len();
+        let mut next: Vec<f32> = vec![f32::NAN; n];
+        for _ in 0..iterations {
+            for ni in self.graph.node_indices() {
+                let i = ni.index();
+                let mut sum = 0.0f64;
+                let mut count = 0u32;
+                let zi = elev[i];
+                if zi.is_finite() {
+                    sum += zi as f64;
+                    count += 1;
+                }
+                for nbr in self.graph.neighbors(ni) {
+                    let z = elev[nbr.index()];
+                    if z.is_finite() {
+                        sum += z as f64;
+                        count += 1;
+                    }
+                }
+                next[i] = if count > 0 {
+                    (sum / count as f64) as f32
+                } else {
+                    f32::NAN
+                };
+            }
+            std::mem::swap(elev, &mut next);
+        }
+    }
+
     /// Closest graph node to `p`, via the R-tree. None if graph is empty.
     pub fn closest(&self, p: LatLon) -> Option<NodeIndex> {
         self.rtree
@@ -250,23 +324,24 @@ fn classify_surface(tags: &osmpbfreader::Tags, highway: &str) -> u8 {
     }
 }
 
-fn classify(tags: &osmpbfreader::Tags, want: u8) -> (u8, u8) {
+fn classify(tags: &osmpbfreader::Tags, want: u8) -> (u8, u8, u8) {
     let route = tags.get("route").map(|s| s.as_str());
     if route == Some("ferry") {
         return (
             (MODE_FOOT | MODE_BIKE | MODE_FERRY) & (want | MODE_FERRY),
             SURFACE_FERRY,
+            BCLASS_FERRY,
         );
     }
     let Some(hw) = tags.get("highway").map(|s| s.as_str()) else {
-        return (0, SURFACE_OTHER);
+        return (0, SURFACE_OTHER, BCLASS_OTHER);
     };
     let access = tags.get("access").map(|s| s.as_str());
     if matches!(access, Some("no") | Some("private")) {
-        return (0, SURFACE_OTHER);
+        return (0, SURFACE_OTHER, BCLASS_OTHER);
     }
     if matches!(hw, "motorway" | "motorway_link") {
-        return (0, SURFACE_OTHER);
+        return (0, SURFACE_OTHER, BCLASS_OTHER);
     }
     let foot = tags.get("foot").map(|s| s.as_str());
     let bicycle = tags.get("bicycle").map(|s| s.as_str());
@@ -324,7 +399,27 @@ fn classify(tags: &osmpbfreader::Tags, want: u8) -> (u8, u8) {
         m |= MODE_MTB;
     }
     let surface = classify_surface(tags, hw);
-    (m, surface)
+
+    let class = match hw {
+        "cycleway" => BCLASS_CYCLEWAY,
+        "residential" | "living_street" => BCLASS_RESIDENTIAL,
+        "tertiary" | "tertiary_link" | "unclassified" => BCLASS_TERTIARY,
+        "service" => BCLASS_SERVICE,
+        "secondary" | "secondary_link" => BCLASS_SECONDARY,
+        "primary" | "primary_link" | "trunk" | "trunk_link" => BCLASS_PRIMARY,
+        "track" | "bridleway" => BCLASS_TRACK,
+        "path" | "footway" | "pedestrian" | "steps" => BCLASS_PATH,
+        _ => BCLASS_OTHER,
+    };
+    let mut attrs = class;
+    if matches!(bicycle, Some("designated")) {
+        attrs |= BATTR_DESIGNATED;
+    }
+    let net = |k: &str| matches!(tags.get(k).map(|s| s.as_str()), Some("yes"));
+    if net("lcn") || net("rcn") || net("ncn") {
+        attrs |= BATTR_CYCLE_NETWORK;
+    }
+    (m, surface, attrs)
 }
 
 /// Build a routing graph from a PBF, bounded by a lat/lon bbox.
@@ -354,7 +449,7 @@ where
     // Pass 1: find ways with passing tags, collect their node IDs, mode mask, surface.
     // Also collect `natural=glacier` closed ways so we can skip edges that cross
     // them — glaciers aren't passable terrain even if a path is tagged through them.
-    let mut keep_ways: Vec<(i64, Vec<i64>, u8, u8)> = Vec::new();
+    let mut keep_ways: Vec<(i64, Vec<i64>, u8, u8, u8)> = Vec::new();
     let mut glacier_ways: Vec<Vec<i64>> = Vec::new();
     let mut needed_nodes: FxHashSet<i64> = FxHashSet::default();
     {
@@ -385,7 +480,7 @@ where
                     }
                     continue;
                 }
-                let (m, s) = classify(&w.tags, want_modes);
+                let (m, s, ba) = classify(&w.tags, want_modes);
                 if m == 0 {
                     continue;
                 }
@@ -393,7 +488,7 @@ where
                 for n in &nodes {
                     needed_nodes.insert(*n);
                 }
-                keep_ways.push((w.id.0, nodes, m, s));
+                keep_ways.push((w.id.0, nodes, m, s, ba));
             }
         }
         pb.finish_with_message(format!(
@@ -467,7 +562,7 @@ where
 
     let mut edges_added = 0usize;
     let mut edges_skipped_glacier = 0usize;
-    for (way_id, nodes, modes, surface) in &keep_ways {
+    for (way_id, nodes, modes, surface, bike_attrs) in &keep_ways {
         for w in nodes.windows(2) {
             let (Some(p0), Some(p1)) = (node_pos.get(&w[0]).copied(), node_pos.get(&w[1]).copied())
             else {
@@ -494,6 +589,7 @@ where
                     length_m: length,
                     modes: *modes,
                     surface: *surface,
+                    bike_attrs: *bike_attrs,
                     way_id: *way_id,
                 },
             );
@@ -608,4 +704,119 @@ fn build_glacier_index(
     }
     let rtree = RTree::bulk_load(boxes);
     GlacierIndex { polys, rtree }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use petgraph::graph::UnGraph;
+
+    fn tiny_chain(n: usize) -> Graph {
+        // n linearly-connected nodes spaced 0.001° apart along the equator.
+        let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(g.add_node(LatLon::new(0.0, i as f64 * 0.001)));
+        }
+        for w in ids.windows(2) {
+            let length = crate::geodesy::haversine(g[w[0]], g[w[1]]);
+            g.add_edge(
+                w[0],
+                w[1],
+                EdgeData {
+                    length_m: length,
+                    modes: MODE_FOOT,
+                    surface: SURFACE_PAVED,
+                    bike_attrs: BCLASS_RESIDENTIAL,
+                    way_id: 1,
+                },
+            );
+        }
+        let (components, rtree) = Graph::build_aux(&g);
+        Graph {
+            graph: g,
+            osm_to_idx: rustc_hash::FxHashMap::default(),
+            components,
+            rtree,
+            elevations_m: None,
+        }
+    }
+
+    #[test]
+    fn smooth_elevations_averages_with_neighbours() {
+        // Three-node chain: A — B — C. B carries a 100 m elevation spike
+        // that A and C do not. One smoothing iteration should pull B's
+        // value down to the mean of (A_old, B_old, C_old) = (100+200+100)/3.
+        let mut g = tiny_chain(3);
+        g.elevations_m = Some(vec![100.0, 200.0, 100.0]);
+        g.smooth_elevations(1);
+        let elev = g.elevations_m.as_ref().unwrap();
+        assert!((elev[1] - 133.333).abs() < 0.5,
+            "B should be averaged toward neighbours, got {}", elev[1]);
+        // Endpoints have a single neighbour, so they average to (own + nbr) / 2.
+        assert!((elev[0] - 150.0).abs() < 0.5, "A averaged with B → 150, got {}", elev[0]);
+        assert!((elev[2] - 150.0).abs() < 0.5, "C averaged with B → 150, got {}", elev[2]);
+    }
+
+    #[test]
+    fn smooth_elevations_is_noop_on_flat_terrain() {
+        // If every node is already at the same elevation, smoothing must
+        // not introduce noise.
+        let mut g = tiny_chain(5);
+        g.elevations_m = Some(vec![500.0, 500.0, 500.0, 500.0, 500.0]);
+        g.smooth_elevations(3);
+        for z in g.elevations_m.as_ref().unwrap() {
+            assert!((z - 500.0).abs() < 1e-3, "flat terrain should stay flat, got {}", z);
+        }
+    }
+
+    #[test]
+    fn smooth_elevations_preserves_nan_when_isolated() {
+        // No DEM coverage anywhere → smoothing is a no-op (and must not panic
+        // or replace NaN with 0).
+        let mut g = tiny_chain(3);
+        g.elevations_m = Some(vec![f32::NAN; 3]);
+        g.smooth_elevations(2);
+        for z in g.elevations_m.as_ref().unwrap() {
+            assert!(z.is_nan(), "without any finite neighbour we should preserve NaN");
+        }
+    }
+
+    #[test]
+    fn classify_marks_cycleway() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("highway".into(), "cycleway".into());
+        let (modes, surface, attrs) = classify(&tags, MODE_FOOT | MODE_BIKE | MODE_MTB);
+        assert!(modes & MODE_BIKE != 0, "cycleway must be bike-routable");
+        assert_eq!(surface, SURFACE_PAVED, "cycleway defaults to paved");
+        assert_eq!(attrs & BCLASS_MASK, BCLASS_CYCLEWAY);
+    }
+
+    #[test]
+    fn classify_marks_primary_as_primary_class() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("highway".into(), "primary".into());
+        let (modes, _surface, attrs) = classify(&tags, MODE_BIKE);
+        assert!(modes & MODE_BIKE != 0, "primary is bike-default-allowed");
+        assert_eq!(attrs & BCLASS_MASK, BCLASS_PRIMARY);
+    }
+
+    #[test]
+    fn classify_records_designated_and_network_flags() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("highway".into(), "tertiary".into());
+        tags.insert("bicycle".into(), "designated".into());
+        tags.insert("lcn".into(), "yes".into());
+        let (_modes, _surface, attrs) = classify(&tags, MODE_BIKE);
+        assert!(attrs & BATTR_DESIGNATED != 0, "bicycle=designated must set flag");
+        assert!(attrs & BATTR_CYCLE_NETWORK != 0, "lcn=yes must set network flag");
+    }
+
+    #[test]
+    fn classify_rejects_motorway() {
+        let mut tags = osmpbfreader::Tags::new();
+        tags.insert("highway".into(), "motorway".into());
+        let (modes, _, _) = classify(&tags, MODE_FOOT | MODE_BIKE | MODE_MTB);
+        assert_eq!(modes, 0, "motorway must be unroutable for foot/bike/mtb");
+    }
 }

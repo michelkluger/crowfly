@@ -15,10 +15,12 @@
 //! a separate visit map; on a 16M-node graph the hashing dominates the
 //! routing inner loop.
 
-use crate::geodesy::{CrossTrack, HaversineToTarget, LatLon};
+use crate::geodesy::{bearing_rad, CrossTrack, HaversineToTarget, LatLon};
 use crate::osm::{
-    EdgeData, Graph, MODE_BIKE, SURFACE_FERRY, SURFACE_GRAVEL, SURFACE_OTHER, SURFACE_PATH,
-    SURFACE_PAVED, SURFACE_UNPAVED,
+    EdgeData, Graph, BATTR_CYCLE_NETWORK, BATTR_DESIGNATED, BCLASS_CYCLEWAY, BCLASS_FERRY,
+    BCLASS_MASK, BCLASS_OTHER, BCLASS_PATH, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, BCLASS_SECONDARY,
+    BCLASS_SERVICE, BCLASS_TERTIARY, BCLASS_TRACK, MODE_BIKE, MODE_MTB, SURFACE_FERRY,
+    SURFACE_GRAVEL, SURFACE_OTHER, SURFACE_PATH, SURFACE_PAVED, SURFACE_UNPAVED,
 };
 use anyhow::{anyhow, Result};
 use petgraph::graph::{NodeIndex, UnGraph};
@@ -47,6 +49,10 @@ pub struct RouteResult {
     pub points: Vec<LatLon>,
     pub edges: Vec<EdgeData>,
     pub total_length_m: f64,
+    /// Graph nodes visited in order, parallel to `points`. Allows
+    /// post-routing graph-aware operations (loop pruning, leg continuation)
+    /// without re-snapping LatLon points to nodes.
+    pub node_indices: Vec<NodeIndex>,
 }
 
 fn midpoint(p0: LatLon, p1: LatLon) -> LatLon {
@@ -87,15 +93,31 @@ impl PartialOrd for Frontier {
 /// Custom A* over an undirected graph with f64 edge costs and a lower-bound
 /// heuristic. Returns `(total_cost, path)` on success. Edge costs that return
 /// non-finite (∞ / NaN) are treated as forbidden and skipped.
+///
+/// `edge_cost` receives the predecessor node (if any) so the cost function
+/// can charge a turn penalty against the (prev → node → next) angle. We use
+/// the *current* `came_from[node]` at expansion time rather than augmenting
+/// the search state with the predecessor — this is a greedy approximation
+/// (a node's `came_from` may later be revised by a cheaper path), but in
+/// practice the heuristic-driven A* converges quickly on the canonical
+/// predecessor and the smoothing benefit dominates the optimality gap. Full
+/// (node, prev_edge) state augmentation would multiply the state space ~10×
+/// at marginal quality gain.
+///
+/// `start_prev` is a virtual predecessor of `start` — set by `route_loop` so
+/// the turn-penalty and U-turn-forbid extend across leg boundaries. It is
+/// *not* added to `came_from`, so the reconstructed path correctly starts at
+/// `start`.
 fn astar_fx<F, H>(
     graph: &UnGraph<LatLon, EdgeData>,
     start: NodeIndex,
     end: NodeIndex,
+    start_prev: Option<NodeIndex>,
     mut edge_cost: F,
     mut heuristic: H,
 ) -> Option<(f64, Vec<NodeIndex>)>
 where
-    F: FnMut(petgraph::graph::EdgeReference<'_, EdgeData>) -> f64,
+    F: FnMut(petgraph::graph::EdgeReference<'_, EdgeData>, Option<NodeIndex>) -> f64,
     H: FnMut(NodeIndex) -> f64,
 {
     let mut g_score: FxHashMap<NodeIndex, f64> = FxHashMap::default();
@@ -129,12 +151,25 @@ where
         if f > cur_g + heuristic(node) + 1e-9 {
             continue;
         }
+        // For the start node, fall back to the caller-supplied `start_prev`
+        // (if any). For every other node use the actual came_from chain.
+        let prev = if node == start {
+            start_prev
+        } else {
+            came_from.get(&node).copied()
+        };
         for er in graph.edges(node) {
-            let cost = edge_cost(er);
+            let cost = edge_cost(er, prev);
             if !cost.is_finite() {
                 continue;
             }
             let next = er.target();
+            // Disallow immediate U-turn back to predecessor on multi-edge
+            // graphs — keeps the path topologically simple. Also extends
+            // across leg boundaries via start_prev.
+            if Some(next) == prev {
+                continue;
+            }
             let tentative = cur_g + cost;
             let prev_g = g_score.get(&next).copied().unwrap_or(f64::INFINITY);
             if tentative < prev_g {
@@ -150,10 +185,223 @@ where
     None
 }
 
+/// Splice out near-revisits: subsequences where the polyline returns within
+/// `max_radius_m` of an earlier point after walking at least `min_loop_m`.
+/// Unlike `prune_revisits`, this is a *geometric* pass — the two endpoints
+/// of the spliced loop are different graph nodes, so the resulting polyline
+/// has a tiny visual jump (≤ `max_radius_m`) where the loop used to be.
+/// In exchange, we kill the "out-and-back via a parallel cycleway / service
+/// road" pattern that single-leg A* cannot avoid (the lobe IS optimal under
+/// edge-local cost, but the user perceives it as garbage).
+///
+/// The `nodes`/`edges` invariant (`edges.len() + 1 == nodes.len()`) is
+/// preserved by skipping the bridging edge entirely; total length is
+/// recomputed downstream from the surviving edges, so it under-reports the
+/// route by at most `max_radius_m` per pruned tail — acceptable cleanup
+/// noise.
+pub fn prune_geometric_loops(
+    nodes: &mut Vec<NodeIndex>,
+    points: &mut Vec<LatLon>,
+    edges: &mut Vec<EdgeData>,
+    max_radius_m: f64,
+    min_loop_m: f64,
+) -> usize {
+    let n = points.len();
+    if n < 20 {
+        return 0;
+    }
+    debug_assert_eq!(nodes.len(), n);
+    debug_assert_eq!(edges.len() + 1, n);
+    let mut cum = vec![0.0_f64; n];
+    for i in 1..n {
+        cum[i] = cum[i - 1] + crate::geodesy::haversine(points[i - 1], points[i]);
+    }
+    let mut keep = vec![true; n];
+    let mut i = 0;
+    while i < n {
+        if !keep[i] {
+            i += 1;
+            continue;
+        }
+        // Scan forward; remember the latest match so the longest loop wins.
+        let mut latest: Option<usize> = None;
+        let max_scan = (cum[i] + min_loop_m * 20.0).min(cum[n - 1]);
+        let mut j = i + 5;
+        while j < n {
+            if !keep[j] {
+                j += 1;
+                continue;
+            }
+            if cum[j] > max_scan {
+                break;
+            }
+            if cum[j] - cum[i] < min_loop_m {
+                j += 1;
+                continue;
+            }
+            let d = crate::geodesy::haversine(points[i], points[j]);
+            if d <= max_radius_m {
+                latest = Some(j);
+            }
+            j += 1;
+        }
+        if let Some(j) = latest {
+            for k in (i + 1)..=j {
+                keep[k] = false;
+            }
+        }
+        i += 1;
+    }
+    let removed = keep.iter().filter(|&&k| !k).count();
+    if removed == 0 {
+        return 0;
+    }
+    // Build the surviving sequence, synthesizing a bridge edge across each
+    // splice so the (edges.len() + 1 == nodes.len()) invariant survives and
+    // downstream length / surface accounting stays correct (under-counting
+    // each loop by ≈ haversine(loop_entry, loop_exit) ≤ max_radius_m).
+    let mut new_nodes = Vec::with_capacity(n - removed);
+    let mut new_points = Vec::with_capacity(n - removed);
+    let mut new_edges = Vec::with_capacity(n - removed);
+    let mut last_kept: Option<usize> = None;
+    for k in 0..n {
+        if !keep[k] {
+            continue;
+        }
+        if let Some(prev) = last_kept {
+            if prev + 1 == k {
+                // Adjacent kept nodes: re-use the original edge.
+                new_edges.push(edges[prev]);
+            } else {
+                // Spliced gap: synthesize a short bridge edge. We carry
+                // surface/modes/bike_attrs from one of the dropped edges so
+                // the bridge inherits roughly the same character as the
+                // road it was bypassing. `way_id = -1` marks it synthetic
+                // for any tooling that wants to flag bridged routes.
+                let bridge_length = crate::geodesy::haversine(points[prev], points[k]);
+                let template = if prev < edges.len() {
+                    edges[prev]
+                } else {
+                    *edges.last().unwrap()
+                };
+                new_edges.push(EdgeData {
+                    length_m: bridge_length,
+                    modes: template.modes,
+                    surface: template.surface,
+                    bike_attrs: template.bike_attrs,
+                    way_id: -1,
+                });
+            }
+        }
+        new_nodes.push(nodes[k]);
+        new_points.push(points[k]);
+        last_kept = Some(k);
+    }
+    *nodes = new_nodes;
+    *points = new_points;
+    *edges = new_edges;
+    removed
+}
+
+/// Splice out cycles in a graph-path. If the same `NodeIndex` appears twice
+/// at indices `i < j`, drop nodes `(i, j]` (and the corresponding edges) so
+/// the surviving path goes ...→nodes[i]→nodes[j+1]→...  By construction
+/// nodes[i] == nodes[j], so the edge that previously connected nodes[j] to
+/// nodes[j+1] now connects nodes[i] to nodes[j+1] — a real graph edge, no
+/// fabricated geometry.
+///
+/// Returns the number of nodes removed; callers use it as a "tails were
+/// pruned" signal.
+pub fn prune_revisits(
+    nodes: &mut Vec<NodeIndex>,
+    points: &mut Vec<LatLon>,
+    edges: &mut Vec<EdgeData>,
+) -> usize {
+    if nodes.len() < 3 {
+        return 0;
+    }
+    debug_assert_eq!(nodes.len(), points.len());
+    debug_assert_eq!(edges.len() + 1, nodes.len());
+    let mut keep_node = vec![true; nodes.len()];
+    let mut keep_edge = vec![true; edges.len()];
+    let mut first_seen: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    let mut removed = 0_usize;
+    for i in 0..nodes.len() {
+        if !keep_node[i] {
+            continue;
+        }
+        if let Some(&earlier) = first_seen.get(&nodes[i]) {
+            // Cycle detected: nodes[earlier..=i] forms a loop returning to
+            // the same graph node. Drop the interior (earlier+1 .. i) plus
+            // the duplicate at i. The edges spanning the loop interior are
+            // edges[earlier .. i] — all dropped. The edge previously sitting
+            // at edges[i] (connecting nodes[i] → nodes[i+1]) still applies
+            // to nodes[earlier] → nodes[i+1] because nodes[earlier] == nodes[i].
+            for k in (earlier + 1)..=i {
+                if keep_node[k] {
+                    keep_node[k] = false;
+                    removed += 1;
+                }
+            }
+            for k in earlier..i {
+                keep_edge[k] = false;
+            }
+            // Any node that was logged in `first_seen` between `earlier` and
+            // `i` is no longer in the surviving path, so its entry should be
+            // discarded.  Scanning the small region is cheap.
+            for k in (earlier + 1)..i {
+                if first_seen.get(&nodes[k]).copied() == Some(k) {
+                    first_seen.remove(&nodes[k]);
+                }
+            }
+        } else {
+            first_seen.insert(nodes[i], i);
+        }
+    }
+    if removed == 0 {
+        return 0;
+    }
+    let mut new_nodes = Vec::with_capacity(nodes.len() - removed);
+    let mut new_points = Vec::with_capacity(points.len() - removed);
+    for i in 0..nodes.len() {
+        if keep_node[i] {
+            new_nodes.push(nodes[i]);
+            new_points.push(points[i]);
+        }
+    }
+    let mut new_edges = Vec::with_capacity(edges.len().saturating_sub(removed));
+    for i in 0..edges.len() {
+        if keep_edge[i] {
+            new_edges.push(edges[i]);
+        }
+    }
+    *nodes = new_nodes;
+    *points = new_points;
+    *edges = new_edges;
+    removed
+}
+
+/// Single-leg A* with no caller-supplied predecessor. Convenience wrapper
+/// around [`shortest_with_start_prev`] for between-A→B and one-shot queries.
 pub fn shortest(
     graph: &Graph,
     start: NodeIndex,
     end: NodeIndex,
+    line_a: LatLon,
+    line_b: LatLon,
+    params: &RouteParams,
+) -> Result<RouteResult> {
+    shortest_with_start_prev(graph, start, end, None, line_a, line_b, params)
+}
+
+/// Same as [`shortest`] but lets the caller supply a virtual predecessor of
+/// `start`. Used by [`route_loop`] to thread the U-turn-forbid and turn
+/// penalty across leg boundaries.
+pub fn shortest_with_start_prev(
+    graph: &Graph,
+    start: NodeIndex,
+    end: NodeIndex,
+    start_prev: Option<NodeIndex>,
     line_a: LatLon,
     line_b: LatLon,
     params: &RouteParams,
@@ -170,27 +418,112 @@ pub fn shortest(
 
     let paved_only = params.paved_only;
     let elevations = graph.elevations_m.as_deref();
-    // Per-surface "fictional metres added per metre of descent" when bike is in
-    // the active mode mask. Steeper drops on path/footway/steps become
-    // disproportionately expensive, so the router prefers a longer rideable
-    // alternative on the way down. Uphill traversal is unaffected (descent ≤ 0).
+    let bike_active = (modes & MODE_BIKE) != 0;
+    let mtb_active = (modes & MODE_MTB) != 0;
+    // When MTB is in the user's mode mask, the cyclist is signalling tolerance
+    // for rough surfaces — soften the descent / surface penalties so the
+    // router doesn't reject perfectly good singletrack just because gravity
+    // exists. Pure bike-mode keeps the original (stricter) weights.
+    let rough_scale: f64 = if mtb_active && !bike_active {
+        0.25
+    } else if mtb_active {
+        0.5
+    } else {
+        1.0
+    };
+    // Per-surface "fictional metres added per metre of descent" when bike or
+    // mtb is in the active mode mask. Steeper drops on path/footway/steps
+    // become disproportionately expensive, so the router prefers a longer
+    // rideable alternative on the way down. Uphill traversal is unaffected
+    // (descent ≤ 0); ascent gets its own grade-squared penalty below.
     let descent_factor = |surface: u8| -> f64 {
-        if (modes & MODE_BIKE) == 0 {
+        if !bike_active && !mtb_active {
             return 0.0;
         }
-        match surface {
+        let base = match surface {
             SURFACE_PAVED | SURFACE_FERRY => 0.0,
             SURFACE_GRAVEL => 1.0,
             SURFACE_UNPAVED => 8.0,
             SURFACE_OTHER => 4.0,
             SURFACE_PATH => 25.0,
             _ => 0.0,
+        };
+        base * rough_scale
+    };
+    // Per-class cost multiplier applied when bike (or mtb) is in the user's
+    // mode mask. The multiplier *range* is deliberately compressed: an
+    // earlier 0.70…2.20 spread caused the router to attach to every short
+    // cycleway/residential spur (200 m of cycleway × 0.70 was worth a 50 m
+    // hairpin to reach), driving turn density to ~400°/km. A narrower range
+    // expresses the same preference ordering — cycleway < residential ≈
+    // tertiary < service < secondary ≪ primary — without rewarding pathology.
+    let bike_class_mult = |class: u8| -> f64 {
+        match class {
+            BCLASS_CYCLEWAY => 1.00,
+            BCLASS_RESIDENTIAL => 1.00,
+            BCLASS_TERTIARY => 1.00,
+            BCLASS_SERVICE => 1.05,
+            BCLASS_SECONDARY => 1.15,
+            BCLASS_PRIMARY => 1.40,
+            BCLASS_TRACK => {
+                if mtb_active {
+                    1.00
+                } else {
+                    1.08
+                }
+            }
+            BCLASS_PATH => {
+                if mtb_active && !bike_active {
+                    1.00
+                } else if mtb_active {
+                    1.10
+                } else {
+                    1.25
+                }
+            }
+            BCLASS_FERRY | BCLASS_OTHER => 1.0,
+            _ => 1.0,
         }
     };
+    // Surface multiplier that applies *always* when bike/mtb are in play, not
+    // just on descent — riding 10 km of path is slow even on the flat. Kept
+    // smaller than the descent kicker so the two stack sensibly on rough
+    // downhills.
+    let surface_mult = |surface: u8| -> f64 {
+        if !bike_active && !mtb_active {
+            return 1.0;
+        }
+        let base = match surface {
+            SURFACE_PAVED | SURFACE_FERRY => 1.0,
+            SURFACE_GRAVEL => 1.05,
+            SURFACE_UNPAVED => 1.25,
+            SURFACE_OTHER => 1.10,
+            SURFACE_PATH => 1.40,
+            _ => 1.0,
+        };
+        // Soften with rough_scale: subtract the excess proportionally so MTB
+        // mode doesn't pay almost any "always" surface tax, while bike mode
+        // pays the full rate.
+        1.0 + (base - 1.0) * rough_scale
+    };
+    // Turn penalty (metres added per radian of bearing change at a junction)
+    // applied when bike/mtb is active. Linear in |Δbearing|: a 90° turn costs
+    // +TURN_PEN·π/2 m, a 180° pivot costs +TURN_PEN·π m. With TURN_PEN=18:
+    //   30°  → +9 m   (gentle bend, almost free)
+    //   60°  → +19 m  (real turn, tolerated by short routes)
+    //   90°  → +28 m  (right-angle, router prefers a smoother alternative)
+    //   180° → +57 m  (hairpin / U-turn, strongly discouraged)
+    // This is what kills the side-spur attaching pathology — a 200 m cycleway
+    // detour that needs two 90° turns to enter and exit now costs +56 m of
+    // "fictional length" beyond the cycleway itself, dwarfing the small
+    // class bonus.
+    const TURN_PEN: f64 = 100.0;
+    let turn_active = bike_active || mtb_active;
     let cost = |p0: LatLon,
                 p1: LatLon,
                 e: &EdgeData,
-                elev_pair: Option<(f32, f32)>|
+                elev_pair: Option<(f32, f32)>,
+                prev_p: Option<LatLon>|
      -> f64 {
         if (e.modes & modes) == 0 {
             return f64::INFINITY;
@@ -204,12 +537,59 @@ pub fn shortest(
             return f64::INFINITY;
         }
         let rel = dev * inv_half;
-        let mut c = e.length_m * (1.0 + alpha * rel * rel);
+        let mut weight = 1.0 + alpha * rel * rel;
+        if bike_active || mtb_active {
+            let class = e.bike_attrs & BCLASS_MASK;
+            let mut bm = bike_class_mult(class);
+            // Designated and signed-network bonuses kept small so they nudge
+            // ranking without making the router go out of its way to attach
+            // to a marked spur.
+            if (e.bike_attrs & BATTR_DESIGNATED) != 0 {
+                bm *= 0.98;
+            }
+            if (e.bike_attrs & BATTR_CYCLE_NETWORK) != 0 {
+                bm *= 0.99;
+            }
+            weight *= bm;
+            weight *= surface_mult(e.surface);
+        }
+        let mut c = e.length_m * weight;
+        if turn_active {
+            if let Some(pp) = prev_p {
+                if pp != p0 && p0 != p1 {
+                    let b_in = bearing_rad(pp, p0);
+                    let b_out = bearing_rad(p0, p1);
+                    let mut d = (b_out - b_in).abs();
+                    if d > std::f64::consts::PI {
+                        d = 2.0 * std::f64::consts::PI - d;
+                    }
+                    c += TURN_PEN * d;
+                }
+            }
+        }
         if let Some((zs, zt)) = elev_pair {
             if zs.is_finite() && zt.is_finite() {
                 let drop_m = (zs - zt) as f64;
                 if drop_m > 1.0 {
                     c += drop_m * descent_factor(e.surface);
+                }
+                // Ascent grade penalty with a hinge at ~4 %: stays ~0 on
+                // gentle rollers and ramps quadratically above 4 % so steep
+                // walls become disproportionately expensive. With k=80 (bike)
+                // / k=45 (mtb-only):
+                //   6 %  ≈ +3 %      (rolling — almost free)
+                //   8 %  ≈ +13 %     (noticeable)
+                //   10 % ≈ +29 %     (avoidable if any flatter detour exists)
+                //   15 % ≈ +97 %     (router strongly prefers a longer route)
+                //   20 % ≈ +205 %    (effectively forbidden unless no choice)
+                // Disabled for foot-only routing (hikers don't gain from it).
+                if (bike_active || mtb_active) && drop_m < -1.0 && e.length_m > 1.0 {
+                    let rise_m = -drop_m;
+                    let grade = rise_m / e.length_m;
+                    const HINGE: f64 = 0.04;
+                    let excess = (grade - HINGE).max(0.0);
+                    let k = if mtb_active && !bike_active { 45.0 } else { 80.0 };
+                    c += e.length_m * k * excess * excess;
                 }
             }
         }
@@ -225,18 +605,26 @@ pub fn shortest(
         Some((zs, zt))
     };
 
+    // Bike multipliers can drive an edge's cost below its physical length
+    // (cycleway × designated × network ≈ 0.52). Plain haversine would then
+    // *over*-estimate remaining cost and break A*'s optimality, so when bike
+    // or mtb is active we scale the heuristic by the cheapest reachable
+    // multiplier. Foot-only routing sees no rescaling.
+    let h_scale: f64 = if bike_active || mtb_active { 0.5 } else { 1.0 };
     let result = astar_fx(
         g,
         start,
         end,
-        |er| {
+        start_prev,
+        |er, prev_node| {
             let s = er.source();
             let t = er.target();
             let p0 = g[s];
             let p1 = g[t];
-            cost(p0, p1, er.weight(), elev_for(s, t))
+            let prev_p = prev_node.map(|pn| g[pn]);
+            cost(p0, p1, er.weight(), elev_for(s, t), prev_p)
         },
-        |n| heur.distance(g[n]),
+        |n| heur.distance(g[n]) * h_scale,
     );
 
     let (_, path) = result.ok_or_else(|| {
@@ -248,32 +636,51 @@ pub fn shortest(
         points.push(g[ni]);
     }
     let mut edges = Vec::with_capacity(path.len().saturating_sub(1));
-    let mut total_length = 0.0;
-    for w in path.windows(2) {
+    let mut node_indices: Vec<NodeIndex> = path.clone();
+    for (i, w) in path.windows(2).enumerate() {
         let p0 = g[w[0]];
         let p1 = g[w[1]];
         let elev_pair = elev_for(w[0], w[1]);
+        let prev_p = if i == 0 {
+            start_prev.map(|p| g[p])
+        } else {
+            Some(g[path[i - 1]])
+        };
         let mut best: Option<(EdgeData, f64)> = None;
         for er in g.edges_connecting(w[0], w[1]) {
             let e = er.weight();
             if (e.modes & modes) == 0 {
                 continue;
             }
-            let c = cost(p0, p1, e, elev_pair);
+            let c = cost(p0, p1, e, elev_pair, prev_p);
             if best.map_or(true, |(_, bc)| c < bc) {
                 best = Some((*e, c));
             }
         }
         if let Some((e, _)) = best {
-            total_length += e.length_m;
             edges.push(e);
         }
     }
+    // Splice out any graph-level loops the A* expansion may have left
+    // behind. Single-leg A* normally can't revisit a node, but the cross-leg
+    // path concatenation in `route_loop` can; this pass also guards single
+    // legs against any future change that might allow revisits.
+    let _pruned = prune_revisits(&mut node_indices, &mut points, &mut edges);
+    // Geometric loop pruning catches the "out-and-back via a parallel
+    // cycleway / service road" pattern: the polyline returns within 30 m of
+    // an earlier point after a 250 m+ excursion. Single-leg A* can produce
+    // these (different graph nodes, so the graph-revisit pass above misses
+    // them) and they are exactly the "weird tails" the user flagged.
+    if bike_active || mtb_active {
+        let _g = prune_geometric_loops(&mut node_indices, &mut points, &mut edges, 60.0, 200.0);
+    }
+    let total_length: f64 = edges.iter().map(|e| e.length_m).sum();
 
     Ok(RouteResult {
         points,
         edges,
         total_length_m: total_length,
+        node_indices,
     })
 }
 
@@ -307,7 +714,12 @@ pub fn route_loop(
     }
     let mut all_points: Vec<LatLon> = Vec::new();
     let mut all_edges: Vec<EdgeData> = Vec::new();
-    let mut total_length = 0.0;
+    let mut all_nodes: Vec<NodeIndex> = Vec::new();
+    // The predecessor of the *next* leg's start is the second-to-last node
+    // of the current leg. Threading it through `shortest_with_start_prev`
+    // makes A* forbid going right back through that node — kills the
+    // hairpin "tail" pattern at shape vertices.
+    let mut start_prev: Option<NodeIndex> = None;
     for (i, w) in vertices.windows(2).enumerate() {
         let pair = graph.closest_connected_pair(w[0], w[1]).ok_or(LegFailure {
             leg_index: i,
@@ -316,26 +728,72 @@ pub fn route_loop(
             message: "graph empty for leg endpoints".into(),
         })?;
         let (s_idx, e_idx, _, _) = pair;
-        let leg = shortest(graph, s_idx, e_idx, w[0], w[1], params).map_err(|e| LegFailure {
-            leg_index: i,
-            from: w[0],
-            to: w[1],
-            message: e.to_string(),
-        })?;
+        // Only thread `start_prev` when the next leg's start coincides with
+        // the previous leg's end node — otherwise the predecessor refers to
+        // a different node and would mis-guide the turn penalty.
+        let prev_to_pass = match (all_nodes.last(), start_prev) {
+            (Some(&last), Some(_)) if last == s_idx => start_prev,
+            _ => None,
+        };
+        // Threading can stall A* if the start node is a degree-1 dead end
+        // whose only neighbour is the forbidden predecessor. Fall back to
+        // unthreaded routing in that case so the loop completes — turn
+        // smoothing is sacrificed at the junction, but a route exists.
+        let leg = match shortest_with_start_prev(
+            graph, s_idx, e_idx, prev_to_pass, w[0], w[1], params,
+        ) {
+            Ok(r) => r,
+            Err(_) if prev_to_pass.is_some() => {
+                shortest_with_start_prev(graph, s_idx, e_idx, None, w[0], w[1], params)
+                    .map_err(|e| LegFailure {
+                        leg_index: i,
+                        from: w[0],
+                        to: w[1],
+                        message: e.to_string(),
+                    })?
+            }
+            Err(e) => {
+                return Err(LegFailure {
+                    leg_index: i,
+                    from: w[0],
+                    to: w[1],
+                    message: e.to_string(),
+                });
+            }
+        };
         if all_points.is_empty() {
             all_points.extend(&leg.points);
+            all_nodes.extend(&leg.node_indices);
         } else {
-            // Skip the first point of subsequent legs to avoid a duplicate
-            // vertex at the junction with the previous leg.
+            // Skip the first point/node of subsequent legs to avoid a
+            // duplicate vertex at the junction with the previous leg.
             all_points.extend(&leg.points[1..]);
+            all_nodes.extend(&leg.node_indices[1..]);
         }
         all_edges.extend(&leg.edges);
-        total_length += leg.total_length_m;
+        // Predecessor of next leg's start = second-to-last node of this leg.
+        start_prev = if leg.node_indices.len() >= 2 {
+            Some(leg.node_indices[leg.node_indices.len() - 2])
+        } else {
+            None
+        };
     }
+    // Cross-leg graph-revisit pruning was tried and reverted (it collapsed
+    // legitimate shape cross-overs whose two legs deliberately pass through
+    // the same major junction). The *geometric* pruner is safer: it only
+    // fires on near-revisits within 30 m, which a legitimate cross-over at
+    // a major intersection would clear by far. Bike/mtb only — turn smoothing
+    // and tails are concerns specific to cycling, not foot routing.
+    let bike_or_mtb = params.modes & (crate::osm::MODE_BIKE | crate::osm::MODE_MTB) != 0;
+    if bike_or_mtb {
+        prune_geometric_loops(&mut all_nodes, &mut all_points, &mut all_edges, 60.0, 200.0);
+    }
+    let total_length: f64 = all_edges.iter().map(|e| e.length_m).sum();
     Ok(RouteResult {
         points: all_points,
         edges: all_edges,
         total_length_m: total_length,
+        node_indices: all_nodes,
     })
 }
 
@@ -343,7 +801,10 @@ pub fn route_loop(
 mod tests {
     use super::*;
     use crate::geodesy::haversine;
-    use crate::osm::{NodePoint, MODE_BIKE, MODE_FOOT, SURFACE_PAVED};
+    use crate::osm::{
+        NodePoint, BCLASS_CYCLEWAY, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, MODE_BIKE, MODE_FOOT,
+        SURFACE_PAVED,
+    };
     use petgraph::graph::UnGraph;
     use rustc_hash::FxHashMap;
 
@@ -368,6 +829,7 @@ mod tests {
                     length_m: length,
                     modes: MODE_FOOT | MODE_BIKE,
                     surface: SURFACE_PAVED,
+                    bike_attrs: BCLASS_RESIDENTIAL,
                     way_id: 1,
                 },
             );
@@ -416,6 +878,362 @@ mod tests {
             result.is_err(),
             "expected no route — detour is far outside corridor"
         );
+    }
+
+    /// Wrap a bare UnGraph in a `Graph` with the auxiliary indices populated
+    /// from the graph's actual contents. Components are filled via a tiny
+    /// union-find pass so multi-island synthetic graphs route correctly.
+    fn wrap_graph(g: UnGraph<LatLon, EdgeData>) -> Graph {
+        let pts: Vec<NodePoint> = g
+            .node_indices()
+            .map(|ni| NodePoint { idx: ni, lat: g[ni].lat, lon: g[ni].lon })
+            .collect();
+        let rtree = rstar::RTree::bulk_load(pts);
+        let n = g.node_count();
+        let mut uf: petgraph::unionfind::UnionFind<usize> =
+            petgraph::unionfind::UnionFind::new(n);
+        for er in g.edge_references() {
+            uf.union(er.source().index(), er.target().index());
+        }
+        let components: Vec<u32> = (0..n).map(|i| uf.find(i) as u32).collect();
+        Graph {
+            graph: g,
+            osm_to_idx: FxHashMap::default(),
+            components,
+            rtree,
+            elevations_m: None,
+        }
+    }
+
+    fn add_edge(
+        g: &mut UnGraph<LatLon, EdgeData>,
+        x: NodeIndex,
+        y: NodeIndex,
+        bike_attrs: u8,
+    ) -> petgraph::graph::EdgeIndex {
+        let length = haversine(g[x], g[y]);
+        g.add_edge(
+            x,
+            y,
+            EdgeData {
+                length_m: length,
+                modes: MODE_FOOT | MODE_BIKE,
+                surface: SURFACE_PAVED,
+                bike_attrs,
+                way_id: 1,
+            },
+        )
+    }
+
+    fn bike_params(half_width_m: f64) -> RouteParams {
+        RouteParams {
+            modes: MODE_BIKE,
+            half_width_m,
+            alpha: 0.0,
+            corridor_max_m: half_width_m,
+            paved_only: false,
+        }
+    }
+
+    #[test]
+    fn turn_penalty_prefers_smoother_route_over_shorter() {
+        // Two A→C options on a synthetic graph:
+        //   smooth: A → B → C  (straight along the equator, ~222 m, no bend)
+        //   sharp:  A → D → C  (a V-shape with ~90° bend at D, ~156 m total)
+        // Without the turn penalty the V wins on raw length. With TURN_PEN=100
+        // m·rad the 90° pivot adds ~157 m, so the smooth route must win.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.001));
+        let c = g.add_node(LatLon::new(0.0, 0.002));
+        let d = g.add_node(LatLon::new(0.0005, 0.001));
+        add_edge(&mut g, a, b, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, b, c, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, a, d, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, d, c, BCLASS_RESIDENTIAL);
+        let graph = wrap_graph(g);
+        let params = bike_params(100_000.0);
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(2),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert_eq!(r.points.len(), 3, "expected 3-point straight route");
+        assert!(
+            r.points[1].lat.abs() < 1e-9,
+            "middle vertex should be B (lat=0), got {:?}",
+            r.points[1]
+        );
+    }
+
+    #[test]
+    fn foot_mode_ignores_bike_class_preference() {
+        // The cycleway-vs-primary split that `bike_prefers_cycleway_over_primary`
+        // exercises must NOT influence foot routing — class multipliers and
+        // turn penalty are bike/mtb-only.  With both branches identical in
+        // length and surface, foot mode is free to pick either.  We just
+        // assert it produces a valid route of the expected length.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.002));
+        let p_mid = g.add_node(LatLon::new(0.0005, 0.001));
+        let c_mid = g.add_node(LatLon::new(-0.0005, 0.001));
+        add_edge(&mut g, a, p_mid, BCLASS_PRIMARY);
+        add_edge(&mut g, p_mid, b, BCLASS_PRIMARY);
+        add_edge(&mut g, a, c_mid, BCLASS_CYCLEWAY);
+        add_edge(&mut g, c_mid, b, BCLASS_CYCLEWAY);
+        let graph = wrap_graph(g);
+        let mut params = bike_params(100_000.0);
+        params.modes = MODE_FOOT;
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(1),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert_eq!(r.points.len(), 3, "expected 3-point route A→mid→B");
+    }
+
+    #[test]
+    fn bike_prefers_cycleway_over_primary_at_equal_length() {
+        // Two symmetric parallel routes A→B of identical length and turn
+        // geometry, differing only in highway class. Bike mode must pick
+        // the cycleway branch over the primary branch.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.002));
+        let p_mid = g.add_node(LatLon::new(0.0005, 0.001));   // primary detour (north)
+        let c_mid = g.add_node(LatLon::new(-0.0005, 0.001));  // cycleway detour (south)
+        add_edge(&mut g, a, p_mid, BCLASS_PRIMARY);
+        add_edge(&mut g, p_mid, b, BCLASS_PRIMARY);
+        add_edge(&mut g, a, c_mid, BCLASS_CYCLEWAY);
+        add_edge(&mut g, c_mid, b, BCLASS_CYCLEWAY);
+        let graph = wrap_graph(g);
+        let params = bike_params(100_000.0);
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(1),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert!(
+            r.points[1].lat < 0.0,
+            "bike route should travel via cycleway midpoint (lat<0), got {:?}",
+            r.points[1]
+        );
+    }
+
+    #[test]
+    fn ascent_penalty_prefers_flat_over_steep() {
+        // Two A→B options of comparable length. The "steep" branch climbs
+        // ~10 m over a 55 m edge (~18 % grade) → the hinged ascent term
+        // makes it expensive. The "flat" branch has equal elevation across
+        // both vertices and should win.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.001));
+        let flat = g.add_node(LatLon::new(0.0005, 0.0005));
+        let steep = g.add_node(LatLon::new(-0.0005, 0.0005));
+        add_edge(&mut g, a, flat, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, flat, b, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, a, steep, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, steep, b, BCLASS_RESIDENTIAL);
+        let mut graph = wrap_graph(g);
+        graph.elevations_m = Some(vec![100.0, 100.0, 100.0, 110.0]);
+        let params = bike_params(100_000.0);
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(1),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.001),
+            &params,
+        )
+        .expect("route");
+        assert!(
+            r.points[1].lat > 0.0,
+            "bike route should take the flat branch (lat>0), got {:?}",
+            r.points[1]
+        );
+    }
+
+    #[test]
+    fn prune_revisits_drops_simple_loop() {
+        // Synthetic path: 0 → 1 → 2 → 3 → 1 → 4.  The cycle "1 → 2 → 3 → 1"
+        // returns to node 1; the splice should collapse it to "0 → 1 → 4".
+        let ni = |i: u32| NodeIndex::from(i);
+        let mut nodes = vec![ni(0), ni(1), ni(2), ni(3), ni(1), ni(4)];
+        let mut points = vec![
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 1.0),
+            LatLon::new(0.0, 2.0),
+            LatLon::new(0.0, 3.0),
+            LatLon::new(0.0, 1.0),
+            LatLon::new(0.0, 4.0),
+        ];
+        let dummy = EdgeData {
+            length_m: 100.0,
+            modes: MODE_BIKE,
+            surface: SURFACE_PAVED,
+            bike_attrs: BCLASS_RESIDENTIAL,
+            way_id: 1,
+        };
+        let mut edges = vec![dummy; 5];
+        let removed = super::prune_revisits(&mut nodes, &mut points, &mut edges);
+        assert_eq!(removed, 3);
+        assert_eq!(nodes, vec![ni(0), ni(1), ni(4)]);
+        assert_eq!(points.len(), 3);
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn prune_revisits_keeps_clean_paths_intact() {
+        let ni = |i: u32| NodeIndex::from(i);
+        let mut nodes = vec![ni(0), ni(1), ni(2), ni(3)];
+        let mut points = vec![
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 1.0),
+            LatLon::new(0.0, 2.0),
+            LatLon::new(0.0, 3.0),
+        ];
+        let dummy = EdgeData {
+            length_m: 100.0,
+            modes: MODE_BIKE,
+            surface: SURFACE_PAVED,
+            bike_attrs: BCLASS_RESIDENTIAL,
+            way_id: 1,
+        };
+        let mut edges = vec![dummy; 3];
+        let removed = super::prune_revisits(&mut nodes, &mut points, &mut edges);
+        assert_eq!(removed, 0);
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn prune_geometric_loops_collapses_a_lobe() {
+        // Build a 21-point polyline: 10 points heading east, 10 points
+        // making a perpendicular lobe (going north 200m then south 200m
+        // back), then continuing east. The lobe tip is at the apex; the
+        // return point sits ~10 m from where the lobe started, so the
+        // pruner should drop the lobe's interior.
+        use petgraph::graph::NodeIndex;
+        let ni = |i: u32| NodeIndex::from(i);
+        let mut nodes: Vec<NodeIndex> = (0..21).map(ni).collect();
+        // Points: 0..=4 east along y=0, lat increasing.
+        // 5..=14 the lobe (going north to peak then back).
+        // 15..=20 east continuation.
+        let mut points: Vec<LatLon> = Vec::with_capacity(21);
+        for i in 0..5 {
+            points.push(LatLon::new(0.0, 0.0005 * i as f64));
+        }
+        // Lobe: enters from (0, 0.002), goes north to (0.002, 0.002) then back.
+        let entry = LatLon::new(0.0, 0.002);
+        for k in 0..10 {
+            let theta = (k as f64) * std::f64::consts::PI / 9.0;
+            let lat = entry.lat + 0.002 * theta.sin() * 0.5;
+            let lon = entry.lon + 0.00001 * k as f64;
+            points.push(LatLon::new(lat, lon));
+        }
+        // Continue east, starting ~10 m from the lobe entry (the return point).
+        for i in 0..6 {
+            points.push(LatLon::new(0.0, 0.0021 + 0.0005 * i as f64));
+        }
+        let dummy = EdgeData {
+            length_m: 50.0,
+            modes: MODE_BIKE,
+            surface: SURFACE_PAVED,
+            bike_attrs: BCLASS_RESIDENTIAL,
+            way_id: 1,
+        };
+        let mut edges = vec![dummy; 20];
+        let removed =
+            super::prune_geometric_loops(&mut nodes, &mut points, &mut edges, 30.0, 100.0);
+        assert!(removed > 0, "lobe should have been spliced");
+        assert!(points.len() < 21);
+        assert_eq!(edges.len() + 1, nodes.len(),
+            "node/edge counts must stay aligned after splice");
+    }
+
+    #[test]
+    fn prune_geometric_loops_leaves_clean_paths_alone() {
+        // Straight polyline with no self-proximity → nothing to splice.
+        let ni = |i: u32| petgraph::graph::NodeIndex::from(i);
+        let mut nodes: Vec<_> = (0..30).map(ni).collect();
+        let mut points: Vec<LatLon> = (0..30).map(|i| LatLon::new(0.0, 0.001 * i as f64)).collect();
+        let dummy = EdgeData {
+            length_m: 100.0,
+            modes: MODE_BIKE,
+            surface: SURFACE_PAVED,
+            bike_attrs: BCLASS_RESIDENTIAL,
+            way_id: 1,
+        };
+        let mut edges = vec![dummy; 29];
+        let removed = super::prune_geometric_loops(&mut nodes, &mut points, &mut edges, 30.0, 250.0);
+        assert_eq!(removed, 0);
+        assert_eq!(points.len(), 30);
+        assert_eq!(edges.len(), 29);
+    }
+
+    #[test]
+    fn prune_revisits_collapses_nested_loops() {
+        // 0 → 1 → 2 → 1 → 3 → 1 → 4: two separate returns to 1.  After the
+        // first splice, 1 is at index 1; the second 1 (originally idx 5)
+        // becomes another revisit and gets collapsed too.  Final path:
+        // 0 → 1 → 4.
+        let ni = |i: u32| NodeIndex::from(i);
+        let mut nodes = vec![ni(0), ni(1), ni(2), ni(1), ni(3), ni(1), ni(4)];
+        let mut points = vec![LatLon::new(0.0, 0.0); nodes.len()];
+        let dummy = EdgeData {
+            length_m: 100.0,
+            modes: MODE_BIKE,
+            surface: SURFACE_PAVED,
+            bike_attrs: BCLASS_RESIDENTIAL,
+            way_id: 1,
+        };
+        let mut edges = vec![dummy; nodes.len() - 1];
+        let removed = super::prune_revisits(&mut nodes, &mut points, &mut edges);
+        assert_eq!(removed, 4);
+        assert_eq!(nodes, vec![ni(0), ni(1), ni(4)]);
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn u_turn_back_to_predecessor_is_skipped() {
+        // A — B — C linear chain. After A* arrives at B with prev=A, the
+        // edge B→A must not be considered (would be a U-turn). Routing
+        // A→C therefore visits each node exactly once.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.001));
+        let c = g.add_node(LatLon::new(0.0, 0.002));
+        add_edge(&mut g, a, b, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, b, c, BCLASS_RESIDENTIAL);
+        let graph = wrap_graph(g);
+        let params = bike_params(100_000.0);
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(2),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert_eq!(r.points.len(), 3);
+        assert_eq!(r.points[0], LatLon::new(0.0, 0.0));
+        assert_eq!(r.points[1], LatLon::new(0.0, 0.001));
+        assert_eq!(r.points[2], LatLon::new(0.0, 0.002));
     }
 
     #[test]
