@@ -12,8 +12,8 @@
 use crate::elevation::ElevationClient;
 use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
-use crate::osm::{BBox, Graph, MODE_BIKE, MODE_FOOT, MODE_MTB, SURFACE_LABELS};
 use crate::hershey_fonts::Font;
+use crate::osm::{BBox, Graph, MODE_BIKE, MODE_FOOT, MODE_MTB, SURFACE_LABELS};
 use crate::route::RouteParams;
 use crate::text;
 use crate::viability::NoGoZone;
@@ -106,17 +106,22 @@ impl RejectionStats {
         }
     }
     pub fn merge(&mut self, other: &RejectionStats) {
-        self.snap_too_far     += other.snap_too_far;
+        self.snap_too_far += other.snap_too_far;
         self.corridor_violated += other.corridor_violated;
-        self.no_route         += other.no_route;
-        self.no_go            += other.no_go;
-        self.too_short        += other.too_short;
-        self.too_long         += other.too_long;
-        self.other            += other.other;
+        self.no_route += other.no_route;
+        self.no_go += other.no_go;
+        self.too_short += other.too_short;
+        self.too_long += other.too_long;
+        self.other += other.other;
     }
     pub fn total(&self) -> usize {
-        self.snap_too_far + self.corridor_violated + self.no_route + self.no_go
-            + self.too_short + self.too_long + self.other
+        self.snap_too_far
+            + self.corridor_violated
+            + self.no_route
+            + self.no_go
+            + self.too_short
+            + self.too_long
+            + self.other
     }
     pub fn to_json(&self) -> Value {
         json!({
@@ -321,12 +326,7 @@ fn parse_modes(s: &str) -> Result<u8> {
 
 fn scored_to_json(s: &Scored, rank: usize, width_m: f64) -> Value {
     let r = &s.report;
-    let coords: Vec<[f64; 2]> = s
-        .route
-        .points
-        .iter()
-        .map(|p| [p.lon, p.lat])
-        .collect();
+    let coords: Vec<[f64; 2]> = s.route.points.iter().map(|p| [p.lon, p.lat]).collect();
     let corridor: Vec<[f64; 2]> = corridor_polygon(s.candidate.start, s.candidate.end, width_m)
         .into_iter()
         .map(|p| [p.lon, p.lat])
@@ -539,13 +539,7 @@ async fn handle_country(
                     batch_seed,
                 )
             } else {
-                explore::generate_country_candidates_in_bbox(
-                    bbox,
-                    n_sample,
-                    dmin,
-                    dmax,
-                    batch_seed,
-                )
+                explore::generate_country_candidates_in_bbox(bbox, n_sample, dmin, dmax, batch_seed)
             };
             if candidates.is_empty() {
                 continue;
@@ -628,7 +622,9 @@ async fn handle_country(
                 width_m,
                 completed: false,
                 failures: failures_json.clone(),
-                kind: AsyncJobKind::Country { final_results: None },
+                kind: AsyncJobKind::Country {
+                    final_results: None,
+                },
             });
         }
         let state_for_bg = state.clone();
@@ -751,6 +747,7 @@ fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
             "vertices": vertex_coords,
             "rotation_deg": s.candidate.rotation_deg,
             "perimeter_km": s.candidate.perimeter_km,
+            "max_leg_detour_pct": (s.max_leg_detour * 100.0).round(),
             "leg_count": s.vertices.len().saturating_sub(1),
         }
     })
@@ -912,7 +909,9 @@ async fn handle_shape_search(
                 width_m,
                 completed: false,
                 failures: failures_json.clone(),
-                kind: AsyncJobKind::Shape { final_results: None },
+                kind: AsyncJobKind::Shape {
+                    final_results: None,
+                },
             });
         }
         let state_for_bg = state.clone();
@@ -1040,7 +1039,10 @@ async fn handle_text(
     // Probe layout to surface missing-glyph count.
     let probe = text::layout_text(
         &req.text,
-        LatLon::new((bbox.lat_min + bbox.lat_max) * 0.5, (bbox.lon_min + bbox.lon_max) * 0.5),
+        LatLon::new(
+            (bbox.lat_min + bbox.lat_max) * 0.5,
+            (bbox.lon_min + bbox.lon_max) * 0.5,
+        ),
         std::f64::consts::FRAC_PI_2,
         req.letter_height_m,
         wrap_m,
@@ -1313,7 +1315,6 @@ async fn run_shape_rerank(
     *p = None;
 }
 
-
 async fn enrich_elevation(state: &AppState, scored: &mut Vec<Scored>, n_samples: usize) {
     if n_samples == 0 || scored.is_empty() {
         return;
@@ -1359,7 +1360,9 @@ async fn handle_results(
         return Json(json!({ "error": "unknown request_id" }));
     }
     match &job.kind {
-        AsyncJobKind::Country { final_results: Some(rs) } => {
+        AsyncJobKind::Country {
+            final_results: Some(rs),
+        } => {
             let resp: Vec<Value> = rs
                 .iter()
                 .enumerate()
@@ -1372,7 +1375,9 @@ async fn handle_results(
                 "failures": job.failures,
             }))
         }
-        AsyncJobKind::Shape { final_results: Some(rs) } => {
+        AsyncJobKind::Shape {
+            final_results: Some(rs),
+        } => {
             let resp: Vec<Value> = rs
                 .iter()
                 .enumerate()
@@ -1415,10 +1420,7 @@ fn now_ms() -> u128 {
 
 async fn handle_info(State(state): State<AppState>) -> Json<Value> {
     let b = state.0.bbox;
-    let center = LatLon::new(
-        (b.lat_min + b.lat_max) * 0.5,
-        (b.lon_min + b.lon_max) * 0.5,
-    );
+    let center = LatLon::new((b.lat_min + b.lat_max) * 0.5, (b.lon_min + b.lon_max) * 0.5);
     Json(json!({
         "bbox": [b.lon_min, b.lat_min, b.lon_max, b.lat_max],
         "center": [center.lon, center.lat],
@@ -1444,7 +1446,10 @@ async fn handle_style() -> Response {
 
 async fn handle_app_js() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         APP_JS,
     )
         .into_response()
@@ -1526,5 +1531,5 @@ fn pick_alphas(n: usize) -> Vec<f64> {
 }
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
-const STYLE_CSS:  &str = include_str!("../assets/style.css");
-const APP_JS:     &str = include_str!("../assets/app.js");
+const STYLE_CSS: &str = include_str!("../assets/style.css");
+const APP_JS: &str = include_str!("../assets/app.js");

@@ -295,8 +295,11 @@ pub fn enclosing_bbox(start: LatLon, candidates: &[Candidate], pad_deg: f64) -> 
 /// to fall back to a flat scoring that ignores it.
 fn score(report: &Report, ref_km: f64, ascent_m: f64) -> f64 {
     let excess_ratio = (report.total_km / ref_km - 1.0).max(0.0);
-    let long_edge_total_km: f64 =
-        report.long_edges.iter().map(|le| le.length_m / 1000.0).sum();
+    let long_edge_total_km: f64 = report
+        .long_edges
+        .iter()
+        .map(|le| le.length_m / 1000.0)
+        .sum();
     let max_dev_pct = report.max_deviation_m / 1000.0;
     // Per-km ascent puts a 100 km flat ride next to a 100 km hilly ride on a
     // comparable footing with the detour term — 10 m/km is +0.5 score, 50 m/km
@@ -452,6 +455,12 @@ pub struct ScoredShape {
     pub surface_km: [f64; 6],
     pub ferry_km: f64,
     pub score: f64,
+    /// Worst single-leg detour ratio above the intended straight shape leg.
+    /// `0.0` means every routed leg matched its target length; `1.0` means at
+    /// least one leg routed twice as long as intended. This is the key shape
+    /// fidelity metric: a single bad leg creates visible tails even when total
+    /// loop distance looks acceptable.
+    pub max_leg_detour: f64,
     pub elevation: Option<Profile>,
     /// Full-width corridor (metres) actually used to produce this route — see
     /// `Scored::corridor_used_m`.
@@ -490,7 +499,11 @@ pub fn generate_shape_candidates_in_bbox(
     let lock_rotation = kind.has_natural_orientation();
     for _ in 0..n {
         let center = LatLon::new(rng.gen_range(lat_lo..lat_hi), rng.gen_range(lon_lo..lon_hi));
-        let rotation_deg = if lock_rotation { 0.0 } else { rng.gen_range(0.0..360.0) };
+        let rotation_deg = if lock_rotation {
+            0.0
+        } else {
+            rng.gen_range(0.0..360.0)
+        };
         out.push(ShapeCandidate {
             center,
             kind,
@@ -504,7 +517,7 @@ pub fn generate_shape_candidates_in_bbox(
 pub fn route_one_shape(
     graph: &Graph,
     candidate: ShapeCandidate,
-    _no_go: &[NoGoZone],
+    no_go: &[NoGoZone],
     params: &RouteParams,
     filter: &RouteFilter,
 ) -> Result<ScoredShape, (ShapeCandidate, String)> {
@@ -551,11 +564,18 @@ pub fn route_one_shape(
         // Fall back to unthreaded routing if the U-turn-forbid leaves the
         // start with nowhere to go (degree-1 dead-end snap).
         let leg = match route::shortest_with_start_prev(
-            graph, s_idx, e_idx, prev_to_pass, w[0], w[1], params,
+            graph,
+            s_idx,
+            e_idx,
+            prev_to_pass,
+            w[0],
+            w[1],
+            params,
         ) {
             Ok(r) => r,
             Err(_) if prev_to_pass.is_some() => {
-                match route::shortest_with_start_prev(graph, s_idx, e_idx, None, w[0], w[1], params) {
+                match route::shortest_with_start_prev(graph, s_idx, e_idx, None, w[0], w[1], params)
+                {
                     Ok(r) => r,
                     Err(e) => return Err((candidate, format!("leg {}: {}", i + 1, e))),
                 }
@@ -602,6 +622,27 @@ pub fn route_one_shape(
     let total_length: f64 = all_edges.iter().map(|e| e.length_m).sum();
     let real_km = total_length / 1000.0;
     let detour = (real_km / candidate.perimeter_km - 1.0).max(0.0);
+    let route = RouteResult {
+        points: all_points,
+        edges: all_edges,
+        total_length_m: total_length,
+        node_indices: all_nodes,
+    };
+    let report = viability::analyse(&route, vertices[0], vertices[1], no_go, f64::INFINITY);
+    if !report.violations.is_empty() {
+        return Err((
+            candidate,
+            format!(
+                "no-go: {}",
+                report
+                    .violations
+                    .iter()
+                    .map(|v| v.zone.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     // Combined score: total detour as before, plus a heavy penalty on the
     // worst single leg. A loop where one leg detours 200% but the rest are
     // tight will end up scoring worse than a loop where every leg detours
@@ -610,15 +651,11 @@ pub fn route_one_shape(
     Ok(ScoredShape {
         candidate,
         vertices,
-        route: RouteResult {
-            points: all_points,
-            edges: all_edges,
-            total_length_m: total_length,
-            node_indices: all_nodes,
-        },
+        route,
         surface_km,
         ferry_km,
         score,
+        max_leg_detour,
         elevation: None,
         corridor_used_m: params.half_width_m * 2.0,
     })
@@ -656,7 +693,7 @@ pub fn rescore_shape_with_elevation(s: &mut ScoredShape) {
     };
     let ascent = s.elevation.as_ref().map(|e| e.ascent_m).unwrap_or(0.0);
     let per_km = if real_km > 0.0 { ascent / real_km } else { 0.0 };
-    s.score = 100.0 * detour + 0.05 * per_km;
+    s.score = 100.0 * detour + 80.0 * s.max_leg_detour + 0.05 * per_km;
 }
 
 /// Rank by score, drop near-duplicate centers, take top n. Two shapes are
@@ -691,11 +728,7 @@ pub fn rank(mut scored: Vec<Scored>) -> Vec<Scored> {
 
 /// Rank, deduplicate near-identical pairs, take top `n`. Two candidates count
 /// as duplicates if both their start AND end points are within `min_sep_km`.
-pub fn rank_dedup_top(
-    mut scored: Vec<Scored>,
-    n: usize,
-    min_sep_km: f64,
-) -> Vec<Scored> {
+pub fn rank_dedup_top(mut scored: Vec<Scored>, n: usize, min_sep_km: f64) -> Vec<Scored> {
     scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
     let mut out: Vec<Scored> = Vec::with_capacity(n);
     let sep_m = min_sep_km * 1000.0;
@@ -766,5 +799,160 @@ fn fmt_m(v: f64) -> String {
         "  —  ".to_string()
     } else {
         format!("{:.0}", v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::osm::{NodePoint, BCLASS_RESIDENTIAL, MODE_FOOT, SURFACE_PAVED};
+    use geo::{Coord, LineString, MultiPolygon, Polygon};
+    use petgraph::graph::UnGraph;
+    use petgraph::visit::EdgeRef;
+    use rustc_hash::FxHashMap;
+
+    fn graph_for_shape(vertices: &[LatLon]) -> Graph {
+        let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
+        let nodes: Vec<_> = vertices[..vertices.len() - 1]
+            .iter()
+            .map(|p| g.add_node(*p))
+            .collect();
+        for i in 0..nodes.len() {
+            let a = nodes[i];
+            let b = nodes[(i + 1) % nodes.len()];
+            g.add_edge(
+                a,
+                b,
+                EdgeData {
+                    length_m: haversine(g[a], g[b]),
+                    modes: MODE_FOOT,
+                    surface: SURFACE_PAVED,
+                    bike_attrs: BCLASS_RESIDENTIAL,
+                    way_id: 1,
+                },
+            );
+        }
+        let pts: Vec<NodePoint> = g
+            .node_indices()
+            .map(|ni| NodePoint {
+                idx: ni,
+                lat: g[ni].lat,
+                lon: g[ni].lon,
+            })
+            .collect();
+        let mut uf = petgraph::unionfind::UnionFind::new(g.node_count());
+        for er in g.edge_references() {
+            uf.union(er.source().index(), er.target().index());
+        }
+        let components: Vec<u32> = (0..g.node_count()).map(|i| uf.find(i) as u32).collect();
+        Graph {
+            graph: g,
+            osm_to_idx: FxHashMap::default(),
+            components,
+            rtree: rstar::RTree::bulk_load(pts),
+            elevations_m: None,
+        }
+    }
+
+    fn no_go_around_segment(name: &str, a: LatLon, b: LatLon) -> NoGoZone {
+        let pad = 0.0001;
+        let lon_min = a.lon.min(b.lon) - pad;
+        let lon_max = a.lon.max(b.lon) + pad;
+        let lat_min = a.lat.min(b.lat) - pad;
+        let lat_max = a.lat.max(b.lat) + pad;
+        NoGoZone {
+            name: name.to_string(),
+            polygons: MultiPolygon(vec![Polygon::new(
+                LineString::from(vec![
+                    Coord {
+                        x: lon_min,
+                        y: lat_min,
+                    },
+                    Coord {
+                        x: lon_max,
+                        y: lat_min,
+                    },
+                    Coord {
+                        x: lon_max,
+                        y: lat_max,
+                    },
+                    Coord {
+                        x: lon_min,
+                        y: lat_max,
+                    },
+                    Coord {
+                        x: lon_min,
+                        y: lat_min,
+                    },
+                ]),
+                vec![],
+            )]),
+        }
+    }
+
+    #[test]
+    fn shape_route_rejects_no_go_intersection() {
+        let candidate = ShapeCandidate {
+            center: LatLon::new(0.0, 0.0),
+            kind: ShapeKind::Square,
+            perimeter_km: 4.0,
+            rotation_deg: 0.0,
+        };
+        let vertices = place_shape(
+            candidate.center,
+            candidate.kind,
+            candidate.perimeter_km,
+            candidate.rotation_deg,
+        );
+        let graph = graph_for_shape(&vertices);
+        let params = RouteParams {
+            modes: MODE_FOOT,
+            half_width_m: 200.0,
+            alpha: 4.0,
+            corridor_max_m: 200.0,
+            paved_only: false,
+        };
+        let filter = RouteFilter::lax(200.0);
+        let no_go = vec![no_go_around_segment("blocked", vertices[0], vertices[1])];
+
+        let err = route_one_shape(&graph, candidate, &no_go, &params, &filter)
+            .expect_err("shape route should be rejected by no-go zone")
+            .1;
+
+        assert!(err.contains("no-go: blocked"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn shape_elevation_rescore_keeps_worst_leg_penalty() {
+        let candidate = ShapeCandidate {
+            center: LatLon::new(0.0, 0.0),
+            kind: ShapeKind::Square,
+            perimeter_km: 10.0,
+            rotation_deg: 0.0,
+        };
+        let mut scored = ScoredShape {
+            candidate,
+            vertices: vec![LatLon::new(0.0, 0.0), LatLon::new(0.0, 0.01)],
+            route: RouteResult {
+                points: vec![LatLon::new(0.0, 0.0), LatLon::new(0.0, 0.01)],
+                edges: Vec::new(),
+                total_length_m: 12_000.0,
+                node_indices: Vec::new(),
+            },
+            surface_km: [0.0; 6],
+            ferry_km: 0.0,
+            score: 0.0,
+            max_leg_detour: 1.5,
+            elevation: None,
+            corridor_used_m: 1_000.0,
+        };
+
+        rescore_shape_with_elevation(&mut scored);
+
+        assert!(
+            scored.score >= 140.0,
+            "score should retain large worst-leg penalty, got {}",
+            scored.score
+        );
     }
 }

@@ -421,9 +421,8 @@ pub fn shortest_with_start_prev(
     let bike_active = (modes & MODE_BIKE) != 0;
     let mtb_active = (modes & MODE_MTB) != 0;
     // When MTB is in the user's mode mask, the cyclist is signalling tolerance
-    // for rough surfaces — soften the descent / surface penalties so the
-    // router doesn't reject perfectly good singletrack just because gravity
-    // exists. Pure bike-mode keeps the original (stricter) weights.
+    // for rough surfaces. Pure bike-mode is treated as road-bike leaning:
+    // avoid footpaths / rough tracks unless the alternative is clearly worse.
     let rough_scale: f64 = if mtb_active && !bike_active {
         0.25
     } else if mtb_active {
@@ -451,12 +450,10 @@ pub fn shortest_with_start_prev(
         base * rough_scale
     };
     // Per-class cost multiplier applied when bike (or mtb) is in the user's
-    // mode mask. The multiplier *range* is deliberately compressed: an
-    // earlier 0.70…2.20 spread caused the router to attach to every short
-    // cycleway/residential spur (200 m of cycleway × 0.70 was worth a 50 m
-    // hairpin to reach), driving turn density to ~400°/km. A narrower range
-    // expresses the same preference ordering — cycleway < residential ≈
-    // tertiary < service < secondary ≪ primary — without rewarding pathology.
+    // mode mask. The paved-road classes stay compressed so the router doesn't
+    // attach to every short cycleway spur. Path/track are deliberately much
+    // harsher for pure bike mode: on a road bike, MTB-ish paths are a last
+    // resort, not a nice shortcut. MTB mode keeps those classes cheap.
     let bike_class_mult = |class: u8| -> f64 {
         match class {
             BCLASS_CYCLEWAY => 1.00,
@@ -469,7 +466,7 @@ pub fn shortest_with_start_prev(
                 if mtb_active {
                     1.00
                 } else {
-                    1.08
+                    1.35
                 }
             }
             BCLASS_PATH => {
@@ -478,7 +475,7 @@ pub fn shortest_with_start_prev(
                 } else if mtb_active {
                     1.10
                 } else {
-                    1.25
+                    2.60
                 }
             }
             BCLASS_FERRY | BCLASS_OTHER => 1.0,
@@ -486,19 +483,19 @@ pub fn shortest_with_start_prev(
         }
     };
     // Surface multiplier that applies *always* when bike/mtb are in play, not
-    // just on descent — riding 10 km of path is slow even on the flat. Kept
-    // smaller than the descent kicker so the two stack sensibly on rough
-    // downhills.
+    // just on descent — riding 10 km of path is slow even on the flat. For
+    // pure bike mode, gravel remains acceptable, but unknown/path/unpaved are
+    // expensive enough that a sane paved-road detour should win.
     let surface_mult = |surface: u8| -> f64 {
         if !bike_active && !mtb_active {
             return 1.0;
         }
         let base = match surface {
             SURFACE_PAVED | SURFACE_FERRY => 1.0,
-            SURFACE_GRAVEL => 1.05,
-            SURFACE_UNPAVED => 1.25,
-            SURFACE_OTHER => 1.10,
-            SURFACE_PATH => 1.40,
+            SURFACE_GRAVEL => 1.12,
+            SURFACE_UNPAVED => 1.85,
+            SURFACE_OTHER => 1.35,
+            SURFACE_PATH => 2.20,
             _ => 1.0,
         };
         // Soften with rough_scale: subtract the excess proportionally so MTB
@@ -588,7 +585,11 @@ pub fn shortest_with_start_prev(
                     let grade = rise_m / e.length_m;
                     const HINGE: f64 = 0.04;
                     let excess = (grade - HINGE).max(0.0);
-                    let k = if mtb_active && !bike_active { 45.0 } else { 80.0 };
+                    let k = if mtb_active && !bike_active {
+                        45.0
+                    } else {
+                        80.0
+                    };
                     c += e.length_m * k * excess * excess;
                 }
             }
@@ -596,14 +597,13 @@ pub fn shortest_with_start_prev(
         c
     };
 
-    let elev_for = |s: petgraph::graph::NodeIndex,
-                    t: petgraph::graph::NodeIndex|
-     -> Option<(f32, f32)> {
-        let el = elevations?;
-        let zs = *el.get(s.index())?;
-        let zt = *el.get(t.index())?;
-        Some((zs, zt))
-    };
+    let elev_for =
+        |s: petgraph::graph::NodeIndex, t: petgraph::graph::NodeIndex| -> Option<(f32, f32)> {
+            let el = elevations?;
+            let zs = *el.get(s.index())?;
+            let zt = *el.get(t.index())?;
+            Some((zs, zt))
+        };
 
     // Bike multipliers can drive an edge's cost below its physical length
     // (cycleway × designated × network ≈ 0.52). Plain haversine would then
@@ -739,28 +739,27 @@ pub fn route_loop(
         // whose only neighbour is the forbidden predecessor. Fall back to
         // unthreaded routing in that case so the loop completes — turn
         // smoothing is sacrificed at the junction, but a route exists.
-        let leg = match shortest_with_start_prev(
-            graph, s_idx, e_idx, prev_to_pass, w[0], w[1], params,
-        ) {
-            Ok(r) => r,
-            Err(_) if prev_to_pass.is_some() => {
-                shortest_with_start_prev(graph, s_idx, e_idx, None, w[0], w[1], params)
-                    .map_err(|e| LegFailure {
+        let leg =
+            match shortest_with_start_prev(graph, s_idx, e_idx, prev_to_pass, w[0], w[1], params) {
+                Ok(r) => r,
+                Err(_) if prev_to_pass.is_some() => {
+                    shortest_with_start_prev(graph, s_idx, e_idx, None, w[0], w[1], params)
+                        .map_err(|e| LegFailure {
+                            leg_index: i,
+                            from: w[0],
+                            to: w[1],
+                            message: e.to_string(),
+                        })?
+                }
+                Err(e) => {
+                    return Err(LegFailure {
                         leg_index: i,
                         from: w[0],
                         to: w[1],
                         message: e.to_string(),
-                    })?
-            }
-            Err(e) => {
-                return Err(LegFailure {
-                    leg_index: i,
-                    from: w[0],
-                    to: w[1],
-                    message: e.to_string(),
-                });
-            }
-        };
+                    });
+                }
+            };
         if all_points.is_empty() {
             all_points.extend(&leg.points);
             all_nodes.extend(&leg.node_indices);
@@ -802,8 +801,8 @@ mod tests {
     use super::*;
     use crate::geodesy::haversine;
     use crate::osm::{
-        NodePoint, BCLASS_CYCLEWAY, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, MODE_BIKE, MODE_FOOT,
-        SURFACE_PAVED,
+        NodePoint, BCLASS_CYCLEWAY, BCLASS_PATH, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, MODE_BIKE,
+        MODE_FOOT, MODE_MTB, SURFACE_PATH, SURFACE_PAVED,
     };
     use petgraph::graph::UnGraph;
     use rustc_hash::FxHashMap;
@@ -886,12 +885,15 @@ mod tests {
     fn wrap_graph(g: UnGraph<LatLon, EdgeData>) -> Graph {
         let pts: Vec<NodePoint> = g
             .node_indices()
-            .map(|ni| NodePoint { idx: ni, lat: g[ni].lat, lon: g[ni].lon })
+            .map(|ni| NodePoint {
+                idx: ni,
+                lat: g[ni].lat,
+                lon: g[ni].lon,
+            })
             .collect();
         let rtree = rstar::RTree::bulk_load(pts);
         let n = g.node_count();
-        let mut uf: petgraph::unionfind::UnionFind<usize> =
-            petgraph::unionfind::UnionFind::new(n);
+        let mut uf: petgraph::unionfind::UnionFind<usize> = petgraph::unionfind::UnionFind::new(n);
         for er in g.edge_references() {
             uf.union(er.source().index(), er.target().index());
         }
@@ -911,14 +913,24 @@ mod tests {
         y: NodeIndex,
         bike_attrs: u8,
     ) -> petgraph::graph::EdgeIndex {
+        add_edge_with_surface(g, x, y, bike_attrs, SURFACE_PAVED)
+    }
+
+    fn add_edge_with_surface(
+        g: &mut UnGraph<LatLon, EdgeData>,
+        x: NodeIndex,
+        y: NodeIndex,
+        bike_attrs: u8,
+        surface: u8,
+    ) -> petgraph::graph::EdgeIndex {
         let length = haversine(g[x], g[y]);
         g.add_edge(
             x,
             y,
             EdgeData {
                 length_m: length,
-                modes: MODE_FOOT | MODE_BIKE,
-                surface: SURFACE_PAVED,
+                modes: MODE_FOOT | MODE_BIKE | MODE_MTB,
+                surface,
                 bike_attrs,
                 way_id: 1,
             },
@@ -1009,8 +1021,8 @@ mod tests {
         let mut g = UnGraph::new_undirected();
         let a = g.add_node(LatLon::new(0.0, 0.0));
         let b = g.add_node(LatLon::new(0.0, 0.002));
-        let p_mid = g.add_node(LatLon::new(0.0005, 0.001));   // primary detour (north)
-        let c_mid = g.add_node(LatLon::new(-0.0005, 0.001));  // cycleway detour (south)
+        let p_mid = g.add_node(LatLon::new(0.0005, 0.001)); // primary detour (north)
+        let c_mid = g.add_node(LatLon::new(-0.0005, 0.001)); // cycleway detour (south)
         add_edge(&mut g, a, p_mid, BCLASS_PRIMARY);
         add_edge(&mut g, p_mid, b, BCLASS_PRIMARY);
         add_edge(&mut g, a, c_mid, BCLASS_CYCLEWAY);
@@ -1031,6 +1043,64 @@ mod tests {
             "bike route should travel via cycleway midpoint (lat<0), got {:?}",
             r.points[1]
         );
+    }
+
+    #[test]
+    fn road_bike_prefers_paved_detour_over_short_path() {
+        // Direct A→B is a rough path (~222 m). The paved residential detour is
+        // ~314 m, but should still win for pure bike mode because road bikes
+        // should not treat MTB/foot paths as cheap shortcuts.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.002));
+        let c = g.add_node(LatLon::new(0.001, 0.001));
+        add_edge_with_surface(&mut g, a, b, BCLASS_PATH, SURFACE_PATH);
+        add_edge(&mut g, a, c, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, c, b, BCLASS_RESIDENTIAL);
+        let graph = wrap_graph(g);
+        let params = bike_params(100_000.0);
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(1),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert_eq!(r.points.len(), 3, "bike should take paved detour");
+        assert!(
+            r.points[1].lat > 0.0,
+            "middle vertex should be paved detour, got {:?}",
+            r.points[1]
+        );
+    }
+
+    #[test]
+    fn mtb_mode_still_accepts_short_path() {
+        // Same graph as `road_bike_prefers_paved_detour_over_short_path`, but
+        // MTB mode keeps path costs low enough that the shorter direct leg is
+        // acceptable.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.002));
+        let c = g.add_node(LatLon::new(0.001, 0.001));
+        add_edge_with_surface(&mut g, a, b, BCLASS_PATH, SURFACE_PATH);
+        add_edge(&mut g, a, c, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, c, b, BCLASS_RESIDENTIAL);
+        let graph = wrap_graph(g);
+        let mut params = bike_params(100_000.0);
+        params.modes = MODE_MTB;
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(1),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert_eq!(r.points.len(), 2, "mtb should accept short path");
     }
 
     #[test]
@@ -1161,8 +1231,11 @@ mod tests {
             super::prune_geometric_loops(&mut nodes, &mut points, &mut edges, 30.0, 100.0);
         assert!(removed > 0, "lobe should have been spliced");
         assert!(points.len() < 21);
-        assert_eq!(edges.len() + 1, nodes.len(),
-            "node/edge counts must stay aligned after splice");
+        assert_eq!(
+            edges.len() + 1,
+            nodes.len(),
+            "node/edge counts must stay aligned after splice"
+        );
     }
 
     #[test]
@@ -1170,7 +1243,9 @@ mod tests {
         // Straight polyline with no self-proximity → nothing to splice.
         let ni = |i: u32| petgraph::graph::NodeIndex::from(i);
         let mut nodes: Vec<_> = (0..30).map(ni).collect();
-        let mut points: Vec<LatLon> = (0..30).map(|i| LatLon::new(0.0, 0.001 * i as f64)).collect();
+        let mut points: Vec<LatLon> = (0..30)
+            .map(|i| LatLon::new(0.0, 0.001 * i as f64))
+            .collect();
         let dummy = EdgeData {
             length_m: 100.0,
             modes: MODE_BIKE,
@@ -1179,7 +1254,8 @@ mod tests {
             way_id: 1,
         };
         let mut edges = vec![dummy; 29];
-        let removed = super::prune_geometric_loops(&mut nodes, &mut points, &mut edges, 30.0, 250.0);
+        let removed =
+            super::prune_geometric_loops(&mut nodes, &mut points, &mut edges, 30.0, 250.0);
         assert_eq!(removed, 0);
         assert_eq!(points.len(), 30);
         assert_eq!(edges.len(), 29);

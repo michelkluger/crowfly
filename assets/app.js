@@ -921,7 +921,10 @@ function cardHtml(r) {
   const metricsRow = (r.kind === 'text')
     ? `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
         (${detour>=0?'+':''}${detour.toFixed(0)}% detour)${ferryTxt}</div>`
-    : `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
+    : r.shape
+      ? `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
+        (${detour>=0?'+':''}${detour.toFixed(0)}%) · worst leg +${Math.round(r.shape.max_leg_detour_pct || 0)}%${ferryTxt}</div>`
+      : `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
         (${detour>=0?'+':''}${detour.toFixed(0)}%) · max dev ${Math.round(r.max_dev_m)} m${ferryTxt}</div>`;
   return `<div class="card" data-rank="${r.rank}" data-key="${r._key || ''}">
     <div class="hd"><b>#${r.rank}</b> &nbsp; ${headerLeft}${widenBadge}
