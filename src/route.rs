@@ -549,6 +549,15 @@ pub fn shortest_with_start_prev(
             }
             weight *= bm;
             weight *= surface_mult(e.surface);
+            // If the user has bike enabled, a pure foot edge is a push/carry
+            // segment, not normal riding. Keep it possible for mixed
+            // bike+hike plans, but make a paved rideable detour strongly win
+            // for road-bike-like searches. MTB users are more likely to have
+            // intentionally enabled rough non-road traversal, so don't apply
+            // the road-bike penalty there.
+            if bike_active && !mtb_active && (e.modes & MODE_BIKE) == 0 {
+                weight *= 4.0;
+            }
         }
         let mut c = e.length_m * weight;
         if turn_active {
@@ -923,13 +932,31 @@ mod tests {
         bike_attrs: u8,
         surface: u8,
     ) -> petgraph::graph::EdgeIndex {
+        add_edge_with_modes(
+            g,
+            x,
+            y,
+            bike_attrs,
+            surface,
+            MODE_FOOT | MODE_BIKE | MODE_MTB,
+        )
+    }
+
+    fn add_edge_with_modes(
+        g: &mut UnGraph<LatLon, EdgeData>,
+        x: NodeIndex,
+        y: NodeIndex,
+        bike_attrs: u8,
+        surface: u8,
+        modes: u8,
+    ) -> petgraph::graph::EdgeIndex {
         let length = haversine(g[x], g[y]);
         g.add_edge(
             x,
             y,
             EdgeData {
                 length_m: length,
-                modes: MODE_FOOT | MODE_BIKE | MODE_MTB,
+                modes,
                 surface,
                 bike_attrs,
                 way_id: 1,
@@ -1101,6 +1128,37 @@ mod tests {
         )
         .expect("route");
         assert_eq!(r.points.len(), 2, "mtb should accept short path");
+    }
+
+    #[test]
+    fn bike_plus_foot_prefers_rideable_detour_over_foot_only_path() {
+        // With foot+bike enabled, a direct foot-only path is technically
+        // allowed. For road-bike-like routing it should still lose to a
+        // reasonable paved bike detour.
+        let mut g = UnGraph::new_undirected();
+        let a = g.add_node(LatLon::new(0.0, 0.0));
+        let b = g.add_node(LatLon::new(0.0, 0.002));
+        let c = g.add_node(LatLon::new(0.001, 0.001));
+        add_edge_with_modes(&mut g, a, b, BCLASS_PATH, SURFACE_PATH, MODE_FOOT);
+        add_edge(&mut g, a, c, BCLASS_RESIDENTIAL);
+        add_edge(&mut g, c, b, BCLASS_RESIDENTIAL);
+        let graph = wrap_graph(g);
+        let mut params = bike_params(100_000.0);
+        params.modes = MODE_FOOT | MODE_BIKE;
+        let r = shortest(
+            &graph,
+            NodeIndex::new(0),
+            NodeIndex::new(1),
+            LatLon::new(0.0, 0.0),
+            LatLon::new(0.0, 0.002),
+            &params,
+        )
+        .expect("route");
+        assert_eq!(
+            r.points.len(),
+            3,
+            "foot+bike should avoid foot-only shortcut"
+        );
     }
 
     #[test]

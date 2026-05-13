@@ -4,7 +4,7 @@ use crate::geodesy::{haversine, LatLon};
 use anyhow::{Context, Result};
 use geo::{Contains, Coord, LineString, Polygon};
 use indicatif::{ProgressBar, ProgressStyle};
-use osmpbfreader::{OsmObj, OsmPbfReader};
+use osmpbfreader::{OsmId, OsmObj, OsmPbfReader};
 use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::unionfind::UnionFind;
 use petgraph::visit::EdgeRef;
@@ -26,8 +26,7 @@ pub const SURFACE_PATH: u8 = 2;
 pub const SURFACE_UNPAVED: u8 = 3;
 pub const SURFACE_OTHER: u8 = 4;
 pub const SURFACE_FERRY: u8 = 5;
-pub const SURFACE_LABELS: [&str; 6] =
-    ["paved", "gravel", "path", "unpaved", "other", "ferry"];
+pub const SURFACE_LABELS: [&str; 6] = ["paved", "gravel", "path", "unpaved", "other", "ferry"];
 
 /// Coarse bike-routing class derived from `highway=*` plus bicycle access tags.
 /// Stored in the low 4 bits of `EdgeData::bike_attrs`. The router uses these
@@ -190,9 +189,15 @@ impl Graph {
         if !missing_tiles.is_empty() {
             let mut list: Vec<String> = missing_tiles
                 .iter()
-                .map(|(lat, lon)| format!("{}{:02}{}{:03}",
-                    if *lat >= 0 { 'N' } else { 'S' }, lat.abs(),
-                    if *lon >= 0 { 'E' } else { 'W' }, lon.abs()))
+                .map(|(lat, lon)| {
+                    format!(
+                        "{}{:02}{}{:03}",
+                        if *lat >= 0 { 'N' } else { 'S' },
+                        lat.abs(),
+                        if *lon >= 0 { 'E' } else { 'W' },
+                        lon.abs()
+                    )
+                })
                 .collect();
             list.sort();
             eprintln!("  (missing tiles: {})", list.join(", "));
@@ -302,8 +307,8 @@ fn classify_surface(tags: &osmpbfreader::Tags, highway: &str) -> u8 {
             | "paving_stones" | "chipseal" | "metal" => SURFACE_PAVED,
             "sett" | "cobblestone" | "unhewn_cobblestone" => SURFACE_PAVED,
             "gravel" | "fine_gravel" | "compacted" | "pebblestone" => SURFACE_GRAVEL,
-            "unpaved" | "dirt" | "ground" | "earth" | "mud" | "grass" | "sand"
-            | "woodchips" | "bark_chips" => SURFACE_UNPAVED,
+            "unpaved" | "dirt" | "ground" | "earth" | "mud" | "grass" | "sand" | "woodchips"
+            | "bark_chips" => SURFACE_UNPAVED,
             _ => SURFACE_OTHER,
         };
     }
@@ -318,8 +323,8 @@ fn classify_surface(tags: &osmpbfreader::Tags, highway: &str) -> u8 {
             Some("grade3" | "grade4" | "grade5") => SURFACE_UNPAVED,
             _ => SURFACE_GRAVEL, // tracks default to gravel — usually right
         },
-        "cycleway" | "service" | "residential" | "unclassified" | "tertiary"
-        | "secondary" | "primary" | "living_street" | "pedestrian" => SURFACE_PAVED,
+        "cycleway" | "service" | "residential" | "unclassified" | "tertiary" | "secondary"
+        | "primary" | "living_street" | "pedestrian" => SURFACE_PAVED,
         _ => SURFACE_OTHER,
     }
 }
@@ -375,10 +380,7 @@ fn classify(tags: &osmpbfreader::Tags, want: u8) -> (u8, u8, u8) {
             | "living_street"
             | "service"
     );
-    let mtb_default = matches!(
-        hw,
-        "path" | "track" | "footway" | "cycleway" | "bridleway"
-    );
+    let mtb_default = matches!(hw, "path" | "track" | "footway" | "cycleway" | "bridleway");
 
     let allow = |default: bool, override_tag: Option<&str>| -> bool {
         match override_tag {
@@ -426,12 +428,7 @@ fn classify(tags: &osmpbfreader::Tags, want: u8) -> (u8, u8, u8) {
 /// `keep_edge(p0, p1)` is the final edge predicate; return `true` to keep,
 /// `false` to drop. Use this to restrict to a corridor in plan mode, or
 /// `|_, _| true` in explore mode.
-pub fn build<F>(
-    path: &Path,
-    bbox: BBox,
-    want_modes: u8,
-    keep_edge: F,
-) -> Result<Graph>
+pub fn build<F>(path: &Path, bbox: BBox, want_modes: u8, keep_edge: F) -> Result<Graph>
 where
     F: Fn(LatLon, LatLon) -> bool,
 {
@@ -446,19 +443,57 @@ where
         lat_min, lat_max, lon_min, lon_max
     );
 
-    // Pass 1: find ways with passing tags, collect their node IDs, mode mask, surface.
-    // Also collect `natural=glacier` closed ways so we can skip edges that cross
-    // them — glaciers aren't passable terrain even if a path is tagged through them.
+    // Pre-pass: collect member ways from `natural=glacier` multipolygon
+    // relations. Alpine glaciers are often mapped this way, not as one closed
+    // way. Missing these polygons lets the router cross ice fields via tagged
+    // hiking/alpine paths.
+    let mut glacier_relation_way_ids: FxHashSet<i64> = FxHashSet::default();
+    let mut glacier_relations: Vec<Vec<i64>> = Vec::new();
+    {
+        let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut pbf = OsmPbfReader::new(f);
+        for obj in pbf.iter() {
+            let obj = obj?;
+            if let OsmObj::Relation(r) = obj {
+                let is_glacier = r.tags.get("natural").map(|s| s.as_str()) == Some("glacier")
+                    && matches!(
+                        r.tags.get("type").map(|s| s.as_str()),
+                        Some("multipolygon") | Some("boundary") | None
+                    );
+                if !is_glacier {
+                    continue;
+                }
+                let mut way_ids = Vec::new();
+                for rf in &r.refs {
+                    if !rf.role.is_empty() && rf.role.as_str() != "outer" {
+                        continue;
+                    }
+                    if let OsmId::Way(wid) = rf.member {
+                        glacier_relation_way_ids.insert(wid.0);
+                        way_ids.push(wid.0);
+                    }
+                }
+                if !way_ids.is_empty() {
+                    glacier_relations.push(way_ids);
+                }
+            }
+        }
+    }
+
+    // Pass 1: find ways with passing tags, collect their node IDs, mode mask,
+    // surface. Also collect glacier boundary ways so we can skip edges that
+    // cross them — glaciers aren't passable terrain even if a path is tagged
+    // through them.
     let mut keep_ways: Vec<(i64, Vec<i64>, u8, u8, u8)> = Vec::new();
     let mut glacier_ways: Vec<Vec<i64>> = Vec::new();
+    let mut glacier_relation_way_nodes: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
     let mut needed_nodes: FxHashSet<i64> = FxHashSet::default();
     {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut pbf = OsmPbfReader::new(f);
         let pb = ProgressBar::new_spinner();
         pb.set_style(
-            ProgressStyle::with_template("{spinner} pass1: {msg} ({pos} ways scanned)")
-                .unwrap(),
+            ProgressStyle::with_template("{spinner} pass1: {msg} ({pos} ways scanned)").unwrap(),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
         let mut scanned = 0u64;
@@ -479,6 +514,15 @@ where
                         glacier_ways.push(nodes);
                     }
                     continue;
+                }
+                if glacier_relation_way_ids.contains(&w.id.0) {
+                    let nodes: Vec<i64> = w.nodes.iter().map(|n| n.0).collect();
+                    if nodes.len() >= 2 {
+                        for n in &nodes {
+                            needed_nodes.insert(*n);
+                        }
+                        glacier_relation_way_nodes.insert(w.id.0, nodes);
+                    }
                 }
                 let (m, s, ba) = classify(&w.tags, want_modes);
                 if m == 0 {
@@ -508,8 +552,7 @@ where
         let mut pbf = OsmPbfReader::new(f);
         let pb = ProgressBar::new(needed_nodes.len() as u64);
         pb.set_style(
-            ProgressStyle::with_template("pass2: {bar:40} {pos}/{len} nodes resolved")
-                .unwrap(),
+            ProgressStyle::with_template("pass2: {bar:40} {pos}/{len} nodes resolved").unwrap(),
         );
         for obj in pbf.iter() {
             let obj = obj?;
@@ -533,7 +576,12 @@ where
     // pass 1. Edges whose midpoint falls inside any of these polygons are
     // dropped from the graph, so the router can't suggest a path that goes
     // over a glacier (even if OSM has a track tagged across it).
-    let glacier_index = build_glacier_index(&glacier_ways, &node_pos);
+    let glacier_rings = collect_glacier_rings(
+        &glacier_ways,
+        &glacier_relations,
+        &glacier_relation_way_nodes,
+    );
+    let glacier_index = build_glacier_index(&glacier_rings, &node_pos);
     if !glacier_index.polys.is_empty() {
         eprintln!(
             "Glacier exclusion: {} polygons indexed",
@@ -689,10 +737,18 @@ fn build_glacier_index(
         let mut lat_min = f64::INFINITY;
         let mut lat_max = f64::NEG_INFINITY;
         for c in &coords {
-            if c.x < lon_min { lon_min = c.x; }
-            if c.x > lon_max { lon_max = c.x; }
-            if c.y < lat_min { lat_min = c.y; }
-            if c.y > lat_max { lat_max = c.y; }
+            if c.x < lon_min {
+                lon_min = c.x;
+            }
+            if c.x > lon_max {
+                lon_max = c.x;
+            }
+            if c.y < lat_min {
+                lat_min = c.y;
+            }
+            if c.y > lat_max {
+                lat_max = c.y;
+            }
         }
         let idx = polys.len();
         polys.push(Polygon::new(LineString::from(coords), vec![]));
@@ -704,6 +760,75 @@ fn build_glacier_index(
     }
     let rtree = RTree::bulk_load(boxes);
     GlacierIndex { polys, rtree }
+}
+
+fn collect_glacier_rings(
+    glacier_ways: &[Vec<i64>],
+    glacier_relations: &[Vec<i64>],
+    relation_way_nodes: &FxHashMap<i64, Vec<i64>>,
+) -> Vec<Vec<i64>> {
+    let mut rings = Vec::new();
+    rings.extend(glacier_ways.iter().cloned());
+    for rel in glacier_relations {
+        let segments: Vec<Vec<i64>> = rel
+            .iter()
+            .filter_map(|way_id| relation_way_nodes.get(way_id).cloned())
+            .filter(|nodes| nodes.len() >= 2)
+            .collect();
+        rings.extend(stitch_rings(segments));
+    }
+    rings
+}
+
+fn stitch_rings(mut segments: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+    let mut rings = Vec::new();
+    while let Some(mut ring) = segments.pop() {
+        let mut changed = true;
+        while changed && ring.first() != ring.last() {
+            changed = false;
+            let Some(&first) = ring.first() else { break };
+            let Some(&last) = ring.last() else { break };
+            let mut hit: Option<(usize, bool, bool)> = None;
+            for (i, seg) in segments.iter().enumerate() {
+                let s_first = *seg.first().unwrap();
+                let s_last = *seg.last().unwrap();
+                if last == s_first {
+                    hit = Some((i, true, false));
+                    break;
+                }
+                if last == s_last {
+                    hit = Some((i, true, true));
+                    break;
+                }
+                if first == s_last {
+                    hit = Some((i, false, false));
+                    break;
+                }
+                if first == s_first {
+                    hit = Some((i, false, true));
+                    break;
+                }
+            }
+            if let Some((idx, append, reverse)) = hit {
+                let mut seg = segments.swap_remove(idx);
+                if reverse {
+                    seg.reverse();
+                }
+                if append {
+                    ring.extend_from_slice(&seg[1..]);
+                } else {
+                    seg.pop();
+                    seg.extend(ring);
+                    ring = seg;
+                }
+                changed = true;
+            }
+        }
+        if ring.len() >= 4 && ring.first() == ring.last() {
+            rings.push(ring);
+        }
+    }
+    rings
 }
 
 #[cfg(test)]
@@ -751,11 +876,22 @@ mod tests {
         g.elevations_m = Some(vec![100.0, 200.0, 100.0]);
         g.smooth_elevations(1);
         let elev = g.elevations_m.as_ref().unwrap();
-        assert!((elev[1] - 133.333).abs() < 0.5,
-            "B should be averaged toward neighbours, got {}", elev[1]);
+        assert!(
+            (elev[1] - 133.333).abs() < 0.5,
+            "B should be averaged toward neighbours, got {}",
+            elev[1]
+        );
         // Endpoints have a single neighbour, so they average to (own + nbr) / 2.
-        assert!((elev[0] - 150.0).abs() < 0.5, "A averaged with B → 150, got {}", elev[0]);
-        assert!((elev[2] - 150.0).abs() < 0.5, "C averaged with B → 150, got {}", elev[2]);
+        assert!(
+            (elev[0] - 150.0).abs() < 0.5,
+            "A averaged with B → 150, got {}",
+            elev[0]
+        );
+        assert!(
+            (elev[2] - 150.0).abs() < 0.5,
+            "C averaged with B → 150, got {}",
+            elev[2]
+        );
     }
 
     #[test]
@@ -766,7 +902,11 @@ mod tests {
         g.elevations_m = Some(vec![500.0, 500.0, 500.0, 500.0, 500.0]);
         g.smooth_elevations(3);
         for z in g.elevations_m.as_ref().unwrap() {
-            assert!((z - 500.0).abs() < 1e-3, "flat terrain should stay flat, got {}", z);
+            assert!(
+                (z - 500.0).abs() < 1e-3,
+                "flat terrain should stay flat, got {}",
+                z
+            );
         }
     }
 
@@ -778,7 +918,10 @@ mod tests {
         g.elevations_m = Some(vec![f32::NAN; 3]);
         g.smooth_elevations(2);
         for z in g.elevations_m.as_ref().unwrap() {
-            assert!(z.is_nan(), "without any finite neighbour we should preserve NaN");
+            assert!(
+                z.is_nan(),
+                "without any finite neighbour we should preserve NaN"
+            );
         }
     }
 
@@ -808,8 +951,14 @@ mod tests {
         tags.insert("bicycle".into(), "designated".into());
         tags.insert("lcn".into(), "yes".into());
         let (_modes, _surface, attrs) = classify(&tags, MODE_BIKE);
-        assert!(attrs & BATTR_DESIGNATED != 0, "bicycle=designated must set flag");
-        assert!(attrs & BATTR_CYCLE_NETWORK != 0, "lcn=yes must set network flag");
+        assert!(
+            attrs & BATTR_DESIGNATED != 0,
+            "bicycle=designated must set flag"
+        );
+        assert!(
+            attrs & BATTR_CYCLE_NETWORK != 0,
+            "lcn=yes must set network flag"
+        );
     }
 
     #[test]
@@ -818,5 +967,27 @@ mod tests {
         tags.insert("highway".into(), "motorway".into());
         let (modes, _, _) = classify(&tags, MODE_FOOT | MODE_BIKE | MODE_MTB);
         assert_eq!(modes, 0, "motorway must be unroutable for foot/bike/mtb");
+    }
+
+    #[test]
+    fn stitch_rings_closes_multipolygon_outer_ways() {
+        let rings = stitch_rings(vec![vec![1, 2], vec![4, 1], vec![2, 3, 4]]);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].first(), rings[0].last());
+        assert_eq!(rings[0].len(), 5);
+    }
+
+    #[test]
+    fn collect_glacier_rings_includes_relation_rings() {
+        let mut ways = FxHashMap::default();
+        ways.insert(10, vec![1, 2]);
+        ways.insert(11, vec![2, 3]);
+        ways.insert(12, vec![3, 1]);
+        let rings = collect_glacier_rings(&[], &[vec![10, 11, 12]], &ways);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].first(), rings[0].last());
+        for id in [1, 2, 3] {
+            assert!(rings[0].contains(&id), "ring should include node {id}");
+        }
     }
 }
