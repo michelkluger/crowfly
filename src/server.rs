@@ -769,10 +769,22 @@ async fn handle_shape_search(
     }
     let base_half = req.width_m / 2.0;
     let count = req.count.clamp(1, 50);
-    // Shapes have lots of legs, so per-candidate failure rate is high — over-
-    // sample more aggressively than country mode (~8×) to give dedup something
-    // to chew on.
-    let base_sample = (count * 8).max(24);
+    let shape_leg_count =
+        crate::shape::place_shape(LatLon::new(0.0, 0.0), kind, req.perimeter_km, 0.0)
+            .len()
+            .saturating_sub(1)
+            .max(1);
+    // Shape cost is roughly `candidates × legs × A*`. Hearts/figure-8s have
+    // many more legs than polygons, so use fewer candidates there; otherwise a
+    // 400 km heart can mean thousands of A* calls before the first response.
+    let sample_factor = if shape_leg_count >= 24 {
+        3
+    } else if shape_leg_count >= 12 {
+        4
+    } else {
+        8
+    };
+    let base_sample = (count * sample_factor).max(count + 8).max(16);
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -780,8 +792,8 @@ async fn handle_shape_search(
             .unwrap_or(0)
     });
     let min_viable = req.min_viable.unwrap_or(count).max(1);
-    const SAMPLE_FACTORS: [f64; 8] = [1.0, 1.0, 1.5, 1.5, 2.0, 2.0, 2.5, 2.5];
-    const WIDEN_DELTA_KM: [f64; 8] = [0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0];
+    const SAMPLE_FACTORS: [f64; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
+    const WIDEN_DELTA_KM: [f64; 5] = [0.0, 0.5, 1.0, 1.5, 2.0];
     const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
     let strict = req.strict_corridor;
 
@@ -806,6 +818,7 @@ async fn handle_shape_search(
         let mut all: Vec<ScoredShape> = Vec::new();
         let mut stats = RejectionStats::default();
         for batch in 0..MAX_BATCHES {
+            let batch_started = std::time::Instant::now();
             let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
             let sample_mul = SAMPLE_FACTORS[batch];
             let half = base_half + delta_km * 500.0;
@@ -823,6 +836,10 @@ async fn handle_shape_search(
                 snap_tolerance_m: half.max(2_000.0),
                 enforce_corridor: true,
             };
+            // Abort bad shape candidates early. A single leg >120% longer
+            // than intended creates the visible tails/kinks we don't want, and
+            // continuing to route the remaining 20-30 legs is wasted work.
+            let max_leg_detour_cap = Some(1.2 + delta_km * 0.15);
             let batch_seed = seed.wrapping_add((batch as u64).wrapping_mul(0x9E3779B97F4A7C15));
             let candidates = explore::generate_shape_candidates_in_bbox(
                 bbox,
@@ -840,13 +857,14 @@ async fn handle_shape_search(
                     pt.total += candidates.len();
                 }
             }
-            let results = explore::evaluate_shapes(
+            let results = explore::evaluate_shapes_with_limits(
                 &inner_for_task.graph,
                 candidates,
                 &inner_for_task.no_go,
                 &params,
                 &filter,
                 Some(&counter_inner),
+                max_leg_detour_cap,
             );
             for r in results {
                 match r {
@@ -854,6 +872,13 @@ async fn handle_shape_search(
                     Err((_, msg)) => stats.classify(&msg),
                 }
             }
+            eprintln!(
+                "shape batch {}: {} candidates, {} viable total, {:.1}s",
+                batch + 1,
+                n_sample,
+                all.len(),
+                batch_started.elapsed().as_secs_f64()
+            );
             if all.len() >= min_viable {
                 break;
             }
@@ -873,7 +898,7 @@ async fn handle_shape_search(
     }
     // Dedup by center proximity, scaled to the shape's diameter so two big
     // shapes don't merge unless they really overlap.
-    let dedup_sep_km = (req.perimeter_km / 6.28).max(8.0);
+    let dedup_sep_km = (req.perimeter_km / std::f64::consts::TAU).max(8.0);
     // Over-keep ahead of elevation enrichment so the ascent re-score can
     // promote a flatter loop over a marginally tighter but climbier one.
     let pool_size = if req.elevation_samples > 0 {

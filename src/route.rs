@@ -14,8 +14,26 @@
 //! of petgraph::algo::astar. petgraph's astar uses std::HashMap (SipHash) and
 //! a separate visit map; on a 16M-node graph the hashing dominates the
 //! routing inner loop.
+//!
+//! Inner-loop economics (in rough order of importance):
+//! - The heuristic is scaled to the *tightest admissible* bound, computed
+//!   from the actual multiplier tables. A slack heuristic inflates the
+//!   explored ellipse quadratically, so this is the dominant lever on search
+//!   size for bike/mtb routing.
+//! - Per-node state (g, cached h, parent) lives in one FxHashMap so each
+//!   relaxation costs a single hash probe, and heap entries carry their g so
+//!   stale entries are detected without recomputing the heuristic on pop.
+//! - Signed cross-track deviation is cached per node; an edge's midpoint
+//!   deviation is the mean of its endpoint deviations (the deviation field
+//!   is smooth — centimetre-level error at OSM edge lengths), which converts
+//!   ~2.6 spherical cross-track evaluations per relaxed edge into ~1 per
+//!   visited node.
+//! - Turn-penalty bearings use the tangent-plane approximation and the
+//!   incoming bearing is memoized per expansion, so the typical relaxed edge
+//!   pays one cos + one atan2 of bearing math instead of two full
+//!   great-circle bearings.
 
-use crate::geodesy::{bearing_rad, CrossTrack, HaversineToTarget, LatLon};
+use crate::geodesy::{fast_bearing_rad, CrossTrack, HaversineToTarget, LatLon};
 use crate::osm::{
     EdgeData, Graph, BATTR_CYCLE_NETWORK, BATTR_DESIGNATED, BCLASS_CYCLEWAY, BCLASS_FERRY,
     BCLASS_MASK, BCLASS_OTHER, BCLASS_PATH, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, BCLASS_SECONDARY,
@@ -55,6 +73,10 @@ pub struct RouteResult {
     pub node_indices: Vec<NodeIndex>,
 }
 
+/// Test-only helper: the routing cost path now derives an edge's corridor
+/// deviation from its cached endpoint deviations instead of materialising
+/// the midpoint.
+#[cfg(test)]
 fn midpoint(p0: LatLon, p1: LatLon) -> LatLon {
     LatLon::new((p0.lat + p1.lat) * 0.5, (p0.lon + p1.lon) * 0.5)
 }
@@ -62,12 +84,16 @@ fn midpoint(p0: LatLon, p1: LatLon) -> LatLon {
 #[derive(Copy, Clone, Debug)]
 struct Frontier {
     f: f64,
+    /// g-score at push time. Lets the pop loop detect stale (lazily-deleted)
+    /// entries by comparing against the node's current g — no heuristic
+    /// recomputation — and serves as the tie-breaker.
+    g: f64,
     node: NodeIndex,
 }
 
 impl PartialEq for Frontier {
     fn eq(&self, other: &Self) -> bool {
-        self.f == other.f && self.node == other.node
+        self.f == other.f && self.g == other.g && self.node == other.node
     }
 }
 
@@ -75,11 +101,19 @@ impl Eq for Frontier {}
 
 impl Ord for Frontier {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap on f-score: invert the usual comparison.
+        // Min-heap on f-score: invert the usual comparison. Among equal f,
+        // prefer the entry with the *larger* g (deeper along its path, i.e.
+        // closer to the goal) — the standard A* tie-break that avoids
+        // ping-ponging across equal-f frontiers in grid-like road networks.
         other
             .f
             .partial_cmp(&self.f)
             .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                self.g
+                    .partial_cmp(&other.g)
+                    .unwrap_or(Ordering::Equal)
+            })
             .then_with(|| self.node.index().cmp(&other.node.index()))
     }
 }
@@ -88,6 +122,18 @@ impl PartialOrd for Frontier {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Per-node search state: best-known g, cached heuristic, and the
+/// predecessor on the best-known path. One map instead of separate
+/// g_score/came_from halves the hash probes in the relaxation loop, and the
+/// cached h means re-improving an already-seen node never recomputes the
+/// heuristic.
+struct NodeState {
+    g: f64,
+    h: f64,
+    /// Predecessor on the best-known path; `parent == self` marks the start.
+    parent: NodeIndex,
 }
 
 /// Custom A* over an undirected graph with f64 edge costs and a lower-bound
@@ -120,49 +166,53 @@ where
     F: FnMut(petgraph::graph::EdgeReference<'_, EdgeData>, Option<NodeIndex>) -> f64,
     H: FnMut(NodeIndex) -> f64,
 {
-    let mut g_score: FxHashMap<NodeIndex, f64> = FxHashMap::default();
-    let mut came_from: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
-    let mut open: BinaryHeap<Frontier> = BinaryHeap::new();
+    // Pre-size for a mid-size corridor search; covers the first ~10 growth
+    // rehashes for the price of one 100 KB allocation.
+    let mut state: FxHashMap<NodeIndex, NodeState> =
+        FxHashMap::with_capacity_and_hasher(1 << 12, Default::default());
+    let mut open: BinaryHeap<Frontier> = BinaryHeap::with_capacity(1 << 10);
 
-    g_score.insert(start, 0.0);
+    let h_start = heuristic(start);
+    state.insert(
+        start,
+        NodeState {
+            g: 0.0,
+            h: h_start,
+            parent: start,
+        },
+    );
     open.push(Frontier {
-        f: heuristic(start),
+        f: h_start,
+        g: 0.0,
         node: start,
     });
 
-    while let Some(Frontier { f, node }) = open.pop() {
+    while let Some(Frontier { f: _, g, node }) = open.pop() {
+        let (cur_g, parent) = match state.get(&node) {
+            Some(st) => (st.g, st.parent),
+            None => continue,
+        };
+        // Lazy deletion: if the node's g improved after this entry was
+        // pushed, a fresher entry (with lower f) has already been processed
+        // or sits earlier in the heap.
+        if g > cur_g {
+            continue;
+        }
         if node == end {
-            let total = g_score[&node];
             let mut path = vec![node];
             let mut cur = node;
-            while let Some(&prev) = came_from.get(&cur) {
+            while cur != start {
+                let prev = state[&cur].parent;
                 path.push(prev);
                 cur = prev;
             }
             path.reverse();
-            return Some((total, path));
-        }
-        let cur_g = match g_score.get(&node) {
-            Some(&g) => g,
-            None => continue,
-        };
-        // Lazy deletion: if a better f for this node has already been popped,
-        // the heap entry is stale.
-        if f > cur_g + heuristic(node) + 1e-9 {
-            continue;
+            return Some((cur_g, path));
         }
         // For the start node, fall back to the caller-supplied `start_prev`
-        // (if any). For every other node use the actual came_from chain.
-        let prev = if node == start {
-            start_prev
-        } else {
-            came_from.get(&node).copied()
-        };
+        // (if any). For every other node use the recorded predecessor.
+        let prev = if node == start { start_prev } else { Some(parent) };
         for er in graph.edges(node) {
-            let cost = edge_cost(er, prev);
-            if !cost.is_finite() {
-                continue;
-            }
             let next = er.target();
             // Disallow immediate U-turn back to predecessor on multi-edge
             // graphs — keeps the path topologically simple. Also extends
@@ -170,15 +220,37 @@ where
             if Some(next) == prev {
                 continue;
             }
+            let cost = edge_cost(er, prev);
+            if !cost.is_finite() {
+                continue;
+            }
             let tentative = cur_g + cost;
-            let prev_g = g_score.get(&next).copied().unwrap_or(f64::INFINITY);
-            if tentative < prev_g {
-                g_score.insert(next, tentative);
-                came_from.insert(next, node);
-                open.push(Frontier {
-                    f: tentative + heuristic(next),
-                    node: next,
-                });
+            match state.entry(next) {
+                std::collections::hash_map::Entry::Occupied(mut oe) => {
+                    let st = oe.get_mut();
+                    if tentative < st.g {
+                        st.g = tentative;
+                        st.parent = node;
+                        open.push(Frontier {
+                            f: tentative + st.h,
+                            g: tentative,
+                            node: next,
+                        });
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(ve) => {
+                    let h = heuristic(next);
+                    ve.insert(NodeState {
+                        g: tentative,
+                        h,
+                        parent: node,
+                    });
+                    open.push(Frontier {
+                        f: tentative + h,
+                        g: tentative,
+                        node: next,
+                    });
+                }
             }
         }
     }
@@ -503,6 +575,12 @@ pub fn shortest_with_start_prev(
         // pays the full rate.
         1.0 + (base - 1.0) * rough_scale
     };
+    // Designated and signed-network bonuses kept small so they nudge ranking
+    // without making the router go out of its way to attach to a marked
+    // spur. These are the only factors that can price an edge *below* its
+    // physical length, so they also bound the admissible heuristic below.
+    const DESIGNATED_BONUS: f64 = 0.98;
+    const NETWORK_BONUS: f64 = 0.99;
     // Turn penalty (metres added per radian of bearing change at a junction)
     // applied when bike/mtb is active. Linear in |Δbearing|: a 90° turn costs
     // +TURN_PEN·π/2 m, a 180° pivot costs +TURN_PEN·π m. With TURN_PEN=18:
@@ -516,11 +594,16 @@ pub fn shortest_with_start_prev(
     // class bonus.
     const TURN_PEN: f64 = 100.0;
     let turn_active = bike_active || mtb_active;
-    let cost = |p0: LatLon,
+    // Cost of an edge given its precomputed |corridor deviation| and the
+    // incoming bearing at p0 (None = no predecessor / zero-length entry
+    // segment). Mode/surface rejection checks live here so both the search
+    // closure and the parallel-edge reconstruction pass share them.
+    let cost = |e: &EdgeData,
+                dev: f64,
+                b_in: Option<f64>,
+                p0: LatLon,
                 p1: LatLon,
-                e: &EdgeData,
-                elev_pair: Option<(f32, f32)>,
-                prev_p: Option<LatLon>|
+                elev_pair: Option<(f32, f32)>|
      -> f64 {
         if (e.modes & modes) == 0 {
             return f64::INFINITY;
@@ -528,8 +611,6 @@ pub fn shortest_with_start_prev(
         if paved_only && e.surface != SURFACE_PAVED {
             return f64::INFINITY;
         }
-        let mid = midpoint(p0, p1);
-        let dev = xt.abs(mid);
         if dev > corridor_max {
             return f64::INFINITY;
         }
@@ -538,14 +619,11 @@ pub fn shortest_with_start_prev(
         if bike_active || mtb_active {
             let class = e.bike_attrs & BCLASS_MASK;
             let mut bm = bike_class_mult(class);
-            // Designated and signed-network bonuses kept small so they nudge
-            // ranking without making the router go out of its way to attach
-            // to a marked spur.
             if (e.bike_attrs & BATTR_DESIGNATED) != 0 {
-                bm *= 0.98;
+                bm *= DESIGNATED_BONUS;
             }
             if (e.bike_attrs & BATTR_CYCLE_NETWORK) != 0 {
-                bm *= 0.99;
+                bm *= NETWORK_BONUS;
             }
             weight *= bm;
             weight *= surface_mult(e.surface);
@@ -560,17 +638,14 @@ pub fn shortest_with_start_prev(
             }
         }
         let mut c = e.length_m * weight;
-        if turn_active {
-            if let Some(pp) = prev_p {
-                if pp != p0 && p0 != p1 {
-                    let b_in = bearing_rad(pp, p0);
-                    let b_out = bearing_rad(p0, p1);
-                    let mut d = (b_out - b_in).abs();
-                    if d > std::f64::consts::PI {
-                        d = 2.0 * std::f64::consts::PI - d;
-                    }
-                    c += TURN_PEN * d;
+        if let Some(b_in) = b_in {
+            if p0 != p1 {
+                let b_out = fast_bearing_rad(p0, p1);
+                let mut d = (b_out - b_in).abs();
+                if d > std::f64::consts::PI {
+                    d = 2.0 * std::f64::consts::PI - d;
                 }
+                c += TURN_PEN * d;
             }
         }
         if let Some((zs, zt)) = elev_pair {
@@ -614,24 +689,99 @@ pub fn shortest_with_start_prev(
             Some((zs, zt))
         };
 
-    // Bike multipliers can drive an edge's cost below its physical length
-    // (cycleway × designated × network ≈ 0.52). Plain haversine would then
-    // *over*-estimate remaining cost and break A*'s optimality, so when bike
-    // or mtb is active we scale the heuristic by the cheapest reachable
-    // multiplier. Foot-only routing sees no rescaling.
-    let h_scale: f64 = if bike_active || mtb_active { 0.5 } else { 1.0 };
+    // Tightest admissible heuristic scale: the lowest possible cost of
+    // covering one metre of great-circle distance. The multiplicative
+    // bonuses can price an edge slightly below its physical length
+    // (designated cycleway on a signed network ≈ 0.97×); every other term
+    // (α-deviation, turn, descent, ascent) only adds cost. Computed from the
+    // actual multiplier tables so future tuning can't silently break
+    // admissibility — an overestimating heuristic would cost optimality,
+    // while needless slack inflates the search quadratically (the old
+    // hardcoded 0.5 roughly doubled the explored radius for bike routing).
+    let h_scale: f64 = if bike_active || mtb_active {
+        let min_class = (0..=BCLASS_MASK)
+            .map(&bike_class_mult)
+            .fold(f64::INFINITY, f64::min);
+        let min_surface = (0..=SURFACE_FERRY)
+            .map(&surface_mult)
+            .fold(f64::INFINITY, f64::min);
+        (min_class * min_surface * DESIGNATED_BONUS * NETWORK_BONUS).min(1.0)
+    } else {
+        1.0
+    };
+    // Signed per-node corridor deviation, computed lazily. Keyed by node
+    // because A* touches each node through several incident edges; see the
+    // module docs for the midpoint-vs-endpoint-mean equivalence argument.
+    let mut dev_cache: FxHashMap<NodeIndex, f64> = FxHashMap::default();
+    let mut dev_of = move |n: NodeIndex, p: LatLon| -> f64 {
+        *dev_cache.entry(n).or_insert_with(|| xt.signed(p))
+    };
+    // One-slot memo for the incoming bearing: astar_fx relaxes all edges of
+    // a node consecutively, so (prev, node) is constant across that burst.
+    let mut b_in_memo: Option<(NodeIndex, NodeIndex, f64)> = None;
+    // One-slot memo for the expanded node's position, deviation, and
+    // elevation: petgraph orients every EdgeReference from `edges(n)` with
+    // `source() == n`, so within one expansion burst this hits on every edge
+    // after the first, skipping the node-weight lookup, the dev-cache hash
+    // probe, and one random access into the elevation array. Elevation is
+    // NaN when no DEM is loaded — same "no data" path the cost fn already
+    // takes for nodes outside tile coverage.
+    let mut src_memo: Option<(NodeIndex, LatLon, f64, f32)> = None;
     let result = astar_fx(
         g,
         start,
         end,
         start_prev,
         |er, prev_node| {
+            let e = er.weight();
+            // Cheapest rejections first: bitmask checks need no geometry.
+            if (e.modes & modes) == 0 {
+                return f64::INFINITY;
+            }
+            if paved_only && e.surface != SURFACE_PAVED {
+                return f64::INFINITY;
+            }
             let s = er.source();
             let t = er.target();
-            let p0 = g[s];
+            let (p0, dev_s, z_s) = match src_memo {
+                Some((ms, p, d, z)) if ms == s => (p, d, z),
+                _ => {
+                    let p = g[s];
+                    let d = dev_of(s, p);
+                    let z = elevations
+                        .and_then(|el| el.get(s.index()).copied())
+                        .unwrap_or(f32::NAN);
+                    src_memo = Some((s, p, d, z));
+                    (p, d, z)
+                }
+            };
             let p1 = g[t];
-            let prev_p = prev_node.map(|pn| g[pn]);
-            cost(p0, p1, er.weight(), elev_for(s, t), prev_p)
+            let dev = (dev_s + dev_of(t, p1)) * 0.5;
+            let dev = dev.abs();
+            if dev > corridor_max {
+                return f64::INFINITY;
+            }
+            let b_in = if turn_active {
+                prev_node.and_then(|pn| match b_in_memo {
+                    Some((mp, mn, b)) if mp == pn && mn == s => Some(b),
+                    _ => {
+                        let pp = g[pn];
+                        if pp == p0 {
+                            return None;
+                        }
+                        let b = fast_bearing_rad(pp, p0);
+                        b_in_memo = Some((pn, s, b));
+                        Some(b)
+                    }
+                })
+            } else {
+                None
+            };
+            let elev_pair = elevations.map(|el| {
+                let z_t = el.get(t.index()).copied().unwrap_or(f32::NAN);
+                (z_s, z_t)
+            });
+            cost(e, dev, b_in, p0, p1, elev_pair)
         },
         |n| heur.distance(g[n]) * h_scale,
     );
@@ -655,13 +805,25 @@ pub fn shortest_with_start_prev(
         } else {
             Some(g[path[i - 1]])
         };
+        let dev = ((dev_of(w[0], p0) + dev_of(w[1], p1)) * 0.5).abs();
+        let b_in = if turn_active {
+            prev_p.and_then(|pp| {
+                if pp != p0 {
+                    Some(fast_bearing_rad(pp, p0))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
         let mut best: Option<(EdgeData, f64)> = None;
         for er in g.edges_connecting(w[0], w[1]) {
             let e = er.weight();
             if (e.modes & modes) == 0 {
                 continue;
             }
-            let c = cost(p0, p1, e, elev_pair, prev_p);
+            let c = cost(e, dev, b_in, p0, p1, elev_pair);
             if best.map_or(true, |(_, bc)| c < bc) {
                 best = Some((*e, c));
             }

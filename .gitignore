@@ -10,6 +10,7 @@
 # Outputs from CLI runs
 /out
 /out_*
+*.log
 
 # OS / editor cruft
 Thumbs.db

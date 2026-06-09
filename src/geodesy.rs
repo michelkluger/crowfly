@@ -29,8 +29,7 @@ pub fn haversine(a: LatLon, b: LatLon) -> f64 {
     let phi2 = to_rad(b.lat);
     let dphi = to_rad(b.lat - a.lat);
     let dlam = to_rad(b.lon - a.lon);
-    let h = (dphi / 2.0).sin().powi(2)
-        + phi1.cos() * phi2.cos() * (dlam / 2.0).sin().powi(2);
+    let h = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlam / 2.0).sin().powi(2);
     2.0 * R_EARTH * h.sqrt().asin()
 }
 
@@ -42,6 +41,27 @@ pub fn bearing_rad(a: LatLon, b: LatLon) -> f64 {
     let y = dlam.sin() * phi2.cos();
     let x = phi1.cos() * phi2.sin() - phi1.sin() * phi2.cos() * dlam.cos();
     y.atan2(x)
+}
+
+/// Approximate initial bearing from `a` to `b` via a local tangent plane:
+/// `atan2(Δλ·cos(φ_mid), Δφ)`. Same convention and range as [`bearing_rad`]
+/// (0 = north, positive eastward, range (-π, π]).
+///
+/// For the sub-kilometre segments the router feeds this (turn-penalty
+/// geometry at junctions), it differs from the great-circle bearing by far
+/// less than a degree — and the consumer only uses the *difference* of two
+/// bearings at the same junction, so the residual largely cancels. Costs one
+/// cos + one atan2 instead of four sin/cos + one atan2.
+pub fn fast_bearing_rad(a: LatLon, b: LatLon) -> f64 {
+    let mut dlam = to_rad(b.lon - a.lon);
+    if dlam > std::f64::consts::PI {
+        dlam -= std::f64::consts::TAU;
+    } else if dlam < -std::f64::consts::PI {
+        dlam += std::f64::consts::TAU;
+    }
+    let dphi = to_rad(b.lat - a.lat);
+    let cos_mid = to_rad((a.lat + b.lat) * 0.5).cos();
+    (dlam * cos_mid).atan2(dphi)
 }
 
 /// Signed cross-track distance (metres) of point `p` from the great circle
@@ -106,6 +126,15 @@ impl CrossTrack {
 
     /// |cross-track distance| from `p` to the reference line, metres.
     pub fn abs(&self, p: LatLon) -> f64 {
+        self.signed(p).abs()
+    }
+
+    /// Signed cross-track distance from `p` to the reference line, metres.
+    /// Positive if `p` is to the right of the path travelling a -> b. The
+    /// router caches this per graph node: the cross-track field is smooth, so
+    /// an edge's midpoint deviation is recovered (to within centimetres at
+    /// OSM edge lengths) as the mean of its two signed endpoint deviations.
+    pub fn signed(&self, p: LatLon) -> f64 {
         let p_lat = to_rad(p.lat);
         let dphi = p_lat - self.a_lat_rad;
         let dlam = to_rad(p.lon) - self.a_lon_rad;
@@ -114,13 +143,14 @@ impl CrossTrack {
         let sin_dlam = dlam.sin();
         let cos_dlam = dlam.cos();
         // angular haversine(a, p)
-        let h = (dphi * 0.5).sin().powi(2) + self.cos_a_lat * cos_p_lat * (dlam * 0.5).sin().powi(2);
+        let h =
+            (dphi * 0.5).sin().powi(2) + self.cos_a_lat * cos_p_lat * (dlam * 0.5).sin().powi(2);
         let d_ap = 2.0 * h.sqrt().asin();
         // bearing(a, p)
         let y = sin_dlam * cos_p_lat;
         let x = self.cos_a_lat * sin_p_lat - self.sin_a_lat * cos_p_lat * cos_dlam;
         let theta_ap = y.atan2(x);
-        (d_ap.sin() * (theta_ap - self.bearing_ab).sin()).asin().abs() * R_EARTH
+        (d_ap.sin() * (theta_ap - self.bearing_ab).sin()).asin() * R_EARTH
     }
 }
 
@@ -159,9 +189,8 @@ pub fn destination(a: LatLon, bearing: f64, dist: f64) -> LatLon {
     let lam1 = to_rad(a.lon);
     let dr = dist / R_EARTH;
     let phi2 = (phi1.sin() * dr.cos() + phi1.cos() * dr.sin() * bearing.cos()).asin();
-    let lam2 = lam1
-        + (bearing.sin() * dr.sin() * phi1.cos())
-            .atan2(dr.cos() - phi1.sin() * phi2.sin());
+    let lam2 =
+        lam1 + (bearing.sin() * dr.sin() * phi1.cos()).atan2(dr.cos() - phi1.sin() * phi2.sin());
     LatLon::new(phi2.to_degrees(), lam2.to_degrees())
 }
 
@@ -263,6 +292,55 @@ mod tests {
             let expected = cross_track(p, a, b).abs();
             let got = xt.abs(p);
             assert!((expected - got).abs() < 1e-3, "{} vs {}", expected, got);
+        }
+    }
+
+    #[test]
+    fn cross_track_signed_matches_function_with_sign() {
+        let a = LatLon::new(46.17, 8.79);
+        let b = LatLon::new(47.68, 8.62);
+        let xt = CrossTrack::new(a, b);
+        for p in [
+            LatLon::new(47.0, 8.7),
+            LatLon::new(47.0, 6.0),
+            LatLon::new(46.5, 8.8),
+            LatLon::new(47.3, 9.5),
+        ] {
+            let expected = cross_track(p, a, b);
+            let got = xt.signed(p);
+            assert!((expected - got).abs() < 1e-3, "{} vs {}", expected, got);
+        }
+    }
+
+    #[test]
+    fn fast_bearing_close_to_exact_for_short_segments() {
+        // Junction-scale segments (50 m – 2 km) at mid and high latitudes:
+        // the approximation must stay within a small fraction of a degree of
+        // the great-circle initial bearing.
+        let anchors = [LatLon::new(46.9, 7.45), LatLon::new(59.3, 18.1)];
+        for a in anchors {
+            for step_deg in [0.0005, 0.002, 0.02] {
+                for k in 0..12 {
+                    let theta = (k as f64) * std::f64::consts::TAU / 12.0;
+                    let b = LatLon::new(
+                        a.lat + step_deg * theta.cos(),
+                        a.lon + step_deg * theta.sin() / a.lat.to_radians().cos(),
+                    );
+                    let exact = bearing_rad(a, b);
+                    let fast = fast_bearing_rad(a, b);
+                    let mut d = (exact - fast).abs();
+                    if d > std::f64::consts::PI {
+                        d = std::f64::consts::TAU - d;
+                    }
+                    assert!(
+                        d < 0.01,
+                        "bearing mismatch {:.4} rad at lat {} step {}",
+                        d,
+                        a.lat,
+                        step_deg
+                    );
+                }
+            }
         }
     }
 
