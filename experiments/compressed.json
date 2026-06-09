@@ -1,0 +1,81 @@
+{
+  "label": "compressed",
+  "host": "http://127.0.0.1:7878",
+  "results": [
+    {
+      "name": "zh_winti",
+      "ref_km": 19.334790472662416,
+      "real_km": 23.22059746285482,
+      "detour_pct": 20.09748694037605,
+      "max_dev_m": 1227.6091635915818,
+      "ascent_m": 404.0,
+      "ascent_per_km": 17.39834647434308,
+      "turn_density_dps_per_km": 433.3023366524799,
+      "sharp_turns_per_km": 2.2687703243361343,
+      "hairpins_per_km": 0.08726039708985132,
+      "detour_loops": 0,
+      "surface_transitions_per_km": 0.043065214045403664,
+      "elapsed_s": 1.5328070999999999
+    },
+    {
+      "name": "bn_fr",
+      "ref_km": 26.874381811451215,
+      "real_km": 33.459775499365115,
+      "detour_pct": 24.50435412474439,
+      "max_dev_m": 1194.765061102689,
+      "ascent_m": 509.0,
+      "ascent_per_km": 15.212295731322467,
+      "turn_density_dps_per_km": 388.5930737107426,
+      "sharp_turns_per_km": 0.9978808016356169,
+      "hairpins_per_km": 0.2116716851954339,
+      "detour_loops": 0,
+      "surface_transitions_per_km": 0.0896598962553387,
+      "elapsed_s": 1.5368286
+    },
+    {
+      "name": "ls_vv",
+      "ref_km": 17.24805761822133,
+      "real_km": 19.823397901274973,
+      "detour_pct": 14.931190166787122,
+      "max_dev_m": 390.0164665894845,
+      "ascent_m": 267.0,
+      "ascent_per_km": 13.468932083678121,
+      "turn_density_dps_per_km": 437.4495540956315,
+      "sharp_turns_per_km": 1.3790434927679418,
+      "hairpins_per_km": 0.10215136983466236,
+      "detour_loops": 0,
+      "surface_transitions_per_km": 0.0,
+      "elapsed_s": 1.4183952
+    },
+    {
+      "name": "zh_lu",
+      "ref_km": 40.34603193423461,
+      "real_km": 50.57676391334823,
+      "detour_pct": 25.357467608685937,
+      "max_dev_m": 879.8328059378138,
+      "ascent_m": 703.0,
+      "ascent_per_km": 13.89966351355398,
+      "turn_density_dps_per_km": 373.56057946616886,
+      "sharp_turns_per_km": 1.378843433891931,
+      "hairpins_per_km": 0.039966476344693656,
+      "detour_loops": 0,
+      "surface_transitions_per_km": 0.0395438506786742,
+      "elapsed_s": 1.5754911
+    },
+    {
+      "name": "bn_thn",
+      "ref_km": 26.015395782579176,
+      "real_km": 31.781513498614203,
+      "detour_pct": 22.164251369553334,
+      "max_dev_m": 928.2755377383342,
+      "ascent_m": 451.0,
+      "ascent_per_km": 14.190639474097587,
+      "turn_density_dps_per_km": 336.5574290981778,
+      "sharp_turns_per_km": 1.0156424958717047,
+      "hairpins_per_km": 0.06347765599198155,
+      "detour_loops": 0,
+      "surface_transitions_per_km": 0.0629296650736035,
+      "elapsed_s": 1.6482462
+    }
+  ]
+}

@@ -161,10 +161,7 @@ impl ElevationClient {
             .map(|p| format!("{:.5},{:.5}", p.lat, p.lon))
             .collect::<Vec<_>>()
             .join("|");
-        let url = format!(
-            "https://api.opentopodata.org/v1/srtm30m?locations={}",
-            locs
-        );
+        let url = format!("https://api.opentopodata.org/v1/srtm30m?locations={}", locs);
         let resp = ureq::get(&url)
             .timeout(Duration::from_secs(30))
             .call()
@@ -226,7 +223,11 @@ pub fn sample_along(points: &[LatLon], n: usize) -> Vec<LatLon> {
         }
         let d0 = cum[j];
         let d1 = cum[(j + 1).min(cum.len() - 1)];
-        let frac = if d1 > d0 { (target - d0) / (d1 - d0) } else { 0.0 };
+        let frac = if d1 > d0 {
+            (target - d0) / (d1 - d0)
+        } else {
+            0.0
+        };
         let p0 = points[j];
         let p1 = points[(j + 1).min(points.len() - 1)];
         out.push(LatLon::new(

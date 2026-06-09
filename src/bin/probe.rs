@@ -26,11 +26,36 @@ struct PanelEntry {
 }
 
 const PANEL: &[PanelEntry] = &[
-    PanelEntry { name: "zh_winti", start: [47.3769, 8.5417], end: [47.4995, 8.7240], width_m: 6_000.0 },
-    PanelEntry { name: "bn_fr",    start: [46.9481, 7.4474], end: [46.8060, 7.1614], width_m: 8_000.0 },
-    PanelEntry { name: "ls_vv",    start: [46.5197, 6.6323], end: [46.4628, 6.8419], width_m: 5_000.0 },
-    PanelEntry { name: "zh_lu",    start: [47.3769, 8.5417], end: [47.0502, 8.3093], width_m: 8_000.0 },
-    PanelEntry { name: "bn_thn",   start: [46.9481, 7.4474], end: [46.7494, 7.6280], width_m: 6_000.0 },
+    PanelEntry {
+        name: "zh_winti",
+        start: [47.3769, 8.5417],
+        end: [47.4995, 8.7240],
+        width_m: 6_000.0,
+    },
+    PanelEntry {
+        name: "bn_fr",
+        start: [46.9481, 7.4474],
+        end: [46.8060, 7.1614],
+        width_m: 8_000.0,
+    },
+    PanelEntry {
+        name: "ls_vv",
+        start: [46.5197, 6.6323],
+        end: [46.4628, 6.8419],
+        width_m: 5_000.0,
+    },
+    PanelEntry {
+        name: "zh_lu",
+        start: [47.3769, 8.5417],
+        end: [47.0502, 8.3093],
+        width_m: 8_000.0,
+    },
+    PanelEntry {
+        name: "bn_thn",
+        start: [46.9481, 7.4474],
+        end: [46.7494, 7.6280],
+        width_m: 6_000.0,
+    },
 ];
 
 const MODES: &str = "foot,bike";
@@ -273,7 +298,13 @@ fn metrics_from_result(name: &str, r: &Value, elapsed_s: f64) -> CaseMetrics {
     };
     let elev = r.get("elevation").cloned().unwrap_or(Value::Null);
     let ascent_m = elev.get("ascent_m").and_then(|v| v.as_f64());
-    let ascent_per_km = ascent_m.and_then(|a| if real_km > 0.0 { Some(a / real_km) } else { None });
+    let ascent_per_km = ascent_m.and_then(|a| {
+        if real_km > 0.0 {
+            Some(a / real_km)
+        } else {
+            None
+        }
+    });
     let (td, sh, hp) = turn_metrics(&coords);
     let loops = detour_loops(&coords);
     let tails = tail_count(&coords);
@@ -382,7 +413,10 @@ fn run_panel(host: &str, label: &str) -> Run {
                         Ok(r) => r,
                         Err(_) => break,
                     };
-                    if r.get("completed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if r.get("completed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         if let Some(arr) = r.get("results").and_then(|v| v.as_array()) {
                             if let Some(first) = arr.first() {
                                 let elapsed_total = t0.elapsed().as_secs_f64();
@@ -446,9 +480,8 @@ fn aggregate(run: &Run) -> Agg {
     if n == 0.0 {
         return Agg::default();
     }
-    let mean = |sel: fn(&CaseMetrics) -> f64| -> f64 {
-        run.results.iter().map(sel).sum::<f64>() / n
-    };
+    let mean =
+        |sel: fn(&CaseMetrics) -> f64| -> f64 { run.results.iter().map(sel).sum::<f64>() / n };
     Agg {
         panel: run.results.len(),
         detour: mean(|m| m.detour_pct),
@@ -474,31 +507,105 @@ fn print_summary(run: &Run, compare: Option<&Run>) {
     let row = |label: &str, fmt: &str, cur: f64, base: Option<f64>| {
         if let Some(b) = base {
             let delta = cur - b;
-            let arrow = if delta < 0.0 { "↓" } else if delta > 0.0 { "↑" } else { "·" };
+            let arrow = if delta < 0.0 {
+                "↓"
+            } else if delta > 0.0 {
+                "↑"
+            } else {
+                "·"
+            };
             match fmt {
-                "%.2f" => println!("  {:<24} {:>7.2}  vs {:>7.2}  {}{:.2}", label, cur, b, arrow, delta.abs()),
-                "%.1f" => println!("  {:<24} {:>7.1}  vs {:>7.1}  {}{:.1}", label, cur, b, arrow, delta.abs()),
-                "%.0f" => println!("  {:<24} {:>7.0}  vs {:>7.0}  {}{:.0}", label, cur, b, arrow, delta.abs()),
-                _      => println!("  {:<24} {:>7.2}  vs {:>7.2}  {}{:.2}", label, cur, b, arrow, delta.abs()),
+                "%.2f" => println!(
+                    "  {:<24} {:>7.2}  vs {:>7.2}  {}{:.2}",
+                    label,
+                    cur,
+                    b,
+                    arrow,
+                    delta.abs()
+                ),
+                "%.1f" => println!(
+                    "  {:<24} {:>7.1}  vs {:>7.1}  {}{:.1}",
+                    label,
+                    cur,
+                    b,
+                    arrow,
+                    delta.abs()
+                ),
+                "%.0f" => println!(
+                    "  {:<24} {:>7.0}  vs {:>7.0}  {}{:.0}",
+                    label,
+                    cur,
+                    b,
+                    arrow,
+                    delta.abs()
+                ),
+                _ => println!(
+                    "  {:<24} {:>7.2}  vs {:>7.2}  {}{:.2}",
+                    label,
+                    cur,
+                    b,
+                    arrow,
+                    delta.abs()
+                ),
             }
         } else {
             match fmt {
                 "%.2f" => println!("  {:<24} {:>7.2}", label, cur),
                 "%.1f" => println!("  {:<24} {:>7.1}", label, cur),
                 "%.0f" => println!("  {:<24} {:>7.0}", label, cur),
-                _      => println!("  {:<24} {:>7.2}", label, cur),
+                _ => println!("  {:<24} {:>7.2}", label, cur),
             }
         }
     };
-    row("detour %",            "%.2f", agg.detour,    cmp.as_ref().map(|c| c.detour));
-    row("turn density °/km",   "%.1f", agg.turn,      cmp.as_ref().map(|c| c.turn));
-    row("sharp turns /km",     "%.2f", agg.sharp,     cmp.as_ref().map(|c| c.sharp));
-    row("hairpins /km",        "%.2f", agg.hairpin,   cmp.as_ref().map(|c| c.hairpin));
-    row("detour loops",        "%.2f", agg.loops,     cmp.as_ref().map(|c| c.loops));
-    row("tails",               "%.2f", agg.tails,     cmp.as_ref().map(|c| c.tails));
-    row("surf transitions /km","%.2f", agg.surf,      cmp.as_ref().map(|c| c.surf));
-    row("ascent m/km",         "%.1f", agg.ascent_pk, cmp.as_ref().map(|c| c.ascent_pk));
-    row("max dev m",           "%.0f", agg.max_dev,   cmp.as_ref().map(|c| c.max_dev));
+    row(
+        "detour %",
+        "%.2f",
+        agg.detour,
+        cmp.as_ref().map(|c| c.detour),
+    );
+    row(
+        "turn density °/km",
+        "%.1f",
+        agg.turn,
+        cmp.as_ref().map(|c| c.turn),
+    );
+    row(
+        "sharp turns /km",
+        "%.2f",
+        agg.sharp,
+        cmp.as_ref().map(|c| c.sharp),
+    );
+    row(
+        "hairpins /km",
+        "%.2f",
+        agg.hairpin,
+        cmp.as_ref().map(|c| c.hairpin),
+    );
+    row(
+        "detour loops",
+        "%.2f",
+        agg.loops,
+        cmp.as_ref().map(|c| c.loops),
+    );
+    row("tails", "%.2f", agg.tails, cmp.as_ref().map(|c| c.tails));
+    row(
+        "surf transitions /km",
+        "%.2f",
+        agg.surf,
+        cmp.as_ref().map(|c| c.surf),
+    );
+    row(
+        "ascent m/km",
+        "%.1f",
+        agg.ascent_pk,
+        cmp.as_ref().map(|c| c.ascent_pk),
+    );
+    row(
+        "max dev m",
+        "%.0f",
+        agg.max_dev,
+        cmp.as_ref().map(|c| c.max_dev),
+    );
 }
 
 /// Quality thresholds the tuned configuration is expected to keep clearing.
@@ -516,11 +623,11 @@ struct GateThresholds {
 }
 
 const GATE: GateThresholds = GateThresholds {
-    max_turn_density: 260.0, // tuned ~200, +30 % slack
-    max_sharp_per_km: 0.75,  // tuned ~0.50
+    max_turn_density: 260.0,   // tuned ~200, +30 % slack
+    max_sharp_per_km: 0.75,    // tuned ~0.50
     max_hairpins_per_km: 0.10, // tuned ~0.02
-    max_detour_pct: 22.0,    // tuned ~17 %
-    max_ascent_per_km: 14.0, // tuned ~11 m/km
+    max_detour_pct: 22.0,      // tuned ~17 %
+    max_ascent_per_km: 14.0,   // tuned ~11 m/km
     // After loop pruning we expect zero on between-A→B; threshold 0.5 leaves
     // a tiny tolerance for the tail-detector's geometric heuristics on
     // legitimate tight road bends.
@@ -536,9 +643,8 @@ fn check_gate(run: &Run) -> Vec<(&'static str, f64, f64)> {
         return vec![("panel_empty", 0.0, 0.0)];
     }
     let n = between.len() as f64;
-    let mean = |sel: fn(&CaseMetrics) -> f64| -> f64 {
-        between.iter().map(|m| sel(*m)).sum::<f64>() / n
-    };
+    let mean =
+        |sel: fn(&CaseMetrics) -> f64| -> f64 { between.iter().map(|m| sel(*m)).sum::<f64>() / n };
     let mut bad = Vec::new();
     let td = mean(|m| m.turn_density_dps_per_km);
     if td > GATE.max_turn_density {
@@ -644,7 +750,10 @@ fn main() -> Result<()> {
         } else {
             eprintln!("\n=== gate: FAIL ===");
             for (name, cur, thr) in &violations {
-                eprintln!("  {:<20} current {:>7.2}  >  threshold {:>7.2}", name, cur, thr);
+                eprintln!(
+                    "  {:<20} current {:>7.2}  >  threshold {:>7.2}",
+                    name, cur, thr
+                );
             }
             std::process::exit(1);
         }

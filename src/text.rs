@@ -216,7 +216,11 @@ pub fn layout_text(
                     // glyph's own advance, so we don't extend that further.
                     x += tracking;
                 }
-                placed.push(Placed { ch, x, line: line_idx });
+                placed.push(Placed {
+                    ch,
+                    x,
+                    line: line_idx,
+                });
                 x += adv;
                 if x > max_x_seen {
                     max_x_seen = x;
@@ -494,11 +498,7 @@ pub fn route_stroke(
 /// ratio (routed length vs intended length, summed across all strokes)
 /// dominates; missing glyphs add a small fixed penalty so candidates with the
 /// same routing fidelity still prefer fewer dropped characters.
-pub fn text_score(
-    total_routed_m: f64,
-    total_intended_m: f64,
-    missing_glyphs: usize,
-) -> f64 {
+pub fn text_score(total_routed_m: f64, total_intended_m: f64, missing_glyphs: usize) -> f64 {
     let detour = if total_intended_m > 0.0 {
         (total_routed_m / total_intended_m - 1.0).max(0.0)
     } else {
@@ -562,7 +562,13 @@ pub struct MessagePlacement {
 /// shape fidelity — they're just "get from the end of stroke A to the
 /// start of stroke B by the cheapest path". A wide corridor + low α lets
 /// the router take the natural shortcut.
-fn route_pen_up(graph: &Graph, from: LatLon, to: LatLon, modes: u8, paved_only: bool) -> Option<PenUp> {
+fn route_pen_up(
+    graph: &Graph,
+    from: LatLon,
+    to: LatLon,
+    modes: u8,
+    paved_only: bool,
+) -> Option<PenUp> {
     let dist = haversine(from, to);
     if dist < 1.0 {
         return Some(PenUp {
@@ -736,7 +742,14 @@ fn place_message_greedy(
     n_local_candidates: usize,
     seed: u64,
 ) -> Option<MessagePlacement> {
-    let layout = layout_text(text, anchor_centre, anchor_bearing_rad, letter_height_m, wrap_m, font);
+    let layout = layout_text(
+        text,
+        anchor_centre,
+        anchor_bearing_rad,
+        letter_height_m,
+        wrap_m,
+        font,
+    );
     if layout.glyphs.is_empty() {
         return None;
     }
@@ -758,7 +771,9 @@ fn place_message_greedy(
 
     for (i, glyph_nom) in layout.glyphs.iter().enumerate() {
         // Apply the accumulated offset to the nominal centre.
-        let nominal = if i == 0 || (accumulated_offset_east.abs() < 1.0 && accumulated_offset_north.abs() < 1.0) {
+        let nominal = if i == 0
+            || (accumulated_offset_east.abs() < 1.0 && accumulated_offset_north.abs() < 1.0)
+        {
             glyph_nom.clone()
         } else {
             let dist = (accumulated_offset_east * accumulated_offset_east
@@ -795,7 +810,8 @@ fn place_message_greedy(
         let actual = lr.centre_chosen;
         let nom = glyph_nom.centre_nominal;
         accumulated_offset_east = (actual.lon - nom.lon).to_radians()
-            * 6_371_008.8 * ((actual.lat + nom.lat) * 0.5).to_radians().cos();
+            * 6_371_008.8
+            * ((actual.lat + nom.lat) * 0.5).to_radians().cos();
         accumulated_offset_north = (actual.lat - nom.lat).to_radians() * 6_371_008.8;
         letters.push(lr);
     }
@@ -821,7 +837,10 @@ fn place_message_greedy(
 
     let total_intended_m: f64 = letters.iter().map(|l| l.total_intended_m).sum();
     let total_routed_m: f64 = letters.iter().map(|l| l.total_routed_m).sum();
-    let max_stroke_detour = letters.iter().map(|l| l.max_stroke_detour).fold(0.0_f64, f64::max);
+    let max_stroke_detour = letters
+        .iter()
+        .map(|l| l.max_stroke_detour)
+        .fold(0.0_f64, f64::max);
 
     Some(MessagePlacement {
         anchor_centre,
@@ -1048,7 +1067,8 @@ mod tests {
         assert!(
             top.lon < centre.lon,
             "letter top lon {} should be west of centre lon {}",
-            top.lon, centre.lon
+            top.lon,
+            centre.lon
         );
     }
 
@@ -1082,7 +1102,10 @@ mod tests {
     fn cursive_layout_works() {
         let centre = deg(46.8, 8.2);
         let lay = layout_text("Hi", centre, FRAC_PI_2, 5_000.0, 0.0, Font::Cursive);
-        assert!(!lay.flat_strokes().is_empty(), "cursive should produce strokes");
+        assert!(
+            !lay.flat_strokes().is_empty(),
+            "cursive should produce strokes"
+        );
     }
 
     #[test]

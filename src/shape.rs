@@ -60,8 +60,8 @@ fn regular_polygon(n: usize) -> Vec<(f64, f64)> {
     // north — matches geographic intuition.
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..=n {
-        let theta = (i as f64) * 2.0 * std::f64::consts::PI / (n as f64)
-            + std::f64::consts::FRAC_PI_2;
+        let theta =
+            (i as f64) * 2.0 * std::f64::consts::PI / (n as f64) + std::f64::consts::FRAC_PI_2;
         out.push((theta.cos(), theta.sin()));
     }
     out
@@ -85,10 +85,8 @@ fn heart(n: usize) -> Vec<(f64, f64)> {
         .map(|i| {
             let t = (i as f64) * 2.0 * std::f64::consts::PI / (n as f64);
             let x = 16.0 * t.sin().powi(3);
-            let y = 13.0 * t.cos()
-                - 5.0 * (2.0 * t).cos()
-                - 2.0 * (3.0 * t).cos()
-                - (4.0 * t).cos();
+            let y =
+                13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
             (x, y)
         })
         .collect();
@@ -225,10 +223,8 @@ fn switzerland_outline() -> Vec<(f64, f64)> {
         (46.8644, 10.4538),
     ];
     let n_unique = POINTS.len() - 1;
-    let lat_c: f64 = POINTS.iter().take(n_unique).map(|p| p.0).sum::<f64>()
-        / n_unique as f64;
-    let lon_c: f64 = POINTS.iter().take(n_unique).map(|p| p.1).sum::<f64>()
-        / n_unique as f64;
+    let lat_c: f64 = POINTS.iter().take(n_unique).map(|p| p.0).sum::<f64>() / n_unique as f64;
+    let lon_c: f64 = POINTS.iter().take(n_unique).map(|p| p.1).sum::<f64>() / n_unique as f64;
     let cos_lat = lat_c.to_radians().cos();
     let mut raw: Vec<(f64, f64)> = POINTS
         .iter()
@@ -330,7 +326,7 @@ pub fn place_shape(
             continue;
         }
         let theta = y.atan2(x); // CCW from east, radians
-        // Geographic bearing (CW from north) = π/2 − θ + rotation.
+                                // Geographic bearing (CW from north) = π/2 − θ + rotation.
         let bearing = std::f64::consts::FRAC_PI_2 - theta + rot_rad;
         let dist = r * radius_m;
         out.push(destination(center, bearing, dist));
@@ -346,10 +342,7 @@ mod tests {
     #[test]
     fn circle_perimeter_matches_request() {
         let verts = place_shape(LatLon::new(46.8, 8.2), ShapeKind::Circle, 50.0, 0.0);
-        let p_m: f64 = verts
-            .windows(2)
-            .map(|w| haversine(w[0], w[1]))
-            .sum();
+        let p_m: f64 = verts.windows(2).map(|w| haversine(w[0], w[1])).sum();
         assert!(
             (p_m - 50_000.0).abs() < 1_500.0,
             "circle perimeter {p_m:.0} m far from 50 000 m"
@@ -385,7 +378,10 @@ mod tests {
         assert_eq!(ShapeKind::parse("Heart"), Some(ShapeKind::Heart));
         assert_eq!(ShapeKind::parse("figure-8"), Some(ShapeKind::FigureEight));
         assert_eq!(ShapeKind::parse("swiss"), Some(ShapeKind::SwissCross));
-        assert_eq!(ShapeKind::parse("switzerland"), Some(ShapeKind::Switzerland));
+        assert_eq!(
+            ShapeKind::parse("switzerland"),
+            Some(ShapeKind::Switzerland)
+        );
         assert_eq!(ShapeKind::parse("CH"), Some(ShapeKind::Switzerland));
         assert_eq!(ShapeKind::parse("blob"), None);
     }

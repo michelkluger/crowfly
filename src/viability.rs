@@ -194,10 +194,7 @@ pub fn analyse(
         route
             .points
             .iter()
-            .map(|p| Coord {
-                x: p.lon,
-                y: p.lat,
-            })
+            .map(|p| Coord { x: p.lon, y: p.lat })
             .collect::<Vec<_>>(),
     );
     let mut violations = Vec::new();

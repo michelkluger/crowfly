@@ -232,7 +232,10 @@ impl<'a> ExploreOutputs<'a> {
 
         for (i, s) in self.ranked.iter().enumerate() {
             let rank = i + 1;
-            let line = format!("rank {} ({:.0}°, {:.1} km)", rank, s.candidate.bearing_deg, s.report.total_km);
+            let line = format!(
+                "rank {} ({:.0}°, {:.1} km)",
+                rank, s.candidate.bearing_deg, s.report.total_km
+            );
             // Reference (great-circle) line dashed, dimmed.
             let ref_pts = sample_line(self.start, s.candidate.end, 3_000.0);
             features.push(linestring_feature_props(

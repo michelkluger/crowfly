@@ -510,18 +510,16 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             real_bbox.lon_max
         );
         let elev = crowfly::elevation::ElevationClient::new(&args.elevation_cache)?;
-        let state = crowfly::server::AppState(std::sync::Arc::new(
-            crowfly::server::ServerState {
-                graph,
-                bbox: real_bbox,
-                no_go,
-                long_edge_threshold_m: args.long_edge_threshold,
-                elevation_cache: args.elevation_cache.clone(),
-                elev: std::sync::Mutex::new(elev),
-                progress: std::sync::Mutex::new(None),
-                async_job: std::sync::Mutex::new(None),
-            },
-        ));
+        let state = crowfly::server::AppState(std::sync::Arc::new(crowfly::server::ServerState {
+            graph,
+            bbox: real_bbox,
+            no_go,
+            long_edge_threshold_m: args.long_edge_threshold,
+            elevation_cache: args.elevation_cache.clone(),
+            elev: std::sync::Mutex::new(elev),
+            progress: std::sync::Mutex::new(None),
+            async_job: std::sync::Mutex::new(None),
+        }));
         crowfly::server::serve(state, &args.bind).await
     })
 }
@@ -534,12 +532,25 @@ fn graph_bbox(g: &crowfly::osm::Graph) -> crowfly::osm::BBox {
     let mut lon_max = f64::NEG_INFINITY;
     for ni in g.graph.node_indices() {
         let p = g.graph[ni];
-        if p.lat < lat_min { lat_min = p.lat; }
-        if p.lat > lat_max { lat_max = p.lat; }
-        if p.lon < lon_min { lon_min = p.lon; }
-        if p.lon > lon_max { lon_max = p.lon; }
+        if p.lat < lat_min {
+            lat_min = p.lat;
+        }
+        if p.lat > lat_max {
+            lat_max = p.lat;
+        }
+        if p.lon < lon_min {
+            lon_min = p.lon;
+        }
+        if p.lon > lon_max {
+            lon_max = p.lon;
+        }
     }
-    BBox { lat_min, lat_max, lon_min, lon_max }
+    BBox {
+        lat_min,
+        lat_max,
+        lon_min,
+        lon_max,
+    }
 }
 
 fn main() -> Result<()> {

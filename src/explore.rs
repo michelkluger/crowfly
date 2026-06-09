@@ -521,6 +521,17 @@ pub fn route_one_shape(
     params: &RouteParams,
     filter: &RouteFilter,
 ) -> Result<ScoredShape, (ShapeCandidate, String)> {
+    route_one_shape_with_limits(graph, candidate, no_go, params, filter, None)
+}
+
+pub fn route_one_shape_with_limits(
+    graph: &Graph,
+    candidate: ShapeCandidate,
+    no_go: &[NoGoZone],
+    params: &RouteParams,
+    filter: &RouteFilter,
+    max_leg_detour_cap: Option<f64>,
+) -> Result<ScoredShape, (ShapeCandidate, String)> {
     let vertices = place_shape(
         candidate.center,
         candidate.kind,
@@ -588,6 +599,19 @@ pub fn route_one_shape(
         let leg_detour = (leg.total_length_m / intended - 1.0).max(0.0);
         if leg_detour > max_leg_detour {
             max_leg_detour = leg_detour;
+        }
+        if let Some(cap) = max_leg_detour_cap {
+            if max_leg_detour > cap {
+                return Err((
+                    candidate,
+                    format!(
+                        "leg {}: detour {:.0}% exceeds shape fidelity cap {:.0}%",
+                        i + 1,
+                        leg_detour * 100.0,
+                        cap * 100.0
+                    ),
+                ));
+            }
         }
         if all_points.is_empty() {
             all_points.extend(&leg.points);
@@ -669,11 +693,24 @@ pub fn evaluate_shapes(
     filter: &RouteFilter,
     progress: Option<&AtomicUsize>,
 ) -> Vec<Result<ScoredShape, (ShapeCandidate, String)>> {
+    evaluate_shapes_with_limits(graph, candidates, no_go, params, filter, progress, None)
+}
+
+pub fn evaluate_shapes_with_limits(
+    graph: &Graph,
+    candidates: Vec<ShapeCandidate>,
+    no_go: &[NoGoZone],
+    params: &RouteParams,
+    filter: &RouteFilter,
+    progress: Option<&AtomicUsize>,
+    max_leg_detour_cap: Option<f64>,
+) -> Vec<Result<ScoredShape, (ShapeCandidate, String)>> {
     use rayon::prelude::*;
     candidates
         .into_par_iter()
         .map(|c| {
-            let r = route_one_shape(graph, c, no_go, params, filter);
+            let r =
+                route_one_shape_with_limits(graph, c, no_go, params, filter, max_leg_detour_cap);
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
             }
@@ -953,6 +990,40 @@ mod tests {
             scored.score >= 140.0,
             "score should retain large worst-leg penalty, got {}",
             scored.score
+        );
+    }
+
+    #[test]
+    fn shape_route_can_abort_on_bad_leg_detour() {
+        let candidate = ShapeCandidate {
+            center: LatLon::new(0.0, 0.0),
+            kind: ShapeKind::Square,
+            perimeter_km: 4.0,
+            rotation_deg: 0.0,
+        };
+        let vertices = place_shape(
+            candidate.center,
+            candidate.kind,
+            candidate.perimeter_km,
+            candidate.rotation_deg,
+        );
+        let graph = graph_for_shape(&vertices);
+        let params = RouteParams {
+            modes: MODE_FOOT,
+            half_width_m: 200.0,
+            alpha: 4.0,
+            corridor_max_m: 200.0,
+            paved_only: false,
+        };
+        let filter = RouteFilter::lax(200.0);
+
+        let err = route_one_shape_with_limits(&graph, candidate, &[], &params, &filter, Some(0.0))
+            .expect_err("any nonzero detour should trip zero cap")
+            .1;
+
+        assert!(
+            err.contains("shape fidelity cap"),
+            "unexpected error: {err}"
         );
     }
 }

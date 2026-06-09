@@ -50,9 +50,7 @@ pub fn ensure_pbf(region: &str, cache_dir: &Path) -> Result<PathBuf> {
             resp.status()
         ));
     }
-    let total: Option<u64> = resp
-        .header("content-length")
-        .and_then(|s| s.parse().ok());
+    let total: Option<u64> = resp.header("content-length").and_then(|s| s.parse().ok());
 
     let pb = match total {
         Some(n) => {

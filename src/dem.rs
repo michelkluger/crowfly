@@ -51,7 +51,11 @@ impl Tile {
         let dc = col_f - c0 as f64;
         let v = |r: usize, c: usize| -> Option<f64> {
             let z = self.data[r * self.side + c];
-            if z == VOID { None } else { Some(z as f64) }
+            if z == VOID {
+                None
+            } else {
+                Some(z as f64)
+            }
         };
         // Bilinear interpolation that drops voided neighbours.
         let mut sum = 0.0;
@@ -67,7 +71,11 @@ impl Tile {
                 w += ww;
             }
         }
-        if w > 0.0 { Some(sum / w) } else { None }
+        if w > 0.0 {
+            Some(sum / w)
+        } else {
+            None
+        }
     }
 }
 
@@ -99,8 +107,8 @@ impl Dem {
                 );
                 continue;
             };
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let side = match bytes.len() {
                 n if n == 1201 * 1201 * 2 => 1201,
                 n if n == 3601 * 3601 * 2 => 3601,
@@ -117,7 +125,15 @@ impl Dem {
             for chunk in bytes.chunks_exact(2) {
                 data.push(i16::from_be_bytes([chunk[0], chunk[1]]));
             }
-            dem.tiles.insert((lat0, lon0), Tile { lat0, lon0, side, data });
+            dem.tiles.insert(
+                (lat0, lon0),
+                Tile {
+                    lat0,
+                    lon0,
+                    side,
+                    data,
+                },
+            );
         }
         Ok(dem)
     }
@@ -131,9 +147,7 @@ impl Dem {
 }
 
 fn collect_hgt(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
@@ -194,9 +208,7 @@ fn ensure_pack(cache_dir: &Path, pack: &str) -> Result<()> {
             resp.status()
         ));
     }
-    let total: Option<u64> = resp
-        .header("content-length")
-        .and_then(|s| s.parse().ok());
+    let total: Option<u64> = resp.header("content-length").and_then(|s| s.parse().ok());
     let pb = match total {
         Some(n) => {
             let pb = ProgressBar::new(n);
@@ -220,8 +232,8 @@ fn ensure_pack(cache_dir: &Path, pack: &str) -> Result<()> {
     };
     let zip_path = cache_dir.join(format!("{}.zip.part", pack.to_ascii_uppercase()));
     {
-        let mut f = File::create(&zip_path)
-            .with_context(|| format!("creating {}", zip_path.display()))?;
+        let mut f =
+            File::create(&zip_path).with_context(|| format!("creating {}", zip_path.display()))?;
         let mut reader = resp.into_reader();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -255,17 +267,20 @@ fn ensure_pack(cache_dir: &Path, pack: &str) -> Result<()> {
             .file_name()
             .ok_or_else(|| anyhow!("zip entry has no filename: {name}"))?;
         let out_path = cache_dir.join(stem);
-        let mut out = File::create(&out_path)
-            .with_context(|| format!("creating {}", out_path.display()))?;
+        let mut out =
+            File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?;
         std::io::copy(&mut entry, &mut out)?;
         extracted += 1;
     }
     drop(archive);
     let _ = std::fs::remove_file(&zip_path);
-    eprintln!("Extracted {} .hgt tiles into {}", extracted, cache_dir.display());
+    eprintln!(
+        "Extracted {} .hgt tiles into {}",
+        extracted,
+        cache_dir.display()
+    );
     // Drop the marker so future runs skip the download.
-    std::fs::write(&marker, b"")
-        .with_context(|| format!("writing marker {}", marker.display()))?;
+    std::fs::write(&marker, b"").with_context(|| format!("writing marker {}", marker.display()))?;
     Ok(())
 }
 
