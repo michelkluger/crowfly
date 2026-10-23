@@ -140,6 +140,8 @@
     padding: 8px 14px; font-size: 12px; color: #666; background: #fff;
     border-top: 1px solid #eee;
   }
+  .status .copy-link { color: var(--accent-dark); text-decoration: none; white-space: nowrap; }
+  .status .copy-link:hover { text-decoration: underline; }
   .spinner {
     display: inline-block; width: 12px; height: 12px; border-radius: 50%;
     border: 2px solid #ddd; border-top-color: var(--accent);

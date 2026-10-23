@@ -205,7 +205,9 @@ map.on('load', async () => {
     setStatus(`graph ready — ${info.graph_nodes.toLocaleString()} nodes`);
   } catch (e) {
     setStatus('failed to load /api/info');
+    return;
   }
+  runLink();
 });
 
 map.on('click', (e) => {
@@ -342,6 +344,99 @@ for (const id of PARAM_IDS) {
   if (el) el.addEventListener('change', saveParams);
 }
 
+// Permalinks: a finished search writes its mode, the inputs it ran with and
+// the server's seed into the URL hash. Opening that URL (or refreshing)
+// re-runs the same search; same seed + same graph gives identical results,
+// since candidate sampling is the only randomness.
+const LINK_PARAMS = {
+  between: ['optWidth','optModes','optElev','optPaved','optBetweenCount'],
+  country: ['optWidth','optModes','optElev','optPaved','optStrict',
+            'optCount','optDmin','optDmax','optBorder','optStrip','optMinViable'],
+  shape:   ['optWidth','optModes','optElev','optPaved','optStrict',
+            'optShape','optPerim','optShapeCount','optShapeMinViable'],
+  text:    ['optModes','optElev','optPaved',
+            'optText','optLetterKm','optWrapKm','optFont','optDetourCap','optTextCandidates'],
+};
+const RUN_BUTTON = { between: 'btnBetween', country: 'btnCountry', shape: 'btnShapeSearch', text: 'btnText' };
+// Seed from an opened permalink, consumed by the next search request.
+let linkSeed = null;
+
+function fmtLink(p) { return `${p[1].toFixed(5)},${p[0].toFixed(5)}`; }
+function parseLink(s) {
+  const [lat, lon] = (s || '').split(',').map(Number);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? [lon, lat] : null;
+}
+
+// Capture the search's inputs when it starts, so edits made while it runs
+// don't leak into its link.
+function linkSnapshot() {
+  const q = new URLSearchParams({ mode: currentMode });
+  for (const id of LINK_PARAMS[currentMode]) {
+    const el = document.getElementById(id);
+    if (el) q.set(id, el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value);
+  }
+  if (currentMode === 'between' && A && B) {
+    q.set('a', fmtLink(A));
+    q.set('b', fmtLink(B));
+  }
+  return q;
+}
+
+function takeLinkSeed() {
+  const s = linkSeed;
+  linkSeed = null;
+  return s === null ? {} : { seed: s };
+}
+
+// Record a finished search in the URL; returns a status suffix to copy it.
+function publishLink(q, seed) {
+  if (seed !== undefined && seed !== null) q.set('seed', String(seed));
+  const hash = '#' + q.toString();
+  history.replaceState(null, '', hash);
+  return ` · <a href="${hash}" class="copy-link" title="Copy a link that re-runs this exact search">copy link</a>`;
+}
+
+// Apply the permalink in the URL hash (mode, inputs, A/B, seed) and start
+// its search. No-op when the hash isn't a crowfly link.
+function runLink() {
+  const q = new URLSearchParams(location.hash.slice(1));
+  const mode = q.get('mode');
+  if (!Object.hasOwn(LINK_PARAMS, mode)) return;
+  switchMode(mode);
+  for (const id of LINK_PARAMS[mode]) {
+    const el = document.getElementById(id);
+    if (!el || !q.has(id)) continue;
+    if (el.type === 'checkbox') el.checked = q.get(id) === '1';
+    else el.value = q.get(id);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  saveParams();
+  if (mode === 'between') {
+    A = parseLink(q.get('a'));
+    B = parseLink(q.get('b'));
+    if (A) markerA.setLngLat(A).addTo(map); else markerA.remove();
+    if (B) markerB.setLngLat(B).addTo(map); else markerB.remove();
+    fmtAB();
+  }
+  const seed = q.get('seed');
+  linkSeed = mode !== 'between' && /^\d+$/.test(seed || '') ? Number(seed) : null;
+  document.getElementById(RUN_BUTTON[mode]).click();
+}
+// Pasting a link into an open tab only changes the hash.
+window.addEventListener('hashchange', runLink);
+
+document.getElementById('status').addEventListener('click', async (e) => {
+  const a = e.target.closest('.copy-link');
+  if (!a) return;
+  e.preventDefault();
+  try {
+    await navigator.clipboard.writeText(location.href);
+    a.textContent = 'link copied';
+  } catch (_) {
+    a.textContent = 'copy failed — use the address bar';
+  }
+});
+
 let inFlight = null;
 let progressTimer = null;
 function showProgress(label) {
@@ -425,6 +520,7 @@ function isAbort(e) { return e && (e.name === 'AbortError' || e.message === 'can
 
 document.getElementById('btnBetween').addEventListener('click', async () => {
   if (!A || !B) return;
+  const link = linkSnapshot();
   setStatus('<span class="spinner"></span> finding alternatives between A and B…');
   document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
   showProgress('finding alternatives…');
@@ -437,7 +533,7 @@ document.getElementById('btnBetween').addEventListener('click', async () => {
       alternatives: +document.getElementById('optBetweenCount').value,
     });
     renderResults(j.results, j.failures);
-    setStatus(`got ${j.results.length} alternatives`);
+    setStatus(`got ${j.results.length} alternatives` + publishLink(link));
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
@@ -456,6 +552,7 @@ document.getElementById('btnText').addEventListener('click', async () => {
   const detour   = parseFloat(document.getElementById('optDetourCap').value);
   const cands    = parseInt(document.getElementById('optTextCandidates').value, 10);
   const teaser = text.length > 32 ? text.slice(0, 32) + '…' : text;
+  const link = linkSnapshot();
   setStatus(`<span class="spinner"></span> searching for a place to write "${teaser}"…`);
   document.getElementById('cards').innerHTML = '<div class="empty">searching placements…</div>';
   showProgress('searching placements…');
@@ -471,13 +568,15 @@ document.getElementById('btnText').addEventListener('click', async () => {
       font: document.getElementById('optFont').value,
       detour_cap: Number.isFinite(detour) && detour >= 1.0 ? detour : 1.6,
       candidates: Number.isFinite(cands) && cands > 0 ? cands : 200,
+      ...takeLinkSeed(),
     });
     renderResults(j.results, j.failures);
+    const linkHtml = publishLink(link, j.seed);
     if (j.results.length === 0) {
       const m = j.text_render_meta || {};
       const evald = m.evaluated || 0;
       const hint = m.hint || 'try larger letter km, shorter text, or higher detour cap';
-      setStatus(`no viable placement after ${evald} candidates — ${hint}`);
+      setStatus(`no viable placement after ${evald} candidates — ${hint}` + linkHtml);
     } else {
       const r = j.results[0];
       const tr = r.text_render || {};
@@ -488,7 +587,7 @@ document.getElementById('btnText').addEventListener('click', async () => {
       const parts = [`placed "${teaser}" (${total} stroke${total === 1 ? '' : 's'}, ${detPct ?? 0}% detour)`];
       parts.push(`evaluated ${evald} candidates`);
       if (miss) parts.push(`${miss} non-ASCII glyph${miss === 1 ? '' : 's'} dropped`);
-      setStatus(parts.join(' · '));
+      setStatus(parts.join(' · ') + linkHtml);
     }
   } catch (e) {
     if (isAbort(e)) return;
@@ -500,6 +599,7 @@ document.getElementById('btnText').addEventListener('click', async () => {
 document.getElementById('btnShapeSearch').addEventListener('click', async () => {
   const kind = document.getElementById('optShape').value;
   const perim = +document.getElementById('optPerim').value;
+  const link = linkSnapshot();
   setStatus(`<span class="spinner"></span> searching for ${kind}s of ${perim} km across the country…`);
   document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
   showProgress(`searching ${kind}s…`);
@@ -512,9 +612,11 @@ document.getElementById('btnShapeSearch').addEventListener('click', async () => 
       perimeter_km: perim,
       count: +document.getElementById('optShapeCount').value,
       ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
+      ...takeLinkSeed(),
     });
     renderResults(j.results, j.failures);
-    setStatus(`got ${j.results.length} ${kind}${j.results.length === 1 ? '' : 's'}`);
+    setStatus(`got ${j.results.length} ${kind}${j.results.length === 1 ? '' : 's'}`
+              + publishLink(link, j.seed));
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
@@ -523,6 +625,7 @@ document.getElementById('btnShapeSearch').addEventListener('click', async () => 
 });
 
 document.getElementById('btnCountry').addEventListener('click', async () => {
+  const link = linkSnapshot();
   setStatus('<span class="spinner"></span> sampling diverse country-wide lines…');
   document.getElementById('cards').innerHTML = '<div class="empty">searching…</div>';
   showProgress('preparing candidates…');
@@ -537,9 +640,10 @@ document.getElementById('btnCountry').addEventListener('click', async () => {
       border_to_border: document.getElementById('optBorder').checked,
       border_strip_km: +document.getElementById('optStrip').value,
       ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
+      ...takeLinkSeed(),
     });
     renderResults(j.results, j.failures);
-    setStatus(`got ${j.results.length} country-wide suggestions`);
+    setStatus(`got ${j.results.length} country-wide suggestions` + publishLink(link, j.seed));
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
