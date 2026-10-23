@@ -444,13 +444,7 @@ async fn handle_country(
     let base_half = req.width_m / 2.0;
     let count = req.count.clamp(1, 50);
     let base_sample = (count * 6).max(20); // oversample, then dedupe to top N
-    let seed = req.seed.unwrap_or_else(|| {
-        // Use system time so refresh gives new lines each click.
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    });
+    let seed = seed_or_random(req.seed);
     let inner = state.0.clone();
     let bbox = inner.bbox;
     let dmin = req.distance_min_km;
@@ -576,6 +570,7 @@ async fn handle_country(
         *p = None;
     }
     Ok(Json(json!({
+        "seed": seed,
         "results": resp,
         "failures": stats.to_json(),
     })))
@@ -662,12 +657,7 @@ async fn handle_shape_search(
         8
     };
     let base_sample = (count * sample_factor).max(count + 8).max(16);
-    let seed = req.seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    });
+    let seed = seed_or_random(req.seed);
     let min_viable = req.min_viable.unwrap_or(count).max(1);
     const SAMPLE_FACTORS: [f64; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
     const WIDEN_DELTA_KM: [f64; 5] = [0.0, 0.5, 1.0, 1.5, 2.0];
@@ -790,6 +780,7 @@ async fn handle_shape_search(
         *p = None;
     }
     Ok(Json(json!({
+        "seed": seed,
         "results": resp,
         "failures": stats.to_json(),
     })))
@@ -831,12 +822,7 @@ async fn handle_text(
     };
     let detour_cap = req.detour_cap.max(1.0);
     let n_candidates = req.candidates.clamp(20, 1000);
-    let seed = req.seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    });
+    let seed = seed_or_random(req.seed);
     let bbox = state.0.bbox;
     let wrap_m = if req.wrap_m > 0.0 { req.wrap_m } else { 0.0 };
 
@@ -903,6 +889,7 @@ async fn handle_text(
 
     let Some(best) = placements.into_iter().next() else {
         return Ok(Json(json!({
+            "seed": seed,
             "results": Vec::<Value>::new(),
             "failures": json!({
                 "snap_too_far": 0, "corridor_violated": 0, "no_route": 0,
@@ -1081,6 +1068,7 @@ async fn handle_text(
     });
 
     Ok(Json(json!({
+        "seed": seed,
         "results": [result],
         "failures": json!({
             "snap_too_far": 0, "corridor_violated": 0, "no_route": 0,
@@ -1125,6 +1113,13 @@ async fn handle_progress(State(state): State<AppState>) -> Json<Value> {
         })),
         None => Json(json!({ "active": false })),
     }
+}
+
+/// The request's seed, or a fresh random one so each click gives new
+/// candidates. Responses echo it back for permalinks; drawing from u32 keeps
+/// links short and the value exact as a JS number.
+fn seed_or_random(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(|| u64::from(rand::random::<u32>()))
 }
 
 fn now_ms() -> u128 {
