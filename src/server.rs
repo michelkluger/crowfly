@@ -29,7 +29,7 @@ use axum::{
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
@@ -45,6 +45,81 @@ pub struct ServerState {
     /// Latest in-flight search progress. Cleared when no work is running. The
     /// server is single-user (README), so a single slot is enough.
     pub progress: Mutex<Option<ProgressTracker>>,
+    /// Cancel flag of the most recent search; see [`Search`].
+    pub search_cancel: Mutex<Arc<AtomicBool>>,
+}
+
+/// One search's cancel flag and its claim on the shared progress slot.
+/// Starting a search cancels the previous one: the server is single-user,
+/// and the FE has already abandoned the old request when it starts a new
+/// one. A superseded search may take a moment to wind down, so it only
+/// touches the progress slot while it still owns it.
+#[derive(Clone)]
+struct Search {
+    state: Arc<ServerState>,
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicUsize>,
+}
+
+/// The handler's owning handle on its [`Search`]. Dropping it — when the
+/// handler returns, or when axum drops the handler because the client went
+/// away (an aborted fetch) — cancels any remaining work and releases the
+/// progress slot, so neither outlives the request.
+struct SearchGuard(Search);
+
+impl Search {
+    fn begin(state: &Arc<ServerState>, kind: &'static str, total: usize) -> SearchGuard {
+        let cancel = Arc::new(AtomicBool::new(false));
+        std::mem::replace(&mut *state.search_cancel.lock().unwrap(), cancel.clone())
+            .store(true, Ordering::Relaxed);
+        let done = Arc::new(AtomicUsize::new(0));
+        *state.progress.lock().unwrap() = Some(ProgressTracker {
+            kind,
+            total,
+            done: done.clone(),
+            started_ms: now_ms(),
+        });
+        SearchGuard(Self {
+            state: state.clone(),
+            cancel,
+            done,
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Grow the progress bar's denominator, e.g. when a retry batch starts.
+    fn add_total(&self, n: usize) {
+        let mut p = self.state.progress.lock().unwrap();
+        if let Some(pt) = p.as_mut().filter(|pt| Arc::ptr_eq(&pt.done, &self.done)) {
+            pt.total += n;
+        }
+    }
+}
+
+impl SearchGuard {
+    /// Handle for the blocking task doing the work.
+    fn task(&self) -> Search {
+        self.0.clone()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.0.cancelled()
+    }
+}
+
+impl Drop for SearchGuard {
+    fn drop(&mut self) {
+        self.0.cancel.store(true, Ordering::Relaxed);
+        let mut p = self.0.state.progress.lock().unwrap();
+        if p.as_ref()
+            .is_some_and(|pt| Arc::ptr_eq(&pt.done, &self.0.done))
+        {
+            *p = None;
+        }
+    }
 }
 
 /// Counters bucketing why candidates were rejected during a search. Returned
@@ -361,18 +436,8 @@ async fn handle_between(
     let alphas = pick_alphas(req.alternatives.max(1));
     let inner = state.0.clone();
 
-    let total = alphas.len();
-    let counter = Arc::new(AtomicUsize::new(0));
-    {
-        let mut p = inner.progress.lock().unwrap();
-        *p = Some(ProgressTracker {
-            kind: "between",
-            total,
-            done: counter.clone(),
-            started_ms: now_ms(),
-        });
-    }
-    let counter_inner = counter.clone();
+    let search = Search::begin(&inner, "between", alphas.len());
+    let task = search.task();
     let paved_only = req.paved_only;
     let elevation_samples = req.elevation_samples;
     let scored_result = tokio::task::spawn_blocking(move || -> (Vec<Scored>, Vec<String>) {
@@ -380,6 +445,9 @@ async fn handle_between(
         let mut errors: Vec<String> = Vec::new();
         let filter = RouteFilter::lax(half.max(2_000.0));
         for a in alphas {
+            if task.cancelled() {
+                break;
+            }
             let params = RouteParams {
                 modes,
                 half_width_m: half,
@@ -399,17 +467,18 @@ async fn handle_between(
                 Ok(s) => out.push(s),
                 Err((_, msg)) => errors.push(format!("α={a}: {msg}")),
             }
-            counter_inner.fetch_add(1, Ordering::Relaxed);
+            task.done.fetch_add(1, Ordering::Relaxed);
         }
         enrich_scored(inner.dem.as_ref(), &mut out, elevation_samples);
         (out, errors)
     })
     .await;
     let (scored, errors) = scored_result.map_err(AppError::internal)?;
+    if search.cancelled() {
+        return Err(AppError::cancelled());
+    }
 
     if scored.is_empty() {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
         let detail = if errors.is_empty() {
             String::new()
         } else {
@@ -429,10 +498,6 @@ async fn handle_between(
         .enumerate()
         .map(|(i, s)| scored_to_json(s, i + 1, width_m))
         .collect();
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-    }
     Ok(Json(json!({ "results": resp })))
 }
 
@@ -462,17 +527,8 @@ async fn handle_country(
     const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
     let strict = req.strict_corridor;
 
-    let counter = Arc::new(AtomicUsize::new(0));
-    {
-        let mut p = inner.progress.lock().unwrap();
-        *p = Some(ProgressTracker {
-            kind: "country",
-            total: 0,
-            done: counter.clone(),
-            started_ms: now_ms(),
-        });
-    }
-    let counter_inner = counter.clone();
+    let search = Search::begin(&inner, "country", 0);
+    let task = search.task();
     let inner_for_task = inner.clone();
     let paved_only = req.paved_only;
     let elevation_samples = req.elevation_samples;
@@ -480,6 +536,9 @@ async fn handle_country(
         let mut all: Vec<Scored> = Vec::new();
         let mut stats = RejectionStats::default();
         for batch in 0..MAX_BATCHES {
+            if task.cancelled() {
+                break;
+            }
             let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
             let sample_mul = SAMPLE_FACTORS[batch];
             // Half-width grows by half of the full-corridor delta.
@@ -518,12 +577,7 @@ async fn handle_country(
             }
             // Publish the new batch's size before evaluation so the progress
             // bar's denominator grows visibly when we retry.
-            {
-                let mut pl = inner_for_task.progress.lock().unwrap();
-                if let Some(pt) = pl.as_mut() {
-                    pt.total += candidates.len();
-                }
-            }
+            task.add_total(candidates.len());
             let results = explore::evaluate(
                 &inner_for_task.graph,
                 candidates,
@@ -531,7 +585,8 @@ async fn handle_country(
                 &params,
                 &filter,
                 long_edge,
-                Some(&counter_inner),
+                Some(&task.done),
+                Some(&task.cancel),
             );
             for r in results {
                 match r {
@@ -551,6 +606,9 @@ async fn handle_country(
     })
     .await;
     let (scored, stats) = scored_result.map_err(AppError::internal)?;
+    if search.cancelled() {
+        return Err(AppError::cancelled());
+    }
 
     // Per-section dedup: routes inside the requested corridor first, then
     // the ones the retry loop found by widening it.
@@ -565,10 +623,6 @@ async fn handle_country(
         .enumerate()
         .map(|(i, s)| scored_to_json(s, i + 1, width_m))
         .collect();
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-    }
     Ok(Json(json!({
         "seed": seed,
         "results": resp,
@@ -664,20 +718,10 @@ async fn handle_shape_search(
     const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
     let strict = req.strict_corridor;
 
-    let counter = Arc::new(AtomicUsize::new(0));
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = Some(ProgressTracker {
-            kind: "shape-search",
-            total: 0,
-            done: counter.clone(),
-            started_ms: now_ms(),
-        });
-    }
-
     let inner = state.0.clone();
+    let search = Search::begin(&inner, "shape-search", 0);
+    let task = search.task();
     let inner_for_task = inner.clone();
-    let counter_inner = counter.clone();
     let bbox = inner.bbox;
     let perimeter_km = req.perimeter_km;
     let paved_only = req.paved_only;
@@ -686,6 +730,9 @@ async fn handle_shape_search(
         let mut all: Vec<ScoredShape> = Vec::new();
         let mut stats = RejectionStats::default();
         for batch in 0..MAX_BATCHES {
+            if task.cancelled() {
+                break;
+            }
             let batch_started = std::time::Instant::now();
             let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
             let sample_mul = SAMPLE_FACTORS[batch];
@@ -719,19 +766,15 @@ async fn handle_shape_search(
             if candidates.is_empty() {
                 break; // shape doesn't fit in bbox
             }
-            {
-                let mut pl = inner_for_task.progress.lock().unwrap();
-                if let Some(pt) = pl.as_mut() {
-                    pt.total += candidates.len();
-                }
-            }
+            task.add_total(candidates.len());
             let results = explore::evaluate_shapes_with_limits(
                 &inner_for_task.graph,
                 candidates,
                 &inner_for_task.no_go,
                 &params,
                 &filter,
-                Some(&counter_inner),
+                Some(&task.done),
+                Some(&task.cancel),
                 max_leg_detour_cap,
             );
             for r in results {
@@ -760,6 +803,9 @@ async fn handle_shape_search(
     })
     .await;
     let (scored, stats) = routed.map_err(AppError::internal)?;
+    if search.cancelled() {
+        return Err(AppError::cancelled());
+    }
 
     // Dedup by center proximity, scaled to the shape's diameter so two big
     // shapes don't merge unless they really overlap.
@@ -775,10 +821,6 @@ async fn handle_shape_search(
         .enumerate()
         .map(|(i, s)| shape_to_json(s, i + 1, width_m))
         .collect();
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-    }
     Ok(Json(json!({
         "seed": seed,
         "results": resp,
@@ -826,7 +868,6 @@ async fn handle_text(
     let bbox = state.0.bbox;
     let wrap_m = if req.wrap_m > 0.0 { req.wrap_m } else { 0.0 };
 
-    let counter = Arc::new(AtomicUsize::new(0));
     // Total tracked = number of (centre, bearing) candidates the search will
     // visit. The search bumps this counter once per candidate, accept or
     // reject — gives the FE a meaningful "evaluated N/M placements" readout.
@@ -837,18 +878,9 @@ async fn handle_text(
         let n_pos = n_candidates.div_ceil(bearings).max(1);
         n_pos * bearings
     };
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = Some(ProgressTracker {
-            kind: "text",
-            total: progress_total,
-            done: counter.clone(),
-            started_ms: now_ms(),
-        });
-    }
-
     let inner = state.0.clone();
-    let counter_inner = counter.clone();
+    let search = Search::begin(&inner, "text", progress_total);
+    let task = search.task();
     let text_owned = req.text.clone();
     let placements = tokio::task::spawn_blocking(move || -> Vec<text::MessagePlacement> {
         text::search_text_placements(
@@ -862,16 +894,15 @@ async fn handle_text(
             detour_cap,
             n_candidates,
             seed,
-            Some(&counter_inner),
+            Some(&task.done),
+            Some(&task.cancel),
             &inner.no_go,
         )
     })
-    .await
-    .map_err(AppError::internal)?;
-
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
+    .await;
+    let placements = placements.map_err(AppError::internal)?;
+    if search.cancelled() {
+        return Err(AppError::cancelled());
     }
 
     // Probe layout to surface missing-glyph count.
@@ -1155,6 +1186,19 @@ async fn handle_elevations(
     Json(json!({ "ele": ele }))
 }
 
+/// Cancel the running search: the FE's Cancel button, or the tab closing.
+/// Workers notice within one candidate (one shape leg); the search's own
+/// request then answers 409.
+async fn handle_cancel(State(state): State<AppState>) -> StatusCode {
+    state
+        .0
+        .search_cancel
+        .lock()
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    StatusCode::NO_CONTENT
+}
+
 async fn handle_info(State(state): State<AppState>) -> Json<Value> {
     let b = state.0.bbox;
     let center = LatLon::new((b.lat_min + b.lat_max) * 0.5, (b.lon_min + b.lon_max) * 0.5);
@@ -1200,6 +1244,7 @@ pub fn router(state: AppState) -> Router {
         .route("/app.js", get(handle_app_js))
         .route("/api/info", get(handle_info))
         .route("/api/progress", get(handle_progress))
+        .route("/api/cancel", post(handle_cancel))
         .route("/api/between", post(handle_between))
         .route("/api/country", post(handle_country))
         .route("/api/shape-search", post(handle_shape_search))
@@ -1243,6 +1288,13 @@ impl AppError {
         Self {
             code: StatusCode::INTERNAL_SERVER_ERROR,
             msg: e.to_string(),
+        }
+    }
+    /// The search was cancelled or superseded by a newer one.
+    fn cancelled() -> Self {
+        Self {
+            code: StatusCode::CONFLICT,
+            msg: "search cancelled".into(),
         }
     }
 }

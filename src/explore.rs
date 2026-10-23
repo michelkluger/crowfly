@@ -18,7 +18,7 @@ use crate::route::{self, RouteParams, RouteResult};
 use crate::shape::{place_shape, unit_max_radius, unit_shape_perimeter, ShapeKind};
 use crate::viability::{self, NoGoZone, Report};
 use anyhow::Result;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -411,6 +411,16 @@ pub fn route_one(
     }
 }
 
+/// Error message for candidates skipped because the search was cancelled.
+pub const CANCELLED: &str = "cancelled";
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
+/// Route every candidate in parallel. Once `cancel` is set, the remaining
+/// candidates are skipped (returned as `CANCELLED` errors) without routing.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     graph: &Graph,
     candidates: Vec<Candidate>,
@@ -419,11 +429,15 @@ pub fn evaluate(
     filter: &RouteFilter,
     long_edge_threshold_m: f64,
     progress: Option<&AtomicUsize>,
+    cancel: Option<&AtomicBool>,
 ) -> Vec<Result<Scored, (Candidate, String)>> {
     use rayon::prelude::*;
     candidates
         .into_par_iter()
         .map(|c| {
+            if is_cancelled(cancel) {
+                return Err((c, CANCELLED.into()));
+            }
             let r = route_one(graph, c, no_go, params, filter, long_edge_threshold_m);
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
@@ -521,9 +535,12 @@ pub fn route_one_shape(
     params: &RouteParams,
     filter: &RouteFilter,
 ) -> Result<ScoredShape, (ShapeCandidate, String)> {
-    route_one_shape_with_limits(graph, candidate, no_go, params, filter, None)
+    route_one_shape_with_limits(graph, candidate, no_go, params, filter, None, None)
 }
 
+/// Route a shape leg by leg. Gives up early when a leg exceeds
+/// `max_leg_detour_cap`, or with `CANCELLED` when `cancel` is set — checked
+/// per leg, since one long shape can be dozens of A* runs.
 pub fn route_one_shape_with_limits(
     graph: &Graph,
     candidate: ShapeCandidate,
@@ -531,6 +548,7 @@ pub fn route_one_shape_with_limits(
     params: &RouteParams,
     filter: &RouteFilter,
     max_leg_detour_cap: Option<f64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ScoredShape, (ShapeCandidate, String)> {
     let vertices = place_shape(
         candidate.center,
@@ -552,6 +570,9 @@ pub fn route_one_shape_with_limits(
     // hugs the polyline, even if their total lengths match.
     let mut max_leg_detour: f64 = 0.0;
     for (i, w) in vertices.windows(2).enumerate() {
+        if is_cancelled(cancel) {
+            return Err((candidate, CANCELLED.into()));
+        }
         let pair = match graph.closest_connected_pair(w[0], w[1]) {
             Some(p) => p,
             None => return Err((candidate, format!("leg {}: graph empty", i + 1))),
@@ -693,9 +714,12 @@ pub fn evaluate_shapes(
     filter: &RouteFilter,
     progress: Option<&AtomicUsize>,
 ) -> Vec<Result<ScoredShape, (ShapeCandidate, String)>> {
-    evaluate_shapes_with_limits(graph, candidates, no_go, params, filter, progress, None)
+    evaluate_shapes_with_limits(
+        graph, candidates, no_go, params, filter, progress, None, None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_shapes_with_limits(
     graph: &Graph,
     candidates: Vec<ShapeCandidate>,
@@ -703,14 +727,22 @@ pub fn evaluate_shapes_with_limits(
     params: &RouteParams,
     filter: &RouteFilter,
     progress: Option<&AtomicUsize>,
+    cancel: Option<&AtomicBool>,
     max_leg_detour_cap: Option<f64>,
 ) -> Vec<Result<ScoredShape, (ShapeCandidate, String)>> {
     use rayon::prelude::*;
     candidates
         .into_par_iter()
         .map(|c| {
-            let r =
-                route_one_shape_with_limits(graph, c, no_go, params, filter, max_leg_detour_cap);
+            let r = route_one_shape_with_limits(
+                graph,
+                c,
+                no_go,
+                params,
+                filter,
+                max_leg_detour_cap,
+                cancel,
+            );
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
             }
@@ -957,6 +989,60 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_searches_skip_routing() {
+        let candidate = ShapeCandidate {
+            center: LatLon::new(0.0, 0.0),
+            kind: ShapeKind::Square,
+            perimeter_km: 4.0,
+            rotation_deg: 0.0,
+        };
+        let vertices = place_shape(
+            candidate.center,
+            candidate.kind,
+            candidate.perimeter_km,
+            candidate.rotation_deg,
+        );
+        let graph = graph_for_shape(&vertices);
+        let params = RouteParams {
+            modes: MODE_FOOT,
+            half_width_m: 200.0,
+            alpha: 4.0,
+            corridor_max_m: 200.0,
+            paved_only: false,
+        };
+        let filter = RouteFilter::lax(200.0);
+        let cancel = AtomicBool::new(true);
+
+        let shape = route_one_shape_with_limits(
+            &graph,
+            candidate.clone(),
+            &[],
+            &params,
+            &filter,
+            None,
+            Some(&cancel),
+        );
+        assert_eq!(shape.expect_err("cancelled shape").1, CANCELLED);
+        assert!(
+            route_one_shape(&graph, candidate, &[], &params, &filter).is_ok(),
+            "the same shape routes when not cancelled"
+        );
+
+        let lines = vec![Candidate::from_endpoints(vertices[0], vertices[1])];
+        let r = evaluate(
+            &graph,
+            lines,
+            &[],
+            &params,
+            &filter,
+            f64::INFINITY,
+            None,
+            Some(&cancel),
+        );
+        assert!(matches!(&r[0], Err((_, m)) if m == CANCELLED));
+    }
+
+    #[test]
     fn shape_elevation_rescore_keeps_worst_leg_penalty() {
         let candidate = ShapeCandidate {
             center: LatLon::new(0.0, 0.0),
@@ -1014,9 +1100,10 @@ mod tests {
         };
         let filter = RouteFilter::lax(200.0);
 
-        let err = route_one_shape_with_limits(&graph, candidate, &[], &params, &filter, Some(0.0))
-            .expect_err("any nonzero detour should trip zero cap")
-            .1;
+        let err =
+            route_one_shape_with_limits(&graph, candidate, &[], &params, &filter, Some(0.0), None)
+                .expect_err("any nonzero detour should trip zero cap")
+                .1;
 
         assert!(
             err.contains("shape fidelity cap"),

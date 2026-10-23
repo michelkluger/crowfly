@@ -507,14 +507,22 @@ function setBusy(busy) {
   document.getElementById('btnCancel').style.display = busy ? '' : 'none';
 }
 
+// Aborting the fetch only stops the browser waiting; /api/cancel stops the
+// server's search too. (Starting a new search also cancels the old one.)
+function cancelServerSearch() {
+  navigator.sendBeacon('/api/cancel');
+}
 document.getElementById('btnCancel').addEventListener('click', () => {
   if (inFlight) {
     inFlight.abort();
+    cancelServerSearch();
     setStatus('cancelled');
     document.getElementById('cards').innerHTML = '<div class="empty">cancelled</div>';
     hideProgress();
   }
 });
+// Closing or reloading the tab mid-search shouldn't leave the server busy.
+window.addEventListener('pagehide', () => { if (inFlight) cancelServerSearch(); });
 
 function isAbort(e) { return e && (e.name === 'AbortError' || e.message === 'cancelled'); }
 
