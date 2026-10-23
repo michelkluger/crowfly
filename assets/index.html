@@ -24,6 +24,27 @@
   </div>
   <div class="scroll">
 
+  <!-- Shared: how you travel. Every mode uses the activity; all but Text
+       (whose corridor follows the letter strokes) use the corridor. -->
+  <div class="options-group">
+    <div class="group-head"><span class="ico">⛰</span> how you travel</div>
+    <div class="options">
+      <label style="grid-column: span 2;" title="Which ways the router may use, and how it weighs them: road bikes avoid rough paths, gravel / MTB welcome tracks and trails, hikers use footpaths.">
+        activity
+        <select id="optActivity">
+          <option value="foot,bike" selected>hike + bike (mixed)</option>
+          <option value="foot">hike</option>
+          <option value="bike">road bike</option>
+          <option value="bike:paved">road bike, paved only</option>
+          <option value="bike,mtb">gravel / MTB</option>
+          <option value="foot,bike,mtb">anything (hike, bike, MTB)</option>
+        </select>
+      </label>
+      <label class="needs-corridor" style="grid-column: span 2;" title="Width of the band around the straight line that the route must stay inside, in km. Narrower = straighter but harder; wider = more leeway around lakes and peaks. If nothing fits, slightly wider alternatives are listed separately.">
+        corridor width (km) <input type="number" id="optWidth" value="8" step="0.5" min="0.5"></label>
+    </div>
+  </div>
+
   <!-- Between A/B mode -->
   <div class="mode-panel active" id="panelBetween">
     <div class="options-group">
@@ -38,8 +59,6 @@
           <span class="pin B"></span> B
           <span style="flex:1; color:#222;" id="lblB">click on map</span>
         </label>
-        <label title="How many alternative routes to return — varied by α (corridor strictness).">
-          alternatives <input type="number" id="optBetweenCount" value="3" min="1" max="6"></label>
       </div>
     </div>
     <div class="actions">
@@ -51,31 +70,13 @@
   <!-- Country mode -->
   <div class="mode-panel" id="panelCountry">
     <div class="options-group">
-      <div class="group-head"><span class="ico">⌖</span> candidates</div>
+      <div class="group-head"><span class="ico">⌖</span> lines</div>
       <div class="options">
-        <label title="How many top suggestions to keep after dedup. Country mode oversamples ~6× this number internally before ranking.">
-          count <input type="number" id="optCount" value="8" min="1" max="40"></label>
-        <label title="Country mode keeps generating new candidate batches until at least this many viable routes are found, up to 8 batches total. Defaults to `count`.">
-          min viable <input type="number" id="optMinViable" value="" min="0" placeholder="= count"></label>
-      </div>
-    </div>
-    <div class="options-group">
-      <div class="group-head"><span class="ico">↦</span> distance (km)</div>
-      <div class="options">
-        <label title="Minimum great-circle distance (km) for country-mode candidate lines.">
-          min <input type="number" id="optDmin" value="100" step="10"></label>
-        <label title="Maximum great-circle distance (km) for country-mode candidate lines. Switzerland's NW–SE diagonal is ~360 km.">
-          max <input type="number" id="optDmax" value="220" step="10"></label>
-      </div>
-    </div>
-    <div class="options-group">
-      <div class="group-head"><span class="ico">▭</span> sampling area</div>
-      <div class="options">
-        <label style="grid-column: span 2;" title="Only sample lines whose start AND end land inside the border strip, on different sides — guarantees the line crosses the country.">
-          <input type="checkbox" id="optBorder"> border-to-border only
-        </label>
-        <label title="Width of the strip near each bbox edge that counts as 'border'. Larger = more flexibility on where endpoints can land.">
-          strip km <input type="number" id="optStrip" value="25" min="5" max="100" step="5"></label>
+        <label class="choice" style="grid-column: span 2;" title="Start and end at the border, on opposite sides: every suggestion crosses the country.">
+          <input type="radio" name="countryKind" id="optCrossing" checked> cross the country, border to border</label>
+        <label class="choice" style="grid-column: span 2;" title="Lines anywhere in the region, about this long (±20 %).">
+          <input type="radio" name="countryKind" id="optAnyLength"> any line, about
+          <input type="number" id="optLength" value="150" min="5" step="10"> km</label>
       </div>
     </div>
     <div class="actions">
@@ -90,7 +91,7 @@
       <div class="group-head"><span class="ico">⬡</span> shape</div>
       <div class="options">
         <label title="Shape to trace as a closed loop.">
-          kind
+          shape
           <select id="optShape">
             <option value="circle">circle</option>
             <option value="triangle">triangle</option>
@@ -104,17 +105,8 @@
             <option value="switzerland">Switzerland (CH outline)</option>
           </select>
         </label>
-        <label title="Total perimeter of the shape, in km — i.e. the loop length. Each candidate is sized to (approximately) hit this.">
-          perim km <input type="number" id="optPerim" value="50" min="2" step="5"></label>
-      </div>
-    </div>
-    <div class="options-group">
-      <div class="group-head"><span class="ico">⌖</span> candidates</div>
-      <div class="options">
-        <label title="How many top suggestions to keep after dedup.">
-          count <input type="number" id="optShapeCount" value="8" min="1" max="40"></label>
-        <label title="Shape mode keeps generating new candidate batches until at least this many viable routes are found, up to 8 batches total. Defaults to `count`.">
-          min viable <input type="number" id="optShapeMinViable" value="" min="0" placeholder="= count"></label>
+        <label title="Length of the loop in km.">
+          length km <input type="number" id="optPerim" value="50" min="2" step="5"></label>
       </div>
     </div>
     <div class="actions">
@@ -133,26 +125,15 @@
           <textarea id="optText" rows="3" style="grid-column: 1 / -1; width: 100%;"
             placeholder="Type your message…"></textarea>
         </label>
-      </div>
-    </div>
-    <div class="options-group">
-      <div class="group-head"><span class="ico">⇲</span> size &amp; font</div>
-      <div class="options">
-        <label title="Capital-letter height in km. Below ~5 km the routed letters become hard to read because road-grid spacing dominates stroke length. Bigger = more legible.">
+        <label title="Capital-letter height in km. Bigger letters are easier to read: below ~5 km the road network is too coarse to draw them.">
           letter km <input type="number" id="optLetterKm" value="15" step="1" min="1"></label>
-        <label title="Wrap to a new line when the horizontal extent would exceed this many km. 0 disables wrapping (single long line).">
-          wrap km <input type="number" id="optWrapKm" value="100" step="10" min="0"></label>
-        <label style="grid-column: span 2;" title="Hershey vector font. Simplex is geometric and routes well. Cursive has fewer pen-up gaps but more curvature, so legibility is more sensitive to road density.">
+        <label title="Hershey vector font. Simplex is geometric and routes well; cursive has fewer pen-up gaps but more curves.">
           font
           <select id="optFont">
-            <option value="simplex" selected>simplex (clean sans)</option>
-            <option value="cursive">cursive (more connected)</option>
+            <option value="simplex" selected>simplex</option>
+            <option value="cursive">cursive</option>
           </select>
         </label>
-        <label title="A placement is accepted only if EVERY stroke routes within (intended × this). Lower = stricter shape fidelity but harder to find a viable spot. 1.6 = up to +60 % detour per stroke.">
-          detour cap <input type="number" id="optDetourCap" value="1.6" step="0.1" min="1.0"></label>
-        <label title="How many candidate placements (centre × bearing) the server tries before giving up. More = better chance of finding a spot, but slower.">
-          candidates <input type="number" id="optTextCandidates" value="200" step="50" min="20" max="1000"></label>
       </div>
     </div>
     <div class="actions">
@@ -161,37 +142,6 @@
     </div>
   </div>
 
-  <!-- Shared options, grouped -->
-  <div class="options-group">
-    <div class="group-head"><span class="ico">▱</span> corridor</div>
-    <div class="options">
-      <label title="Width of the band the route may stay within, in km. Wider = more leeway around lakes/peaks; narrower = stricter 'straight line' rule. Accepts decimals (e.g. 2.5).">
-        width km <input type="number" id="optWidth" value="8" step="0.1" min="0.1"></label>
-      <label style="grid-column: span 2;" title="When ticked, the search never widens the corridor on retry. If no route fits inside your requested corridor, you get an empty result instead of looser-corridor alternatives.">
-        <input type="checkbox" id="optStrict"> strict (no widening)
-      </label>
-    </div>
-  </div>
-  <div class="options-group">
-    <div class="group-head"><span class="ico">⛰</span> surface &amp; elevation</div>
-    <div class="options">
-      <label title="Which transport modes are allowed. The corresponding OSM ways are kept in the graph (paved roads, gravel tracks, MTB paths, etc.).">
-        modes
-        <select id="optModes">
-          <option value="foot,bike" selected>foot+bike</option>
-          <option value="foot">foot only</option>
-          <option value="bike">bike only</option>
-          <option value="bike,mtb">bike+mtb</option>
-          <option value="foot,bike,mtb">foot+bike+mtb</option>
-        </select>
-      </label>
-      <label title="Number of points in each route's elevation chart. 0 disables elevation (and the ascent term in ranking). Ascent/descent always use the full 50 m DEM profile.">
-        elev pts <input type="number" id="optElev" value="30" min="0" max="100"></label>
-      <label style="grid-column: span 2;" title="Restrict routing to paved surfaces (asphalt, concrete, paving stones). Excludes gravel, paths, unpaved tracks, and ferries — useful for road bikes.">
-        <input type="checkbox" id="optPaved"> paved roads only
-      </label>
-    </div>
-  </div>
   <div class="actions" style="border-top: 1px solid #eee;">
     <button class="btn-cancel" id="btnCancel" style="display:none;">⨯ Cancel</button>
   </div>
@@ -210,26 +160,20 @@
   <div class="scroll">
     <div id="cards"><div class="empty">Pick a mode tab on the left and run a search to see suggestions.</div></div>
     <details class="help" style="margin-top: 8px;">
-    <summary>What do these parameters mean?</summary>
+    <summary>How does it work?</summary>
     <dl>
-      <dt>corridor (m)</dt>
-      <dd>Total width of the corridor around the great-circle line A→B. The router pays a quadratic penalty for straying off the line, scaled to the corridor. <b>Smaller</b> = the route hugs the line tightly (and may fail in mountains). <b>Larger</b> = the router is allowed to detour further to find a viable path. Try 5 km for a strict line, 8–15 km for a doable one.</dd>
-      <dt>modes</dt>
-      <dd>Which OSM ways the router is allowed to use. <b>foot</b> includes paths and footways; <b>bike</b> wants surfaces a road bike tolerates; <b>mtb</b> opens up rough singletrack. Combinations widen the graph.</dd>
-      <dt>candidates</dt>
-      <dd>How many top suggestions to keep after scoring + deduplication. Country mode generates ~6× this number internally, then prunes near-duplicates so the cards you see are visually distinct lines.</dd>
-      <dt>elevation pts</dt>
-      <dd>Points in each route's elevation chart. Elevation comes from the SRTM tiles loaded at startup (<code>--dem-pack</code>), sampled every 50 m for the ascent/descent totals, so it needs no network. 0 hides elevation and drops the ascent term from ranking.</dd>
-      <dt>distance min/max km</dt>
-      <dd>Length range for country-mode candidate lines. The straight-line distance between start and end must fall in this band. Doesn't apply to "between A and B" mode.</dd>
-      <dt>border-to-border only</dt>
-      <dd>When ticked, country mode only proposes lines whose <i>start</i> and <i>end</i> both land in a strip near the country's bbox edges, on <i>different</i> sides — so every suggestion is a true country traversal. Set distance max generously (Switzerland's diagonal is ~360 km).</dd>
-      <dt>border strip km</dt>
-      <dd>How wide the "border strip" is. 25 km gives the sampler room to find graph nodes near the edge; smaller values force more extreme corner-to-corner candidates.</dd>
-      <dt>(internal) alpha</dt>
-      <dd>For "between A and B", the server runs A* with three different α values (0.5, 4, 12) to give qualitatively different alternatives — loose, balanced, strict.</dd>
-      <dt>(internal) score</dt>
-      <dd>Lower is easier. score = 100·(real_km/ref_km−1) + 5·long-edge km + 8·max-deviation km. Detour ratio dominates; long edges penalise unavoidable lake/glacier hops; max deviation flags lines that bulge wide.</dd>
+      <dt>corridor width</dt>
+      <dd>The rule of the game: the route must stay inside a band this wide around the straight line. The router follows the line as closely as the roads allow and pays a growing penalty for straying from it. Try 5 km for a strict line, 8–15 km for a doable one. If no route fits, the search tries slightly wider bands (at most +2 km) and lists those separately as <i>looser-corridor alternatives</i>.</dd>
+      <dt>activity</dt>
+      <dd>Which ways the router may use and how it weighs them. <b>Road bike</b> prefers smooth roads and avoids paths; <b>paved only</b> forbids anything unpaved. <b>Gravel / MTB</b> welcomes tracks and trails. <b>Hike</b> uses footpaths. Every activity avoids steep climbs and glaciers.</dd>
+      <dt>cross the country</dt>
+      <dd>Both ends sit at the border — the outermost roads of the loaded map — on opposite sides, so every suggestion is a true crossing. <b>Any line</b> instead samples lines anywhere, about the length you give.</dd>
+      <dt>A/B alternatives</dt>
+      <dd>Between two points you get up to three routes, from loose (shortest) to strict (hugs the line).</dd>
+      <dt>ranking</dt>
+      <dd>Lower score is easier: mostly how much longer the route is than the straight line, plus penalties for wide bulges, long ferry/lake hops and climbing. Elevation comes from the terrain data loaded at startup.</dd>
+      <dt>sharing</dt>
+      <dd>After a search, <b>copy link</b> (bottom right) gives a URL that re-runs exactly the same search.</dd>
     </dl>
   </details>
   </div><!-- /.scroll -->

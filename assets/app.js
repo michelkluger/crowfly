@@ -170,6 +170,7 @@ map.on('load', async () => {
     if (info.bbox) {
       map.fitBounds([[info.bbox[0], info.bbox[1]], [info.bbox[2], info.bbox[3]]],
                     { padding: 30, duration: 0 });
+      applyRegionDefaults(info.bbox);
     }
     setStatus(`graph ready — ${info.graph_nodes.toLocaleString()} nodes`);
   } catch (e) {
@@ -209,6 +210,7 @@ map.on('click', (e) => {
 
 function switchMode(mode) {
   currentMode = mode;
+  document.getElementById('left').dataset.mode = mode;
   document.querySelectorAll('.tabs button').forEach(b =>
     b.classList.toggle('active', b.dataset.mode === mode));
   document.getElementById('panelBetween').classList.toggle('active', mode === 'between');
@@ -250,41 +252,78 @@ document.getElementById('clearAB').addEventListener('click', () => {
   fmtAB();
 });
 
+// Points in each route's elevation chart. Climb totals always come from the
+// full 50 m terrain profile, and the ascent term is always part of ranking.
+const CHART_POINTS = 60;
+
+// The activity select encodes API modes, plus ":paved" for paved-only.
+function activity() {
+  const [modes, flag] = document.getElementById('optActivity').value.split(':');
+  return { modes, paved_only: flag === 'paved' };
+}
+
 function commonPayload() {
   // optWidth is in km on the form; the API takes metres.
   const widthKm = parseFloat(document.getElementById('optWidth').value);
   return {
+    ...activity(),
     width_m: Math.round((Number.isFinite(widthKm) ? widthKm : 0) * 1000),
-    modes: document.getElementById('optModes').value,
-    elevation_samples: +document.getElementById('optElev').value,
-    paved_only: document.getElementById('optPaved').checked,
-    strict_corridor: document.getElementById('optStrict').checked,
+    elevation_samples: CHART_POINTS,
   };
 }
 
-// Persist all sidebar inputs to localStorage so a refresh keeps the user's
-// last-used corridor / modes / distance / etc. The schema is just `id ↦ value`
-// over every input/select inside `.options`.
+// Persist the sidebar inputs to localStorage so a refresh keeps the user's
+// last-used settings. The schema is just `id ↦ value` (checked state for
+// checkboxes and radios).
 const PARAM_IDS = [
-  'optWidth','optModes','optCount','optBetweenCount','optShapeCount',
-  'optElev','optDmin','optDmax',
-  'optBorder','optStrip','optMinViable','optShapeMinViable','optPaved','optStrict',
+  'optActivity','optWidth',
+  'optCrossing','optAnyLength','optLength',
   'optShape','optPerim',
-  'optText','optLetterKm','optWrapKm','optFont','optDetourCap','optTextCandidates',
+  'optText','optLetterKm','optFont',
 ];
+const isToggle = el => el.type === 'checkbox' || el.type === 'radio';
+function setInput(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (isToggle(el)) el.checked = value === true || value === '1';
+  else {
+    el.value = value;
+    // A value the select doesn't offer leaves it empty: keep the default.
+    if (el.tagName === 'SELECT' && el.value === '') el.selectedIndex = 0;
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+}
+// Map settings from before the simplified UI (saved state or old links) onto
+// the current inputs: modes + paved-only → activity, the border checkbox and
+// distance range → crossing / any-line length.
+function migrateParams(get) {
+  const on = x => x === true || x === '1';
+  const out = {};
+  const modes = get('optModes');
+  if (modes != null && get('optActivity') == null) {
+    out.optActivity = on(get('optPaved')) && modes.includes('bike') ? 'bike:paved' : modes;
+  }
+  const border = get('optBorder');
+  if (border != null && get('optCrossing') == null) {
+    out.optCrossing = on(border);
+    out.optAnyLength = !on(border);
+    const lo = parseFloat(get('optDmin')), hi = parseFloat(get('optDmax'));
+    if (Number.isFinite(lo) && Number.isFinite(hi)) out.optLength = String(Math.round((lo + hi) / 2));
+  }
+  return out;
+}
+// Inputs restored from saved state; region defaults leave these alone.
+const restored = new Set();
 function loadParams() {
   try {
     const raw = localStorage.getItem('crowfly:params');
     if (!raw) return;
     const v = JSON.parse(raw);
+    Object.assign(v, migrateParams(k => v[k]));
     for (const id of PARAM_IDS) {
-      const el = document.getElementById(id);
-      if (!el || !(id in v)) continue;
-      if (el.type === 'checkbox') el.checked = !!v[id];
-      else el.value = v[id];
-      // Fire `input` so live-display side effects (rotation slider readout)
-      // refresh after restore.
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      if (!(id in v)) continue;
+      setInput(id, v[id]);
+      restored.add(id);
     }
     if (typeof v.__mode === 'string' && ['between','country','shape','text'].includes(v.__mode)) {
       switchMode(v.__mode);
@@ -294,18 +333,35 @@ function loadParams() {
     const wEl = document.getElementById('optWidth');
     if (wEl && parseFloat(wEl.value) >= 200) {
       wEl.value = (parseFloat(wEl.value) / 1000).toString();
-      saveParams();
     }
+    saveParams();
   } catch (_) { /* ignore corrupt state */ }
 }
 function saveParams() {
   const v = { __mode: currentMode };
   for (const id of PARAM_IDS) {
     const el = document.getElementById(id);
-    if (!el) continue;
-    v[id] = el.type === 'checkbox' ? el.checked : el.value;
+    if (el) v[id] = isToggle(el) ? el.checked : el.value;
   }
   try { localStorage.setItem('crowfly:params', JSON.stringify(v)); } catch (_) {}
+}
+// Size-dependent defaults (line length, loop length, letter height) suit the
+// loaded region instead of Switzerland: a 150 km line or 15 km letters can't
+// fit Liechtenstein. Only inputs the user hasn't set are touched.
+function applyRegionDefaults(bbox) {
+  const [w, s, e, n] = bbox;
+  const midLat = (s + n) / 2 * Math.PI / 180;
+  const widthKm = (e - w) * 111.32 * Math.cos(midLat), heightKm = (n - s) * 110.57;
+  const [small, large] = [Math.min(widthKm, heightKm), Math.max(widthKm, heightKm)];
+  const round5 = x => Math.max(5, Math.round(x / 5) * 5);
+  const defaults = {
+    optLength: round5(0.4 * large),
+    optPerim: Math.min(50, round5(0.6 * small)),
+    optLetterKm: Math.min(15, Math.max(2, Math.round(small / 4))),
+  };
+  for (const [id, value] of Object.entries(defaults)) {
+    if (!restored.has(id)) setInput(id, String(value));
+  }
 }
 loadParams();
 for (const id of PARAM_IDS) {
@@ -318,13 +374,10 @@ for (const id of PARAM_IDS) {
 // re-runs the same search; same seed + same graph gives identical results,
 // since candidate sampling is the only randomness.
 const LINK_PARAMS = {
-  between: ['optWidth','optModes','optElev','optPaved','optBetweenCount'],
-  country: ['optWidth','optModes','optElev','optPaved','optStrict',
-            'optCount','optDmin','optDmax','optBorder','optStrip','optMinViable'],
-  shape:   ['optWidth','optModes','optElev','optPaved','optStrict',
-            'optShape','optPerim','optShapeCount','optShapeMinViable'],
-  text:    ['optModes','optElev','optPaved',
-            'optText','optLetterKm','optWrapKm','optFont','optDetourCap','optTextCandidates'],
+  between: ['optActivity','optWidth'],
+  country: ['optActivity','optWidth','optCrossing','optAnyLength','optLength'],
+  shape:   ['optActivity','optWidth','optShape','optPerim'],
+  text:    ['optActivity','optText','optLetterKm','optFont'],
 };
 const RUN_BUTTON = { between: 'btnBetween', country: 'btnCountry', shape: 'btnShapeSearch', text: 'btnText' };
 // Seed from an opened permalink, consumed by the next search request.
@@ -342,7 +395,7 @@ function linkSnapshot() {
   const q = new URLSearchParams({ mode: currentMode });
   for (const id of LINK_PARAMS[currentMode]) {
     const el = document.getElementById(id);
-    if (el) q.set(id, el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value);
+    if (el) q.set(id, isToggle(el) ? (el.checked ? '1' : '0') : el.value);
   }
   if (currentMode === 'between' && A && B) {
     q.set('a', fmtLink(A));
@@ -372,12 +425,10 @@ function runLink() {
   const mode = q.get('mode');
   if (!Object.hasOwn(LINK_PARAMS, mode)) return;
   switchMode(mode);
+  const values = Object.fromEntries(q);
+  Object.assign(values, migrateParams(k => values[k]));
   for (const id of LINK_PARAMS[mode]) {
-    const el = document.getElementById(id);
-    if (!el || !q.has(id)) continue;
-    if (el.type === 'checkbox') el.checked = q.get(id) === '1';
-    else el.value = q.get(id);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
+    if (id in values) setInput(id, values[id]);
   }
   saveParams();
   if (mode === 'between') {
@@ -507,7 +558,6 @@ document.getElementById('btnBetween').addEventListener('click', async () => {
       ...commonPayload(),
       start: [A[1], A[0]],
       end:   [B[1], B[0]],
-      alternatives: +document.getElementById('optBetweenCount').value,
     });
     renderResults(j.results, j.failures);
     setStatus(`got ${j.results.length} alternatives` + publishLink(link));
@@ -525,9 +575,6 @@ document.getElementById('btnText').addEventListener('click', async () => {
     return;
   }
   const letterKm = parseFloat(document.getElementById('optLetterKm').value);
-  const wrapKm   = parseFloat(document.getElementById('optWrapKm').value);
-  const detour   = parseFloat(document.getElementById('optDetourCap').value);
-  const cands    = parseInt(document.getElementById('optTextCandidates').value, 10);
   const teaser = text.length > 32 ? text.slice(0, 32) + '…' : text;
   const link = linkSnapshot();
   setStatus(`<span class="spinner"></span> searching for a place to write "${teaser}"…`);
@@ -535,16 +582,14 @@ document.getElementById('btnText').addEventListener('click', async () => {
   showProgress('searching placements…');
   startProgressPoll();
   try {
+    // Line wrapping, the per-stroke detour cap and the placement budget use
+    // the server's defaults (wrap fits the region's width).
     const j = await postJson('/api/text', {
-      modes: document.getElementById('optModes').value,
-      elevation_samples: +document.getElementById('optElev').value,
-      paved_only: document.getElementById('optPaved').checked,
+      ...activity(),
+      elevation_samples: CHART_POINTS,
       text,
       letter_height_m: Math.round((Number.isFinite(letterKm) ? letterKm : 15) * 1000),
-      wrap_m:          Math.round((Number.isFinite(wrapKm)   ? wrapKm   : 0)  * 1000),
       font: document.getElementById('optFont').value,
-      detour_cap: Number.isFinite(detour) && detour >= 1.0 ? detour : 1.6,
-      candidates: Number.isFinite(cands) && cands > 0 ? cands : 200,
       ...takeLinkSeed(),
     });
     renderResults(j.results, j.failures);
@@ -552,7 +597,7 @@ document.getElementById('btnText').addEventListener('click', async () => {
     if (j.results.length === 0) {
       const m = j.text_render_meta || {};
       const evald = m.evaluated || 0;
-      const hint = m.hint || 'try larger letter km, shorter text, or higher detour cap';
+      const hint = m.hint || 'try bigger letters or a shorter message';
       setStatus(`no viable placement after ${evald} candidates — ${hint}` + linkHtml);
     } else {
       const r = j.results[0];
@@ -582,13 +627,10 @@ document.getElementById('btnShapeSearch').addEventListener('click', async () => 
   showProgress(`searching ${kind}s…`);
   startProgressPoll();
   try {
-    const minViableRaw = document.getElementById('optShapeMinViable').value.trim();
     const j = await postJson('/api/shape-search', {
       ...commonPayload(),
       kind,
       perimeter_km: perim,
-      count: +document.getElementById('optShapeCount').value,
-      ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
       ...takeLinkSeed(),
     });
     renderResults(j.results, j.failures);
@@ -608,15 +650,16 @@ document.getElementById('btnCountry').addEventListener('click', async () => {
   showProgress('preparing candidates…');
   startProgressPoll();
   try {
-    const minViableRaw = document.getElementById('optMinViable').value.trim();
+    // Crossings are bounded by the country; other lines get ±20 % around the
+    // requested length.
+    const crossing = document.getElementById('optCrossing').checked;
+    const lengthKm = parseFloat(document.getElementById('optLength').value);
+    const span = crossing ? { border_to_border: true }
+      : Number.isFinite(lengthKm) && lengthKm > 0
+        ? { distance_min_km: 0.8 * lengthKm, distance_max_km: 1.2 * lengthKm } : {};
     const j = await postJson('/api/country', {
       ...commonPayload(),
-      count: +document.getElementById('optCount').value,
-      distance_min_km: +document.getElementById('optDmin').value,
-      distance_max_km: +document.getElementById('optDmax').value,
-      border_to_border: document.getElementById('optBorder').checked,
-      border_strip_km: +document.getElementById('optStrip').value,
-      ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
+      ...span,
       ...takeLinkSeed(),
     });
     renderResults(j.results, j.failures);
@@ -823,24 +866,26 @@ function renderResults(rs, failures) {
 
 function failuresHtml(f) {
   if (!f || !f.total) {
-    return '<div class="empty">no viable routes — try relaxing the corridor or modes</div>';
+    return '<div class="empty">no viable routes — try a wider corridor or another activity</div>';
   }
   // Diagnostic strings for each bucket: short label + a one-line hint of what
   // to change. Order matters — most actionable first.
   const items = [];
   const push = (n, label, hint) => { if (n > 0) items.push({ n, label, hint }); };
   push(f.snap_too_far,      'endpoints too far from any road',
-       'move endpoints, widen the corridor, or enable extra modes (foot opens up paths)');
+       'move the endpoints, widen the corridor, or pick an activity with more ways (hike opens up paths)');
   push(f.corridor_violated, 'best route bulged outside the corridor',
        'widen the corridor — these would be reachable with a wider band');
-  push(f.no_route,          'no path through the graph',
-       'mountain barriers / lakes — try wider corridor or relax mode mask (mtb opens trails)');
+  push(f.no_route,          'no path within the corridor',
+       'mountains or lakes in the way — widen the corridor, or pick an activity with more ways (gravel / MTB opens trails)');
+  push(f.too_winding,       'a side of the shape had to detour too far',
+       'try a wider corridor, a different length, or an activity with more ways');
   push(f.no_go,             'route crossed a no-go zone',
        'remove the matching no-go file or move endpoints around it');
-  push(f.too_short,         'routed shorter than your distance min',
-       'lower distance min, or pick endpoints further apart');
-  push(f.too_long,          'routed longer than your distance max',
-       'raise distance max, or pick endpoints closer together');
+  push(f.too_short,         'route shorter than the requested length',
+       'ask for a shorter line');
+  push(f.too_long,          'route longer than the requested length',
+       'ask for a longer line, or widen the corridor so the route needs fewer detours');
   push(f.other,             'other rejection',
        'check server logs for the exact reason');
 

@@ -71,6 +71,10 @@
   }
   .options input[type="number"] { width: 62px; padding: 2px 4px; font-size: 12px; }
   .options select { font-size: 12px; padding: 2px 2px; }
+  .options label.choice { justify-content: flex-start; color: #333; }
+  .options label.choice input[type="number"] { width: 56px; }
+  /* Text mode draws its own corridor around each letter stroke. */
+  #left[data-mode="text"] .needs-corridor { display: none; }
   .options-group {
     background: #fff; border-bottom: 1px solid #eee;
   }

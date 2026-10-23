@@ -32,26 +32,34 @@ cargo build --release
 
 In the browser:
 
-1. Click the map to drop **A** (blue), click again for **B** (red), then hit
-   **"Find routes between A and B"** — you get up to 3 alternatives that vary
-   in corridor strictness.
-2. Or just hit **"Suggest routes across the country"** — server samples
-   diverse start/end pairs nationwide, scores them, returns the easiest N as
-   cards.
-3. Tick **"border-to-border only"** to restrict country mode to lines whose
-   endpoints both land near opposite bbox edges (true country traversals).
-4. **⨯ Cancel** stops a running search, on the server too (within about one
+1. Pick how you travel — **activity** (hike, road bike, paved only, gravel /
+   MTB, …) and **corridor width** — then a mode tab.
+2. **A/B**: click the map to drop **A** (blue), click again for **B** (red),
+   then hit **"Find routes A → B"** — up to 3 alternatives, from loose to
+   strict.
+3. **Country**: **cross the country** (default) suggests lines from border to
+   border on opposite sides — the endpoints are the outermost roads of the
+   loaded map, so every suggestion is a real crossing. **Any line, about N
+   km** samples lines anywhere instead. The 8 easiest come back as cards;
+   if nothing fits the corridor, slightly wider-corridor alternatives are
+   listed separately.
+4. **Shapes** traces a loop (circle, heart, Swiss outline, …) of a given
+   length; **Text** writes a message with routes. Lengths and letter sizes
+   default to fit the loaded region.
+5. **⨯ Cancel** stops a running search, on the server too (within about one
    route calculation). Starting a new search, or closing the tab, also
    cancels the running one.
-5. Click any card → it highlights on the map. **⬇ GPX** downloads that
+6. Click any card → it highlights on the map. **⬇ GPX** downloads that
    specific candidate as a GPX track, with DEM elevations (`<ele>`), a
    descriptive name, and a link back to the search.
-6. After each search the URL records the mode, inputs, A/B and random seed
+7. After each search the URL records the mode, inputs, A/B and random seed
    (**copy link** in the status bar). Opening it re-runs the same search with
    the same results, as long as the server has the same graph loaded.
 
-The **"What do these parameters mean?"** drawer in the side panel explains
-every option (`corridor`, `modes`, `alpha`, `score`, ...).
+The **"How does it work?"** drawer in the right panel explains the corridor,
+activities, crossings and ranking. Search tuning (candidate counts, retry
+batches, text wrapping, …) uses fixed defaults; the HTTP API still accepts
+those fields (see the request structs in `src/server.rs`).
 
 ## CLI
 

@@ -531,24 +531,18 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             Ok((g, dem))
         })
         .await??;
-        let real_bbox = graph.bbox();
+        let state = crowfly::server::ServerState::new(graph, no_go, args.long_edge_threshold, dem);
+        let b = state.bbox;
         eprintln!(
-            "Graph ready: {} nodes; bbox [{:.3},{:.3}]×[{:.3},{:.3}]",
-            graph.graph.node_count(),
-            real_bbox.lat_min,
-            real_bbox.lat_max,
-            real_bbox.lon_min,
-            real_bbox.lon_max
+            "Graph ready: {} nodes; bbox [{:.3},{:.3}]×[{:.3},{:.3}]; {} outline points",
+            state.graph.graph.node_count(),
+            b.lat_min,
+            b.lat_max,
+            b.lon_min,
+            b.lon_max,
+            state.outline.len()
         );
-        let state = crowfly::server::AppState(std::sync::Arc::new(crowfly::server::ServerState {
-            graph,
-            bbox: real_bbox,
-            no_go,
-            long_edge_threshold_m: args.long_edge_threshold,
-            dem,
-            progress: std::sync::Mutex::new(None),
-            search_cancel: Default::default(),
-        }));
+        let state = crowfly::server::AppState(std::sync::Arc::new(state));
         crowfly::server::serve(state, &args.bind).await
     })
 }
