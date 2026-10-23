@@ -52,6 +52,8 @@ pub const BATTR_DESIGNATED: u8 = 1 << 4;
 /// way-level tags, which is what most local OSM mappers set on signed routes.
 pub const BATTR_CYCLE_NETWORK: u8 = 1 << 5;
 
+/// Per-edge routing data. There is one per graph edge (~17M for
+/// Switzerland), so every byte counts: this packs into 16.
 #[derive(Copy, Clone, Debug)]
 pub struct EdgeData {
     pub length_m: f64,
@@ -63,7 +65,6 @@ pub struct EdgeData {
     /// and harmless because `route.rs` only consults this byte when bike or
     /// mtb is in the active mode mask.
     pub bike_attrs: u8,
-    pub way_id: i64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -120,7 +121,6 @@ impl rstar::PointDistance for NodePoint {
 
 pub struct Graph {
     pub graph: UnGraph<LatLon, EdgeData>,
-    pub osm_to_idx: FxHashMap<i64, NodeIndex>,
     /// Per-NodeIndex component representative. Computed once at build time so
     /// every routing query is O(1) for "which component is this node in".
     pub components: Vec<u32>,
@@ -484,7 +484,7 @@ where
     // surface. Also collect glacier boundary ways so we can skip edges that
     // cross them — glaciers aren't passable terrain even if a path is tagged
     // through them.
-    let mut keep_ways: Vec<(i64, Vec<i64>, u8, u8, u8)> = Vec::new();
+    let mut keep_ways: Vec<(Vec<i64>, u8, u8, u8)> = Vec::new();
     let mut glacier_ways: Vec<Vec<i64>> = Vec::new();
     let mut glacier_relation_way_nodes: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
     let mut needed_nodes: FxHashSet<i64> = FxHashSet::default();
@@ -532,7 +532,7 @@ where
                 for n in &nodes {
                     needed_nodes.insert(*n);
                 }
-                keep_ways.push((w.id.0, nodes, m, s, ba));
+                keep_ways.push((nodes, m, s, ba));
             }
         }
         pb.finish_with_message(format!(
@@ -590,8 +590,14 @@ where
     }
 
     eprintln!("Building graph (final edge filter)");
-    let mut graph: UnGraph<LatLon, EdgeData> =
-        UnGraph::with_capacity(node_pos.len(), node_pos.len() * 2);
+    // Every kept way segment is at most one edge, so this bounds the edge
+    // count tightly (a node-based guess reserved ~2× too many).
+    let max_edges: usize = keep_ways
+        .iter()
+        .map(|(nodes, ..)| nodes.len().saturating_sub(1))
+        .sum();
+    let mut graph: UnGraph<LatLon, EdgeData> = UnGraph::with_capacity(node_pos.len(), max_edges);
+    // OSM id → graph node, only needed while wiring edges.
     let mut osm_to_idx: FxHashMap<i64, NodeIndex> =
         FxHashMap::with_capacity_and_hasher(node_pos.len(), Default::default());
 
@@ -610,7 +616,7 @@ where
 
     let mut edges_added = 0usize;
     let mut edges_skipped_glacier = 0usize;
-    for (way_id, nodes, modes, surface, bike_attrs) in &keep_ways {
+    for (nodes, modes, surface, bike_attrs) in &keep_ways {
         for w in nodes.windows(2) {
             let (Some(p0), Some(p1)) = (node_pos.get(&w[0]).copied(), node_pos.get(&w[1]).copied())
             else {
@@ -638,12 +644,16 @@ where
                     modes: *modes,
                     surface: *surface,
                     bike_attrs: *bike_attrs,
-                    way_id: *way_id,
                 },
             );
             edges_added += 1;
         }
     }
+    // Free the build-time tables before the R-tree bulk load, which is the
+    // next big allocation (these are ~16M-entry maps for Switzerland).
+    drop(osm_to_idx);
+    drop(node_pos);
+    drop(keep_ways);
 
     eprintln!(
         "Graph built: {} nodes, {} edges ({} skipped over glaciers)",
@@ -657,7 +667,6 @@ where
 
     Ok(Graph {
         graph,
-        osm_to_idx,
         components,
         rtree,
         elevations_m: None,
@@ -853,18 +862,23 @@ mod tests {
                     modes: MODE_FOOT,
                     surface: SURFACE_PAVED,
                     bike_attrs: BCLASS_RESIDENTIAL,
-                    way_id: 1,
                 },
             );
         }
         let (components, rtree) = Graph::build_aux(&g);
         Graph {
             graph: g,
-            osm_to_idx: rustc_hash::FxHashMap::default(),
             components,
             rtree,
             elevations_m: None,
         }
+    }
+
+    #[test]
+    fn edge_data_stays_compact() {
+        // One per graph edge (~17M for Switzerland): 8 more bytes here is
+        // ~130 MB of RAM.
+        assert_eq!(std::mem::size_of::<EdgeData>(), 16);
     }
 
     #[test]
