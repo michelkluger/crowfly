@@ -10,28 +10,29 @@
 //! prunes the A* frontier to the corridor envelope, which is the dominant
 //! perf win for tight corridors over a country-sized graph.
 //!
-//! We use a custom A* with FxHash-backed score maps + lazy deletion, instead
-//! of petgraph::algo::astar. petgraph's astar uses std::HashMap (SipHash) and
-//! a separate visit map; on a 16M-node graph the hashing dominates the
-//! routing inner loop.
+//! We use a custom A* with FxHash-backed state + lazy deletion, instead of
+//! petgraph::algo::astar: on a 16M-node graph the hashing and heap traffic
+//! dominate the routing inner loop.
 //!
 //! Inner-loop economics (in rough order of importance):
 //! - The heuristic is scaled to the *tightest admissible* bound, computed
 //!   from the actual multiplier tables. A slack heuristic inflates the
 //!   explored ellipse quadratically, so this is the dominant lever on search
 //!   size for bike/mtb routing.
-//! - Per-node state (g, cached h, parent) lives in one FxHashMap so each
-//!   relaxation costs a single hash probe, and heap entries carry their g so
-//!   stale entries are detected without recomputing the heuristic on pop.
-//! - Signed cross-track deviation is cached per node; an edge's midpoint
-//!   deviation is the mean of its endpoint deviations (the deviation field
-//!   is smooth — centimetre-level error at OSM edge lengths), which converts
-//!   ~2.6 spherical cross-track evaluations per relaxed edge into ~1 per
-//!   visited node.
-//! - Turn-penalty bearings use the tangent-plane approximation and the
-//!   incoming bearing is memoized per expansion, so the typical relaxed edge
-//!   pays one cos + one atan2 of bearing math instead of two full
-//!   great-circle bearings.
+//! - A* only stops at nodes where the route can branch (`Graph::is_junction`,
+//!   plus the start and end). ~84 % of OSM nodes are mid-road shape points
+//!   with exactly two neighbours; since U-turns are forbidden, a route that
+//!   enters such a chain must follow it, so the search walks each chain in
+//!   one go — charging every edge as before — instead of pushing every shape
+//!   point through the heap and the hash map (~6× fewer of each).
+//! - Per-stop-node state (g, cached h, walk origin) lives in one FxHashMap
+//!   so each relaxation costs a single hash probe, and heap entries carry
+//!   their g so stale entries are detected without recomputing h on pop.
+//! - An edge's midpoint deviation is the mean of its endpoint deviations
+//!   (the deviation field is smooth — centimetre-level error at OSM edge
+//!   lengths), so a walk evaluates one spherical cross-track per node.
+//! - Turn-penalty bearings use the tangent-plane approximation: one cos +
+//!   one atan2 per edge instead of two full great-circle bearings.
 
 use crate::geodesy::{fast_bearing_rad, CrossTrack, HaversineToTarget, LatLon};
 use crate::osm::{
@@ -41,7 +42,7 @@ use crate::osm::{
     SURFACE_GRAVEL, SURFACE_OTHER, SURFACE_PATH, SURFACE_PAVED, SURFACE_UNPAVED,
 };
 use anyhow::{anyhow, Result};
-use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::graph::{EdgeIndex, EdgeReference, NodeIndex};
 use petgraph::visit::EdgeRef;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
@@ -109,11 +110,7 @@ impl Ord for Frontier {
             .f
             .partial_cmp(&self.f)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                self.g
-                    .partial_cmp(&other.g)
-                    .unwrap_or(Ordering::Equal)
-            })
+            .then_with(|| self.g.partial_cmp(&other.g).unwrap_or(Ordering::Equal))
             .then_with(|| self.node.index().cmp(&other.node.index()))
     }
 }
@@ -124,137 +121,20 @@ impl PartialOrd for Frontier {
     }
 }
 
-/// Per-node search state: best-known g, cached heuristic, and the
-/// predecessor on the best-known path. One map instead of separate
-/// g_score/came_from halves the hash probes in the relaxation loop, and the
-/// cached h means re-improving an already-seen node never recomputes the
-/// heuristic.
+/// Search state of a node A* stops at: best-known g, cached heuristic, and
+/// the walk that achieved it. One map entry per stop node keeps each
+/// relaxation to a single hash probe, and the cached h means re-improving a
+/// node never recomputes the heuristic.
 struct NodeState {
     g: f64,
     h: f64,
-    /// Predecessor on the best-known path; `parent == self` marks the start.
-    parent: NodeIndex,
-}
-
-/// Custom A* over an undirected graph with f64 edge costs and a lower-bound
-/// heuristic. Returns `(total_cost, path)` on success. Edge costs that return
-/// non-finite (∞ / NaN) are treated as forbidden and skipped.
-///
-/// `edge_cost` receives the predecessor node (if any) so the cost function
-/// can charge a turn penalty against the (prev → node → next) angle. We use
-/// the *current* `came_from[node]` at expansion time rather than augmenting
-/// the search state with the predecessor — this is a greedy approximation
-/// (a node's `came_from` may later be revised by a cheaper path), but in
-/// practice the heuristic-driven A* converges quickly on the canonical
-/// predecessor and the smoothing benefit dominates the optimality gap. Full
-/// (node, prev_edge) state augmentation would multiply the state space ~10×
-/// at marginal quality gain.
-///
-/// `start_prev` is a virtual predecessor of `start` — set by `route_loop` so
-/// the turn-penalty and U-turn-forbid extend across leg boundaries. It is
-/// *not* added to `came_from`, so the reconstructed path correctly starts at
-/// `start`.
-fn astar_fx<F, H>(
-    graph: &UnGraph<LatLon, EdgeData>,
-    start: NodeIndex,
-    end: NodeIndex,
-    start_prev: Option<NodeIndex>,
-    mut edge_cost: F,
-    mut heuristic: H,
-) -> Option<(f64, Vec<NodeIndex>)>
-where
-    F: FnMut(petgraph::graph::EdgeReference<'_, EdgeData>, Option<NodeIndex>) -> f64,
-    H: FnMut(NodeIndex) -> f64,
-{
-    // Pre-size for a mid-size corridor search; covers the first ~10 growth
-    // rehashes for the price of one 100 KB allocation.
-    let mut state: FxHashMap<NodeIndex, NodeState> =
-        FxHashMap::with_capacity_and_hasher(1 << 12, Default::default());
-    let mut open: BinaryHeap<Frontier> = BinaryHeap::with_capacity(1 << 10);
-
-    let h_start = heuristic(start);
-    state.insert(
-        start,
-        NodeState {
-            g: 0.0,
-            h: h_start,
-            parent: start,
-        },
-    );
-    open.push(Frontier {
-        f: h_start,
-        g: 0.0,
-        node: start,
-    });
-
-    while let Some(Frontier { f: _, g, node }) = open.pop() {
-        let (cur_g, parent) = match state.get(&node) {
-            Some(st) => (st.g, st.parent),
-            None => continue,
-        };
-        // Lazy deletion: if the node's g improved after this entry was
-        // pushed, a fresher entry (with lower f) has already been processed
-        // or sits earlier in the heap.
-        if g > cur_g {
-            continue;
-        }
-        if node == end {
-            let mut path = vec![node];
-            let mut cur = node;
-            while cur != start {
-                let prev = state[&cur].parent;
-                path.push(prev);
-                cur = prev;
-            }
-            path.reverse();
-            return Some((cur_g, path));
-        }
-        // For the start node, fall back to the caller-supplied `start_prev`
-        // (if any). For every other node use the recorded predecessor.
-        let prev = if node == start { start_prev } else { Some(parent) };
-        for er in graph.edges(node) {
-            let next = er.target();
-            // Disallow immediate U-turn back to predecessor on multi-edge
-            // graphs — keeps the path topologically simple. Also extends
-            // across leg boundaries via start_prev.
-            if Some(next) == prev {
-                continue;
-            }
-            let cost = edge_cost(er, prev);
-            if !cost.is_finite() {
-                continue;
-            }
-            let tentative = cur_g + cost;
-            match state.entry(next) {
-                std::collections::hash_map::Entry::Occupied(mut oe) => {
-                    let st = oe.get_mut();
-                    if tentative < st.g {
-                        st.g = tentative;
-                        st.parent = node;
-                        open.push(Frontier {
-                            f: tentative + st.h,
-                            g: tentative,
-                            node: next,
-                        });
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(ve) => {
-                    let h = heuristic(next);
-                    ve.insert(NodeState {
-                        g: tentative,
-                        h,
-                        parent: node,
-                    });
-                    open.push(Frontier {
-                        f: tentative + h,
-                        g: tentative,
-                        node: next,
-                    });
-                }
-            }
-        }
-    }
-    None
+    /// Origin of the walk that last improved this node (`start` for itself).
+    from: NodeIndex,
+    /// That walk's first edge; None for `start`.
+    via: Option<EdgeIndex>,
+    /// Node just before this one on the best path — the turn-penalty and
+    /// U-turn reference for leaving it. `start_prev` for `start`.
+    prev: Option<NodeIndex>,
 }
 
 /// Splice out near-revisits: subsequences where the polyline returns within
@@ -679,14 +559,6 @@ pub fn shortest_with_start_prev(
         c
     };
 
-    let elev_for =
-        |s: petgraph::graph::NodeIndex, t: petgraph::graph::NodeIndex| -> Option<(f32, f32)> {
-            let el = elevations?;
-            let zs = *el.get(s.index())?;
-            let zt = *el.get(t.index())?;
-            Some((zs, zt))
-        };
-
     // Tightest admissible heuristic scale: the lowest possible cost of
     // covering one metre of great-circle distance. The multiplicative
     // bonuses can price an edge slightly below its physical length
@@ -707,129 +579,209 @@ pub fn shortest_with_start_prev(
     } else {
         1.0
     };
-    // Signed per-node corridor deviation, computed lazily. Keyed by node
-    // because A* touches each node through several incident edges; see the
-    // module docs for the midpoint-vs-endpoint-mean equivalence argument.
-    let mut dev_cache: FxHashMap<NodeIndex, f64> = FxHashMap::default();
-    let mut dev_of = move |n: NodeIndex, p: LatLon| -> f64 {
-        *dev_cache.entry(n).or_insert_with(|| xt.signed(p))
+    let elev_at = |n: NodeIndex| -> f32 {
+        elevations
+            .and_then(|el| el.get(n.index()).copied())
+            .unwrap_or(f32::NAN)
     };
-    // One-slot memo for the incoming bearing: astar_fx relaxes all edges of
-    // a node consecutively, so (prev, node) is constant across that burst.
-    let mut b_in_memo: Option<(NodeIndex, NodeIndex, f64)> = None;
-    // One-slot memo for the expanded node's position, deviation, and
-    // elevation: petgraph orients every EdgeReference from `edges(n)` with
-    // `source() == n`, so within one expansion burst this hits on every edge
-    // after the first, skipping the node-weight lookup, the dev-cache hash
-    // probe, and one random access into the elevation array. Elevation is
-    // NaN when no DEM is loaded — same "no data" path the cost fn already
-    // takes for nodes outside tile coverage.
-    let mut src_memo: Option<(NodeIndex, LatLon, f64, f32)> = None;
-    let result = astar_fx(
-        g,
-        start,
-        end,
-        start_prev,
-        |er, prev_node| {
+    // Incoming bearing for the turn penalty when leaving `at` having arrived
+    // from `before`; None without a predecessor, for foot-only routing, or
+    // after a zero-length segment.
+    let bearing_in = |before: Option<NodeIndex>, at: LatLon| -> Option<f64> {
+        if !turn_active {
+            return None;
+        }
+        let pp = g[before?];
+        (pp != at).then(|| fast_bearing_rad(pp, at))
+    };
+    // A* only stops at nodes where the route can branch. Mid-road shape
+    // points (two edges, two distinct neighbours) leave one way forward —
+    // U-turns are forbidden — so `walk` crosses them in one go: from `from`
+    // (reached via `before`) along `first` until a junction, the start or the
+    // end. It charges every edge exactly what the per-node search did (the
+    // cost model, turn penalty against the previous node, midpoint
+    // deviation as the mean of endpoint deviations), and returns the node it
+    // stopped at, the walk's cost, and the node just before it. None when an
+    // edge on the way is forbidden (mode, surface, corridor, ∞ cost), which
+    // makes the whole chain impassable — as it was node by node.
+    let max_steps = g.node_count();
+    let walk = |from: NodeIndex,
+                before: Option<NodeIndex>,
+                first: EdgeReference<'_, EdgeData>|
+     -> Option<(NodeIndex, f64, NodeIndex)> {
+        let (mut u, mut before, mut er) = (from, before, first);
+        let mut pu = g[u];
+        let mut dev_u = xt.signed(pu);
+        let mut z_u = elev_at(u);
+        let mut total = 0.0;
+        for _ in 0..max_steps {
             let e = er.weight();
             // Cheapest rejections first: bitmask checks need no geometry.
-            if (e.modes & modes) == 0 {
-                return f64::INFINITY;
+            if (e.modes & modes) == 0 || (paved_only && e.surface != SURFACE_PAVED) {
+                return None;
             }
-            if paved_only && e.surface != SURFACE_PAVED {
-                return f64::INFINITY;
-            }
-            let s = er.source();
-            let t = er.target();
-            let (p0, dev_s, z_s) = match src_memo {
-                Some((ms, p, d, z)) if ms == s => (p, d, z),
-                _ => {
-                    let p = g[s];
-                    let d = dev_of(s, p);
-                    let z = elevations
-                        .and_then(|el| el.get(s.index()).copied())
-                        .unwrap_or(f32::NAN);
-                    src_memo = Some((s, p, d, z));
-                    (p, d, z)
-                }
-            };
-            let p1 = g[t];
-            let dev = (dev_s + dev_of(t, p1)) * 0.5;
-            let dev = dev.abs();
+            let v = er.target();
+            let pv = g[v];
+            let dev_v = xt.signed(pv);
+            let dev = ((dev_u + dev_v) * 0.5).abs();
             if dev > corridor_max {
-                return f64::INFINITY;
+                return None;
             }
-            let b_in = if turn_active {
-                prev_node.and_then(|pn| match b_in_memo {
-                    Some((mp, mn, b)) if mp == pn && mn == s => Some(b),
-                    _ => {
-                        let pp = g[pn];
-                        if pp == p0 {
-                            return None;
-                        }
-                        let b = fast_bearing_rad(pp, p0);
-                        b_in_memo = Some((pn, s, b));
-                        Some(b)
-                    }
-                })
-            } else {
-                None
-            };
-            let elev_pair = elevations.map(|el| {
-                let z_t = el.get(t.index()).copied().unwrap_or(f32::NAN);
-                (z_s, z_t)
-            });
-            cost(e, dev, b_in, p0, p1, elev_pair)
+            let z_v = elev_at(v);
+            let c = cost(
+                e,
+                dev,
+                bearing_in(before, pu),
+                pu,
+                pv,
+                elevations.map(|_| (z_u, z_v)),
+            );
+            if !c.is_finite() {
+                return None;
+            }
+            total += c;
+            if v == end || v == start || graph.is_junction(v) {
+                return Some((v, total, u));
+            }
+            // Shape point: the way on is the edge not leading back to `u`.
+            er = g.edges(v).find(|r| r.target() != u)?;
+            (before, u, pu, dev_u, z_u) = (Some(u), v, pv, dev_v, z_v);
+        }
+        None
+    };
+
+    // A* over the stop nodes, with FxHash-backed state and lazy deletion.
+    // The turn penalty uses each node's *current* predecessor at expansion
+    // time rather than augmenting the state with it — a greedy approximation
+    // (a predecessor may later be revised by a cheaper path), but the
+    // heuristic-driven search converges quickly on the canonical one and
+    // full (node, incoming edge) states would multiply the state space ~10×
+    // at marginal quality gain. `start_prev` is a virtual predecessor of
+    // `start` (set by `route_loop`) so the turn penalty and U-turn rule
+    // extend across leg boundaries.
+    let h_of = |n: NodeIndex| heur.distance(g[n]) * h_scale;
+    let mut state: FxHashMap<NodeIndex, NodeState> =
+        FxHashMap::with_capacity_and_hasher(1 << 10, Default::default());
+    let mut open: BinaryHeap<Frontier> = BinaryHeap::with_capacity(1 << 10);
+    let h_start = h_of(start);
+    state.insert(
+        start,
+        NodeState {
+            g: 0.0,
+            h: h_start,
+            from: start,
+            via: None,
+            prev: start_prev,
         },
-        |n| heur.distance(g[n]) * h_scale,
     );
-
-    let (_, path) = result.ok_or_else(|| {
-        anyhow!("no route found between selected nodes — try a wider corridor or different modes")
-    })?;
-
-    let mut points = Vec::with_capacity(path.len());
-    for &ni in &path {
-        points.push(g[ni]);
-    }
-    let mut edges = Vec::with_capacity(path.len().saturating_sub(1));
-    let mut node_indices: Vec<NodeIndex> = path.clone();
-    for (i, w) in path.windows(2).enumerate() {
-        let p0 = g[w[0]];
-        let p1 = g[w[1]];
-        let elev_pair = elev_for(w[0], w[1]);
-        let prev_p = if i == 0 {
-            start_prev.map(|p| g[p])
-        } else {
-            Some(g[path[i - 1]])
+    open.push(Frontier {
+        f: h_start,
+        g: 0.0,
+        node: start,
+    });
+    let mut found = false;
+    while let Some(Frontier {
+        g: popped_g, node, ..
+    }) = open.pop()
+    {
+        let (cur_g, prev) = match state.get(&node) {
+            Some(st) => (st.g, st.prev),
+            None => continue,
         };
-        let dev = ((dev_of(w[0], p0) + dev_of(w[1], p1)) * 0.5).abs();
-        let b_in = if turn_active {
-            prev_p.and_then(|pp| {
-                if pp != p0 {
-                    Some(fast_bearing_rad(pp, p0))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-        let mut best: Option<(EdgeData, f64)> = None;
-        for er in g.edges_connecting(w[0], w[1]) {
-            let e = er.weight();
-            if (e.modes & modes) == 0 {
+        // Lazy deletion: a fresher, cheaper entry for this node was pushed
+        // after this one.
+        if popped_g > cur_g {
+            continue;
+        }
+        if node == end {
+            found = true;
+            break;
+        }
+        for er in g.edges(node) {
+            // No immediate U-turn back to the predecessor; keeps the path
+            // topologically simple, across leg boundaries via `start_prev`.
+            if Some(er.target()) == prev {
                 continue;
             }
-            let c = cost(e, dev, b_in, p0, p1, elev_pair);
-            if best.map_or(true, |(_, bc)| c < bc) {
-                best = Some((*e, c));
+            let Some((next, c, before)) = walk(node, prev, er) else {
+                continue;
+            };
+            let tentative = cur_g + c;
+            match state.entry(next) {
+                std::collections::hash_map::Entry::Occupied(mut oe) => {
+                    let st = oe.get_mut();
+                    if tentative < st.g {
+                        st.g = tentative;
+                        st.from = node;
+                        st.via = Some(er.id());
+                        st.prev = Some(before);
+                        open.push(Frontier {
+                            f: tentative + st.h,
+                            g: tentative,
+                            node: next,
+                        });
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(ve) => {
+                    let h = h_of(next);
+                    ve.insert(NodeState {
+                        g: tentative,
+                        h,
+                        from: node,
+                        via: Some(er.id()),
+                        prev: Some(before),
+                    });
+                    open.push(Frontier {
+                        f: tentative + h,
+                        g: tentative,
+                        node: next,
+                    });
+                }
             }
         }
-        if let Some((e, _)) = best {
-            edges.push(e);
-        }
     }
+    if !found {
+        return Err(anyhow!(
+            "no route found between selected nodes — try a wider corridor or different modes"
+        ));
+    }
+
+    // Rebuild the path backwards, one walk at a time: each stop node records
+    // the walk (origin + first edge) that last improved it, and re-walking it
+    // is deterministic. Exact edges are known, so parallel edges need no
+    // re-selection.
+    let mut walks: Vec<(Vec<NodeIndex>, Vec<EdgeData>)> = Vec::new();
+    let mut cur = end;
+    while cur != start {
+        let st = &state[&cur];
+        let mut seg_nodes = Vec::new();
+        let mut seg_edges = Vec::new();
+        let (mut u, mut e) = (st.from, st.via.expect("non-start state has a walk"));
+        loop {
+            let (a, b) = g.edge_endpoints(e).expect("edge in graph");
+            let v = if a == u { b } else { a };
+            seg_edges.push(g[e]);
+            seg_nodes.push(v);
+            if v == cur {
+                break;
+            }
+            e = g
+                .edges(v)
+                .find(|r| r.target() != u)
+                .expect("shape point has a way on")
+                .id();
+            u = v;
+        }
+        walks.push((seg_nodes, seg_edges));
+        cur = st.from;
+    }
+    let mut node_indices: Vec<NodeIndex> = vec![start];
+    let mut edges: Vec<EdgeData> = Vec::new();
+    for (seg_nodes, seg_edges) in walks.into_iter().rev() {
+        node_indices.extend(seg_nodes);
+        edges.extend(seg_edges);
+    }
+    let mut points: Vec<LatLon> = node_indices.iter().map(|&n| g[n]).collect();
     // Splice out any graph-level loops the A* expansion may have left
     // behind. Single-leg A* normally can't revisit a node, but the cross-leg
     // path concatenation in `route_loop` can; this pass also guards single
@@ -970,8 +922,8 @@ mod tests {
     use super::*;
     use crate::geodesy::haversine;
     use crate::osm::{
-        NodePoint, BCLASS_CYCLEWAY, BCLASS_PATH, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, MODE_BIKE,
-        MODE_FOOT, MODE_MTB, SURFACE_PATH, SURFACE_PAVED,
+        BCLASS_CYCLEWAY, BCLASS_PATH, BCLASS_PRIMARY, BCLASS_RESIDENTIAL, MODE_BIKE, MODE_FOOT,
+        MODE_MTB, SURFACE_PATH, SURFACE_PAVED,
     };
     use petgraph::graph::UnGraph;
 
@@ -1003,23 +955,7 @@ mod tests {
         edge(&mut g, a, m1);
         edge(&mut g, m1, m2);
         edge(&mut g, m2, b);
-        let pts: Vec<NodePoint> = g
-            .node_indices()
-            .map(|ni| NodePoint {
-                idx: ni,
-                lat: g[ni].lat,
-                lon: g[ni].lon,
-            })
-            .collect();
-        let rtree = rstar::RTree::bulk_load(pts);
-        let n = g.node_count();
-        let components: Vec<u32> = (0..n as u32).map(|_| 0).collect();
-        Graph {
-            graph: g,
-            components,
-            rtree,
-            elevations_m: None,
-        }
+        Graph::from_graph(g)
     }
 
     #[test]
@@ -1045,31 +981,10 @@ mod tests {
         );
     }
 
-    /// Wrap a bare UnGraph in a `Graph` with the auxiliary indices populated
-    /// from the graph's actual contents. Components are filled via a tiny
-    /// union-find pass so multi-island synthetic graphs route correctly.
+    /// Wrap a bare UnGraph in a `Graph` with its derived indices
+    /// (components, R-tree, junctions), as a real build would.
     fn wrap_graph(g: UnGraph<LatLon, EdgeData>) -> Graph {
-        let pts: Vec<NodePoint> = g
-            .node_indices()
-            .map(|ni| NodePoint {
-                idx: ni,
-                lat: g[ni].lat,
-                lon: g[ni].lon,
-            })
-            .collect();
-        let rtree = rstar::RTree::bulk_load(pts);
-        let n = g.node_count();
-        let mut uf: petgraph::unionfind::UnionFind<usize> = petgraph::unionfind::UnionFind::new(n);
-        for er in g.edge_references() {
-            uf.union(er.source().index(), er.target().index());
-        }
-        let components: Vec<u32> = (0..n).map(|i| uf.find(i) as u32).collect();
-        Graph {
-            graph: g,
-            components,
-            rtree,
-            elevations_m: None,
-        }
+        Graph::from_graph(g)
     }
 
     fn add_edge(
@@ -1554,5 +1469,195 @@ mod tests {
                 "vertex deviation {dev:.0}m exceeds half-width (with 5% slack for snap)"
             );
         }
+    }
+
+    /// A road network for randomized checks: a grid of junctions whose
+    /// roads are winding chains of shape points, plus dead-end spurs, loop
+    /// roads, parallel roads, and random modes / surfaces / classes.
+    fn random_network(rng: &mut rand::rngs::StdRng) -> UnGraph<LatLon, EdgeData> {
+        use rand::Rng;
+        fn jitter(rng: &mut rand::rngs::StdRng) -> f64 {
+            rng.gen_range(-0.0004..0.0004)
+        }
+        fn random_edge(rng: &mut rand::rngs::StdRng, length_m: f64) -> EdgeData {
+            let modes = match rng.gen_range(0..10) {
+                0 => MODE_FOOT,
+                1 => MODE_BIKE,
+                2 => MODE_FOOT | MODE_MTB,
+                _ => MODE_FOOT | MODE_BIKE | MODE_MTB,
+            };
+            let mut bike_attrs = rng.gen_range(0..=9u8);
+            if rng.gen_bool(0.2) {
+                bike_attrs |= crate::osm::BATTR_DESIGNATED;
+            }
+            if rng.gen_bool(0.2) {
+                bike_attrs |= crate::osm::BATTR_CYCLE_NETWORK;
+            }
+            EdgeData {
+                length_m,
+                modes,
+                surface: rng.gen_range(0..=5u8),
+                bike_attrs,
+            }
+        }
+        /// A road from `a` to `b` through `k` jittered shape points.
+        fn road(
+            g: &mut UnGraph<LatLon, EdgeData>,
+            rng: &mut rand::rngs::StdRng,
+            a: NodeIndex,
+            b: NodeIndex,
+            k: usize,
+        ) {
+            let (pa, pb) = (g[a], g[b]);
+            let mut prev = a;
+            for i in 1..=k {
+                let t = i as f64 / (k + 1) as f64;
+                let p = LatLon::new(
+                    pa.lat + (pb.lat - pa.lat) * t + jitter(rng),
+                    pa.lon + (pb.lon - pa.lon) * t + jitter(rng),
+                );
+                let n = g.add_node(p);
+                let e = random_edge(rng, haversine(g[prev], p));
+                g.add_edge(prev, n, e);
+                prev = n;
+            }
+            let e = random_edge(rng, haversine(g[prev], pb));
+            g.add_edge(prev, b, e);
+        }
+
+        let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
+        let side = rng.gen_range(3..=6);
+        let spacing = 0.003; // ~300 m
+        let grid: Vec<NodeIndex> = (0..side * side)
+            .map(|i| {
+                let (r, c) = ((i / side) as f64, (i % side) as f64);
+                let p = LatLon::new(
+                    46.0 + r * spacing + jitter(rng),
+                    7.0 + c * spacing + jitter(rng),
+                );
+                g.add_node(p)
+            })
+            .collect();
+        for r in 0..side {
+            for c in 0..side {
+                let here = grid[r * side + c];
+                for (dr, dc) in [(0, 1), (1, 0), (1, 1)] {
+                    let (nr, nc) = (r + dr, c + dc);
+                    let skip = if dr + dc == 2 { 0.8 } else { 0.15 };
+                    if nr >= side || nc >= side || rng.gen_bool(skip) {
+                        continue;
+                    }
+                    let there = grid[nr * side + nc];
+                    let k = rng.gen_range(0..=6);
+                    road(&mut g, rng, here, there, k);
+                    if rng.gen_bool(0.05) {
+                        road(&mut g, rng, here, there, 0); // parallel road
+                    }
+                }
+                let p = g[here];
+                if rng.gen_bool(0.15) {
+                    let tip = g.add_node(LatLon::new(p.lat + jitter(rng), p.lon + jitter(rng)));
+                    let k = rng.gen_range(0..=3);
+                    road(&mut g, rng, here, tip, k); // dead-end spur
+                }
+                if rng.gen_bool(0.08) {
+                    // Loop road leaving and re-entering the same junction.
+                    let far = g.add_node(LatLon::new(p.lat + 0.0008, p.lon + 0.0008));
+                    let (k1, k2) = (rng.gen_range(1..=3), rng.gen_range(1..=3));
+                    road(&mut g, rng, here, far, k1);
+                    road(&mut g, rng, far, here, k2);
+                }
+            }
+        }
+        g
+    }
+
+    /// The chain-walking search must return exactly what a per-node search
+    /// returns. Marking every node a junction degenerates `walk` into single
+    /// edges — the classic per-node A* — so both run the same cost model and
+    /// differ only in how they cross shape points.
+    #[test]
+    fn chain_walking_matches_per_node_search() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        let (mut routed, mut no_route, mut mid_chain) = (0, 0, 0);
+        for case in 0..400 {
+            let net = random_network(&mut rng);
+            let mut chains = Graph::from_graph(net.clone());
+            let mut per_node = Graph::from_graph(net);
+            per_node.junctions.iter_mut().for_each(|w| *w = u64::MAX);
+            if rng.gen_bool(0.5) {
+                let mut z = 500.0_f32;
+                let elev: Vec<f32> = (0..chains.graph.node_count())
+                    .map(|_| {
+                        z += rng.gen_range(-15.0..15.0);
+                        z
+                    })
+                    .collect();
+                chains.elevations_m = Some(elev.clone());
+                per_node.elevations_m = Some(elev);
+            }
+            let n = chains.graph.node_count();
+            let start = NodeIndex::new(rng.gen_range(0..n));
+            let end = NodeIndex::new(rng.gen_range(0..n));
+            let start_prev = if rng.gen_bool(0.4) {
+                chains.graph.neighbors(start).next()
+            } else {
+                None
+            };
+            let modes = [
+                MODE_FOOT,
+                MODE_BIKE,
+                MODE_FOOT | MODE_BIKE,
+                MODE_BIKE | MODE_MTB,
+                MODE_FOOT | MODE_BIKE | MODE_MTB,
+            ][rng.gen_range(0..5)];
+            let half = rng.gen_range(150.0..2500.0);
+            let params = RouteParams {
+                modes,
+                half_width_m: half,
+                alpha: rng.gen_range(0.0..12.0),
+                corridor_max_m: half,
+                paved_only: rng.gen_bool(0.1),
+            };
+            let (a, b) = (chains.graph[start], chains.graph[end]);
+            let fast = shortest_with_start_prev(&chains, start, end, start_prev, a, b, &params);
+            let slow = shortest_with_start_prev(&per_node, start, end, start_prev, a, b, &params);
+            match (fast, slow) {
+                (Ok(f), Ok(s)) => {
+                    assert_eq!(
+                        f.node_indices, s.node_indices,
+                        "case {case}: different paths"
+                    );
+                    let key = |r: &RouteResult| {
+                        r.edges
+                            .iter()
+                            .map(|e| (e.length_m.to_bits(), e.modes, e.surface, e.bike_attrs))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(key(&f), key(&s), "case {case}: different edges");
+                    routed += 1;
+                    if !chains.is_junction(start) || !chains.is_junction(end) {
+                        mid_chain += 1;
+                    }
+                }
+                (Err(_), Err(_)) => no_route += 1,
+                (f, s) => panic!(
+                    "case {case}: chain walk {:?} vs per-node {:?}",
+                    f.map(|r| r.node_indices.len()),
+                    s.map(|r| r.node_indices.len())
+                ),
+            }
+        }
+        // Make sure the comparison exercised the interesting cases.
+        println!("{routed} routed ({mid_chain} from/to mid-chain), {no_route} without a route");
+        assert!(
+            routed > 150 && no_route > 20,
+            "routed {routed}, no route {no_route}"
+        );
+        assert!(
+            mid_chain > 100,
+            "only {mid_chain} routes started/ended mid-chain"
+        );
     }
 }

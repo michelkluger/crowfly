@@ -155,10 +155,13 @@ allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
    query, take the K=30 nearest nodes to each endpoint via the R-tree, keep
    the cheapest pair whose components match. Catches the common OSM case
    where naïve closest-node would put A and B on different islands.
-5. **A\* routing** (`src/route.rs`) — petgraph's `astar` with haversine
-   heuristic. Edge cost = `length · (1 + α · (deviation/half_width)²)`;
-   deviation is computed at edge-midpoint cross-track at query time, so one
-   graph serves many candidate lines (essential for explore + country mode).
+5. **A\* routing** (`src/route.rs`) — a custom A\* with a haversine
+   heuristic. Edge cost = `length · (1 + α · (deviation/half_width)²)` plus
+   bike class / surface / turn / slope terms; deviation is computed at the
+   edge midpoint at query time, so one graph serves many candidate lines
+   (essential for explore + country mode). The search only stops at
+   junctions: the ~84 % of nodes that are mid-road shape points are walked
+   through in one go, which is ~20 % faster with identical routes.
 6. **Parallel candidates** (`src/explore.rs`) — `evaluate` runs candidate
    A\* searches via rayon; on a multicore box this is the dominant speedup
    for country mode.

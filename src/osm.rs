@@ -1,7 +1,7 @@
 //! Read an OSM PBF and build a corridor-bounded routing graph.
 
 use crate::geodesy::{haversine, LatLon};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use geo::{Contains, Coord, LineString, Polygon};
 use indicatif::{ProgressBar, ProgressStyle};
 use osmpbfreader::{OsmId, OsmObj, OsmPbfReader};
@@ -17,6 +17,25 @@ pub const MODE_FOOT: u8 = 1 << 0;
 pub const MODE_BIKE: u8 = 1 << 1;
 pub const MODE_MTB: u8 = 1 << 2;
 pub const MODE_FERRY: u8 = 1 << 3;
+
+/// Parse a comma-separated mode list (`foot,bike,mtb`, with aliases) into a
+/// `MODE_*` mask. Shared by the CLI flags and the HTTP API.
+pub fn parse_modes(s: &str) -> Result<u8> {
+    let mut m = 0u8;
+    for tok in s.split(',') {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "foot" | "walk" | "hike" => m |= MODE_FOOT,
+            "bike" | "cycle" | "bicycle" => m |= MODE_BIKE,
+            "mtb" | "gravel" => m |= MODE_MTB,
+            "" => {}
+            other => return Err(anyhow!("unknown mode: {other}")),
+        }
+    }
+    if m == 0 {
+        return Err(anyhow!("no modes selected"));
+    }
+    Ok(m)
+}
 
 /// Coarse surface categories useful for route comparison. Stored as u8 in
 /// EdgeData so it fits next to the bitmask without alignment waste.
@@ -119,6 +138,23 @@ impl rstar::PointDistance for NodePoint {
     }
 }
 
+/// Bitset of every node that is not a mid-road shape point, i.e. that does
+/// not have exactly two incident edges leading to two distinct neighbours.
+fn junction_bits(graph: &UnGraph<LatLon, EdgeData>) -> Vec<u64> {
+    let mut bits = vec![0u64; graph.node_count().div_ceil(64)];
+    for v in graph.node_indices() {
+        let mut neighbours = graph.edges(v).map(|e| e.target());
+        let shape_point = match (neighbours.next(), neighbours.next(), neighbours.next()) {
+            (Some(a), Some(b), None) => a != b,
+            _ => false,
+        };
+        if !shape_point {
+            bits[v.index() / 64] |= 1 << (v.index() % 64);
+        }
+    }
+    bits
+}
+
 pub struct Graph {
     pub graph: UnGraph<LatLon, EdgeData>,
     /// Per-NodeIndex component representative. Computed once at build time so
@@ -131,6 +167,10 @@ pub struct Graph {
     /// loaded tile coverage. The router uses these to penalise descending on
     /// non-rideable surfaces when bike is in the mode set.
     pub elevations_m: Option<Vec<f32>>,
+    /// Bitset over node indices of the nodes routing must stop at: every node
+    /// except mid-road shape points (exactly two incident edges, to two
+    /// distinct neighbours), whose chains A* walks through. See `route.rs`.
+    pub(crate) junctions: Vec<u64>,
 }
 
 impl Graph {
@@ -139,12 +179,21 @@ impl Graph {
     pub(crate) fn from_graph(graph: UnGraph<LatLon, EdgeData>) -> Self {
         eprintln!("Computing connected components + spatial index…");
         let (components, rtree) = Self::build_aux(&graph);
+        let junctions = junction_bits(&graph);
         Self {
             graph,
             components,
             rtree,
             elevations_m: None,
+            junctions,
         }
+    }
+
+    /// Whether routing must stop at `n` (see `junctions`).
+    #[inline]
+    pub fn is_junction(&self, n: NodeIndex) -> bool {
+        let i = n.index();
+        self.junctions[i / 64] & (1 << (i % 64)) != 0
     }
 
     /// Bounding box of every node, i.e. the area the graph actually covers.
@@ -887,13 +936,30 @@ mod tests {
                 },
             );
         }
-        let (components, rtree) = Graph::build_aux(&g);
-        Graph {
-            graph: g,
-            components,
-            rtree,
-            elevations_m: None,
+        Graph::from_graph(g)
+    }
+
+    #[test]
+    fn junctions_are_every_node_but_mid_road_shape_points() {
+        // 0-1-2-3-5-6 along the equator, a spur 1-4, and a double edge 6=7.
+        let mut g = tiny_chain(4).graph;
+        let ed = g[g.edge_indices().next().unwrap()];
+        let node = |i: usize| NodeIndex::new(i);
+        for p in [(0.001, 0.001), (0.0, 0.004), (0.0, 0.005), (0.0, 0.006)] {
+            g.add_node(LatLon::new(p.0, p.1));
         }
+        for (a, b) in [(1, 4), (3, 5), (5, 6), (6, 7), (6, 7)] {
+            g.add_edge(node(a), node(b), ed);
+        }
+        let graph = Graph::from_graph(g);
+        let junction: Vec<bool> = (0..8).map(|i| graph.is_junction(node(i))).collect();
+        // Dead ends 0 and 4, branch 1, and 6/7 joined by two parallel edges
+        // (7's two edges lead to the same neighbour) are junctions; 2, 3
+        // and 5 are plain shape points.
+        assert_eq!(
+            junction,
+            [true, true, false, false, true, false, true, true]
+        );
     }
 
     #[test]
