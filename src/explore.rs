@@ -18,6 +18,7 @@ use crate::route::{self, RouteParams, RouteResult};
 use crate::shape::{place_shape, unit_max_radius, unit_shape_perimeter, ShapeKind};
 use crate::viability::{self, NoGoZone, Report};
 use anyhow::Result;
+use petgraph::graph::NodeIndex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
@@ -196,18 +197,28 @@ pub struct OutlinePoint {
 }
 
 /// Approximate the country's border by the outermost graph node in each of
-/// `sectors` equal bearing sectors around the centre of the graph's bbox.
-/// Roads reach the border all round, so these are real, routable border
-/// points — unlike strips along the bbox, which put many "border" endpoints
-/// where the country isn't. Exact for star-shaped countries; a deep
-/// concavity just contributes its outermost road.
-pub fn country_outline(graph: &Graph, sectors: usize) -> Vec<OutlinePoint> {
+/// `sectors` equal bearing sectors around the centre of the graph's bbox,
+/// among the nodes `usable` accepts. Roads reach the border all round, so
+/// these are real, routable border points — unlike strips along the bbox,
+/// which put many "border" endpoints where the country isn't. Exact for
+/// star-shaped countries; a deep concavity just contributes its outermost
+/// road. `usable` lets callers keep, say, only nodes a road bike can start
+/// from: the outermost node overall is often a trail on a border ridge.
+pub fn country_outline(
+    graph: &Graph,
+    sectors: usize,
+    usable: impl Fn(NodeIndex) -> bool,
+) -> Vec<OutlinePoint> {
     let b = graph.bbox();
     let centre = LatLon::new((b.lat_min + b.lat_max) * 0.5, (b.lon_min + b.lon_max) * 0.5);
     let cos_lat = centre.lat.to_radians().cos();
     // Per sector: (squared local distance, bearing, point) of the farthest node.
     let mut best: Vec<Option<(f64, f64, LatLon)>> = vec![None; sectors];
-    for &p in graph.graph.node_weights() {
+    for n in graph.graph.node_indices() {
+        if !usable(n) {
+            continue;
+        }
+        let p = graph.graph[n];
         // Local equirectangular offsets: plenty for ordering within a sector.
         let east = (p.lon - centre.lon) * cos_lat;
         let north = p.lat - centre.lat;
@@ -574,7 +585,6 @@ pub fn route_one_shape_with_limits(
     if vertices.len() < 2 {
         return Err((candidate, "shape has no legs".into()));
     }
-    use petgraph::graph::NodeIndex;
     let mut all_points: Vec<LatLon> = Vec::new();
     let mut all_edges: Vec<EdgeData> = Vec::new();
     let mut all_nodes: Vec<NodeIndex> = Vec::new();
@@ -1061,7 +1071,7 @@ mod tests {
     #[test]
     fn outline_takes_the_outermost_node_per_bearing() {
         let (graph, centre) = ring_country();
-        let outline = country_outline(&graph, 36);
+        let outline = country_outline(&graph, 36, |_| true);
         assert_eq!(outline.len(), 36, "one point per sector");
         for o in &outline {
             let d = haversine(centre, o.point);
@@ -1070,9 +1080,25 @@ mod tests {
     }
 
     #[test]
+    fn outline_skips_nodes_the_activity_cannot_use() {
+        // ring_country adds each bearing's outer node, then its inner node:
+        // pretend only the inner ones are usable (say, paved).
+        let (graph, centre) = ring_country();
+        let outline = country_outline(&graph, 36, |n| n.index() % 2 == 1);
+        assert_eq!(outline.len(), 36);
+        for o in &outline {
+            let d = haversine(centre, o.point);
+            assert!(
+                (20_000.0..25_000.0).contains(&d),
+                "picked an unusable node {d:.0} m out"
+            );
+        }
+    }
+
+    #[test]
     fn crossings_join_far_apart_outline_points_within_bounds() {
         let (graph, _) = ring_country();
-        let outline = country_outline(&graph, 36);
+        let outline = country_outline(&graph, 36, |_| true);
         let bearing_of = |p: LatLon| {
             outline
                 .iter()

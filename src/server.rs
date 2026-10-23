@@ -14,7 +14,7 @@ use crate::elevation::profile_from_dem;
 use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
 use crate::hershey_fonts::Font;
-use crate::osm::{self, BBox, Graph, SURFACE_LABELS};
+use crate::osm::{self, BBox, Graph, SURFACE_LABELS, SURFACE_PAVED};
 use crate::route::RouteParams;
 use crate::text;
 use crate::viability::NoGoZone;
@@ -29,6 +29,7 @@ use axum::{
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -47,13 +48,16 @@ pub struct ServerState {
     pub progress: Mutex<Option<ProgressTracker>>,
     /// Cancel flag of the most recent search; see [`Search`].
     pub search_cancel: Mutex<Arc<AtomicBool>>,
-    /// The country's edge — outermost road node per bearing from the centre
-    /// — where crossing ("border to border") searches start and end.
-    pub outline: Vec<explore::OutlinePoint>,
+    /// Country outlines per activity, computed on first use; see
+    /// [`ServerState::outline_for`].
+    outlines: OutlineCache,
 }
 
+/// Outlines keyed by activity `(modes, paved_only)`.
+type OutlineCache = Mutex<HashMap<(u8, bool), Arc<Vec<explore::OutlinePoint>>>>;
+
 impl ServerState {
-    /// State for serving `graph`: derives its bbox and outline.
+    /// State for serving `graph`, with its bbox derived.
     pub fn new(
         graph: Graph,
         no_go: Vec<NoGoZone>,
@@ -61,7 +65,6 @@ impl ServerState {
         dem: Option<Dem>,
     ) -> Self {
         let bbox = graph.bbox();
-        let outline = explore::country_outline(&graph, 360);
         Self {
             graph,
             bbox,
@@ -70,8 +73,29 @@ impl ServerState {
             dem,
             progress: Mutex::new(None),
             search_cancel: Default::default(),
-            outline,
+            outlines: Default::default(),
         }
+    }
+
+    /// The country's edge as an activity can use it — the outermost node per
+    /// bearing from the centre that has an edge open to `modes` (and paved,
+    /// if `paved_only`) — where crossing searches start and end. The
+    /// outermost node overall is often a trail on a border ridge, useless to
+    /// a road bike. Computed once per activity (~1 s for Switzerland).
+    pub fn outline_for(&self, modes: u8, paved_only: bool) -> Arc<Vec<explore::OutlinePoint>> {
+        let key = (modes, paved_only);
+        if let Some(outline) = self.outlines.lock().unwrap().get(&key) {
+            return outline.clone();
+        }
+        let g = &self.graph.graph;
+        let outline = Arc::new(explore::country_outline(&self.graph, 360, |n| {
+            g.edges(n).any(|e| {
+                let d = e.weight();
+                (d.modes & modes) != 0 && (!paved_only || d.surface == SURFACE_PAVED)
+            })
+        }));
+        self.outlines.lock().unwrap().insert(key, outline.clone());
+        outline
     }
 }
 
@@ -628,6 +652,7 @@ async fn handle_country(
             seed,
             min_viable,
         };
+        let outline = border.then(|| inner_for_task.outline_for(modes, paved_only));
         let (mut all, stats) = run_batches(&task, "country", &retry, |b| {
             let params = RouteParams {
                 modes,
@@ -643,11 +668,11 @@ async fn handle_country(
                 enforce_corridor: true,
             };
             let (lo, hi) = (dmin.unwrap_or(0.0), dmax.unwrap_or(f64::INFINITY));
-            let candidates = if border {
-                let outline = &inner_for_task.outline;
-                explore::generate_crossing_candidates(outline, b.n_sample, lo, hi, b.seed)
-            } else {
-                explore::generate_country_candidates_in_bbox(bbox, b.n_sample, lo, hi, b.seed)
+            let candidates = match &outline {
+                Some(o) => explore::generate_crossing_candidates(o, b.n_sample, lo, hi, b.seed),
+                None => {
+                    explore::generate_country_candidates_in_bbox(bbox, b.n_sample, lo, hi, b.seed)
+                }
             };
             task.add_total(candidates.len());
             Some(explore::evaluate(
