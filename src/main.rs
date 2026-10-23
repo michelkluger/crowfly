@@ -2,11 +2,13 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crowfly::elevation::ElevationClient;
+use crowfly::dem::{self, Dem};
+use crowfly::elevation::{profile_from_dem, ElevationClient};
 use crowfly::explore;
 use crowfly::fetch;
 use crowfly::geodesy::{haversine, in_corridor, LatLon};
-use crowfly::osm::{self, BBox, MODE_BIKE, MODE_FOOT, MODE_MTB};
+use crowfly::graph_cache;
+use crowfly::osm::{self, BBox, Graph, MODE_BIKE, MODE_FOOT, MODE_MTB};
 use crowfly::output::{ExploreOutputs, Outputs};
 use crowfly::route::{self, RouteParams, RouteResult};
 use crowfly::viability::{self, NoGoZone, Report};
@@ -29,6 +31,30 @@ enum Cmd {
     Serve(ServeArgs),
 }
 
+/// DEM options, shared by every subcommand so `plan` / `explore` route on the
+/// same slope-aware graph as `serve`.
+#[derive(Parser, Debug, Clone)]
+struct DemArgs {
+    /// Directory holding SRTM `.hgt` tiles (NxxEyyy.hgt). If empty, the named
+    /// `--dem-pack` is downloaded from viewfinderpanoramas.org on first run.
+    /// Every graph node is then stamped with its elevation, and the router
+    /// penalises descending edges on non-rideable surfaces (steps / footway /
+    /// path) so bike+hike combos prefer a rideable line on the way down. The
+    /// same tiles provide route elevation profiles.
+    #[arg(long, default_value = "./dem-cache")]
+    dem_dir: PathBuf,
+    /// viewfinderpanoramas DEM3 pack(s) to download, comma-separated. Each
+    /// pack covers a 6°×4° square: `L32` is N44–48 / E6–12 (most of
+    /// Switzerland and the Alps); `L31` is N44–48 / E0–6 (Geneva, Jura).
+    /// Already-fetched packs are skipped via a marker file in `--dem-dir`.
+    /// Set to an empty string to disable DEM loading entirely (no slope-aware
+    /// routing; elevation falls back to OpenTopoData in the CLI and is
+    /// omitted by `serve`). See <https://viewfinderpanoramas.org/dem3.html>
+    /// for the world grid.
+    #[arg(long, default_value = "L31,L32")]
+    dem_pack: String,
+}
+
 #[derive(Parser, Debug)]
 struct ServeArgs {
     /// OSM .pbf file. Mutually exclusive with --region.
@@ -37,26 +63,17 @@ struct ServeArgs {
     /// Geofabrik region key (downloaded if missing).
     #[arg(long)]
     region: Option<String>,
-    /// Cache dir for downloaded PBFs.
+    /// Cache dir for downloaded PBFs and the built-graph cache
+    /// (`<pbf name>.graph`).
     #[arg(long, default_value = "./osm-cache")]
     cache_dir: PathBuf,
-    /// Directory holding SRTM `.hgt` tiles (NxxEyyy.hgt). If empty, the named
-    /// `--dem-pack` is downloaded from viewfinderpanoramas.org on first run.
-    /// Every graph node is then stamped with its elevation, and the router
-    /// penalises descending edges on non-rideable surfaces (steps / footway /
-    /// path) so bike+hike combos prefer a rideable line on the way down. The
-    /// same tiles stay loaded for route elevation profiles.
-    #[arg(long, default_value = "./dem-cache")]
-    dem_dir: PathBuf,
-    /// viewfinderpanoramas DEM3 pack(s) to download, comma-separated. Each
-    /// pack covers a 6°×4° square: `L32` is N44–48 / E6–12 (most of
-    /// Switzerland and the Alps); `L31` is N44–48 / E0–6 (Geneva, Jura).
-    /// Already-fetched packs are skipped via a marker file in `--dem-dir`.
-    /// Set to an empty string to disable DEM loading entirely (no slope-aware
-    /// routing, no elevation profiles). See
-    /// <https://viewfinderpanoramas.org/dem3.html> for the world grid.
-    #[arg(long, default_value = "L31,L32")]
-    dem_pack: String,
+    /// Always build the graph from the PBF instead of reusing the cache in
+    /// --cache-dir. The cache is rebuilt automatically when the PBF, the
+    /// modes or the graph-building code change.
+    #[arg(long)]
+    no_graph_cache: bool,
+    #[command(flatten)]
+    dem: DemArgs,
     /// Repeatable: GeoJSON polygon files to forbid.
     #[arg(long)]
     no_go: Vec<PathBuf>,
@@ -74,8 +91,8 @@ struct ServeArgs {
 
 #[derive(Parser, Debug)]
 struct CommonArgs {
-    /// Total corridor width, metres.
-    #[arg(long, default_value_t = 5000.0)]
+    /// Total corridor width, metres (the web app's default too).
+    #[arg(long, default_value_t = 8000.0)]
     width: f64,
     /// Allowed transport modes, comma-separated: foot, bike, mtb.
     #[arg(long, default_value = "foot,bike")]
@@ -104,15 +121,18 @@ struct CommonArgs {
     /// Long-edge flagging threshold (metres) — likely ferries / graph gaps.
     #[arg(long, default_value_t = 800.0)]
     long_edge_threshold: f64,
-    /// Elevation samples per route. 0 disables elevation lookup.
+    /// Elevation chart samples per route; 0 disables elevation. Profiles come
+    /// from the DEM tiles when loaded (as in `serve`), else from OpenTopoData.
     #[arg(long, default_value_t = 60)]
     elevation_samples: usize,
-    /// Cache dir for downloaded elevation lookups.
+    /// Cache dir for OpenTopoData lookups (only used without a DEM).
     #[arg(long, default_value = "./elevation-cache")]
     elevation_cache: PathBuf,
     /// Output directory.
     #[arg(long, default_value = "./out")]
     out: PathBuf,
+    #[command(flatten)]
+    dem: DemArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -232,6 +252,44 @@ fn print_modes(modes: u8) {
     );
 }
 
+/// Load the DEM packs named by `--dem-pack` (downloading missing ones), or
+/// None when disabled or no tiles were found.
+fn load_dem(args: &DemArgs) -> Result<Option<Dem>> {
+    let packs: Vec<&str> = args
+        .dem_pack
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if packs.is_empty() {
+        return Ok(None);
+    }
+    dem::ensure_packs(&args.dem_dir, &packs)?;
+    let d = Dem::load_dir(&args.dem_dir)?;
+    if d.is_empty() {
+        eprintln!("  (no tiles found — slope-aware routing and DEM elevation disabled)");
+        return Ok(None);
+    }
+    eprintln!("  loaded {} tile(s)", d.tiles.len());
+    Ok(Some(d))
+}
+
+/// Stamp (and smooth) node elevations for slope-aware routing, then keep
+/// only the tiles under the graph for elevation profiles — routes never
+/// leave its bbox. Every subcommand goes through here so they all route on
+/// the same graph.
+fn attach_dem(graph: &mut Graph, dem: Option<Dem>) -> Option<Dem> {
+    let mut d = dem?;
+    graph.stamp_elevations(&d);
+    graph.smooth_elevations(2);
+    d.retain_bbox(graph.bbox());
+    eprintln!(
+        "  keeping {} DEM tile(s) for elevation profiles",
+        d.tiles.len()
+    );
+    Some(d)
+}
+
 fn run_plan(args: PlanArgs) -> Result<()> {
     let start = parse_latlon(&args.start)?;
     let end = parse_latlon(&args.end)?;
@@ -249,19 +307,20 @@ fn run_plan(args: PlanArgs) -> Result<()> {
     let no_go = load_no_go(&args.common)?;
     let pbf = resolve_pbf(&args.common)?;
 
-    let (route, report): (RouteResult, Report) = if let Some(pbf) = pbf {
+    let (route, report, dem): (RouteResult, Report, Option<Dem>) = if let Some(pbf) = pbf {
         let bbox = corridor_bbox(start, end, 0.10);
         let total_len_m = haversine(start, end);
         let keep = |p0: LatLon, p1: LatLon| -> bool {
             in_corridor(p0, start, end, half, total_len_m)
                 || in_corridor(p1, start, end, half, total_len_m)
         };
-        let graph = osm::build(&pbf, bbox, modes, keep)?;
+        let mut graph = osm::build(&pbf, bbox, modes, keep)?;
         if graph.graph.node_count() == 0 {
             return Err(anyhow!(
                 "no graph nodes in corridor — the PBF may not cover this area"
             ));
         }
+        let dem = attach_dem(&mut graph, load_dem(&args.common.dem)?);
         let (start_idx, end_idx, sd, ed) = graph
             .closest_connected_pair(start, end)
             .ok_or_else(|| anyhow!("graph empty"))?;
@@ -279,7 +338,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         let r = route::shortest(&graph, start_idx, end_idx, start, end, &params)?;
         let rep = viability::analyse(&r, start, end, &no_go, args.common.long_edge_threshold);
         viability::print_report(&rep, total_km);
-        (r, rep)
+        (r, rep, dem)
     } else {
         println!("\n(no --osm or --region: emitting corridor + reference line only)");
         let preview = RouteResult {
@@ -295,17 +354,24 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             &no_go,
             args.common.long_edge_threshold,
         );
-        (preview, report)
+        (preview, report, None)
     };
 
-    let elevation = if args.common.elevation_samples > 0 && route.points.len() >= 2 {
-        println!(
-            "\nFetching elevation profile ({} samples)…",
-            args.common.elevation_samples
-        );
-        let mut client = ElevationClient::new(&args.common.elevation_cache)?;
-        let p = client.profile(&route.points, args.common.elevation_samples);
-        let _ = client.save();
+    let n_samples = args.common.elevation_samples;
+    let elevation = if n_samples > 0 && route.points.len() >= 2 {
+        let p = match &dem {
+            Some(d) => {
+                println!("\nElevation profile from the DEM ({n_samples} samples)");
+                profile_from_dem(d, &route.points, n_samples)
+            }
+            None => {
+                println!("\nFetching elevation profile ({n_samples} samples)…");
+                let mut client = ElevationClient::new(&args.common.elevation_cache)?;
+                let p = client.profile(&route.points, n_samples);
+                let _ = client.save();
+                p
+            }
+        };
         if let Some(prof) = &p {
             println!(
                 "Ascent: {:.0} m, Descent: {:.0} m, Max: {:.0} m, Min: {:.0} m",
@@ -371,10 +437,11 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     // enclosing bbox as the cheap area filter; the deviation cost in A* will
     // pull each route toward its own line.
     let bbox = explore::enclosing_bbox(start, &candidates, 0.10);
-    let graph = osm::build(&pbf, bbox, modes, |_, _| true)?;
+    let mut graph = osm::build(&pbf, bbox, modes, |_, _| true)?;
     if graph.graph.node_count() == 0 {
         return Err(anyhow!("no graph nodes in search area"));
     }
+    let dem = attach_dem(&mut graph, load_dem(&args.common.dem)?);
 
     let params = RouteParams {
         modes,
@@ -419,16 +486,22 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         ));
     }
 
+    let n_samples = args.common.elevation_samples;
+    if let (Some(d), true) = (&dem, n_samples > 0) {
+        // As in `serve`: DEM profiles are cheap, so every viable line gets
+        // one and the ascent term takes part in the ranking.
+        for s in viable.iter_mut() {
+            s.elevation = profile_from_dem(d, &s.route.points, n_samples);
+            explore::rescore_with_elevation(s);
+        }
+    }
     let mut ranked = explore::rank(viable);
     ranked.truncate(args.top);
 
-    if args.common.elevation_samples > 0 {
-        println!(
-            "\nFetching elevation profiles ({} samples per route)…",
-            args.common.elevation_samples
-        );
+    if dem.is_none() && n_samples > 0 {
+        println!("\nFetching elevation profiles ({n_samples} samples per route)…");
         let mut client = ElevationClient::new(&args.common.elevation_cache)?;
-        explore::enrich_with_elevation(&mut ranked, &mut client, args.common.elevation_samples);
+        explore::enrich_with_elevation(&mut ranked, &mut client, n_samples);
     }
 
     explore::print_leaderboard(&ranked, start);
@@ -448,7 +521,6 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
 }
 
 fn run_serve(args: ServeArgs) -> Result<()> {
-    use crowfly::osm::BBox;
     let modes = parse_modes(&args.modes)?;
     let pbf = if let Some(p) = &args.osm {
         p.clone()
@@ -462,57 +534,21 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         .iter()
         .map(|p| crowfly::viability::load_no_go(p))
         .collect::<Result<_>>()?;
-    // Loose lat/lon bbox lets us load anything; the graph dimensions then
-    // determine the real area used for country sampling.
-    let loose_bbox = BBox {
-        lat_min: -85.0,
-        lat_max: 85.0,
-        lon_min: -180.0,
-        lon_max: 180.0,
-    };
+    let graph_cache_dir = (!args.no_graph_cache).then(|| args.cache_dir.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let pbf_for_build = pbf.clone();
-        let dem_dir_for_build = args.dem_dir.clone();
-        let dem_pack_for_build = args.dem_pack.clone();
-        let (graph, dem) = tokio::task::spawn_blocking(
-            move || -> Result<(crowfly::osm::Graph, Option<crowfly::dem::Dem>)> {
-                eprintln!("Building graph from {} …", pbf_for_build.display());
-                let mut g = crowfly::osm::build(&pbf_for_build, loose_bbox, modes, |_, _| true)?;
-                let mut dem = None;
-                if !dem_pack_for_build.trim().is_empty() {
-                    let packs: Vec<&str> = dem_pack_for_build
-                        .split(',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    crowfly::dem::ensure_packs(&dem_dir_for_build, &packs)?;
-                    let d = crowfly::dem::Dem::load_dir(&dem_dir_for_build)?;
-                    if d.is_empty() {
-                        eprintln!(
-                            "  (no tiles found — slope-aware routing and elevation profiles disabled)"
-                        );
-                    } else {
-                        eprintln!("  loaded {} tile(s)", d.tiles.len());
-                        g.stamp_elevations(&d);
-                        g.smooth_elevations(2);
-                        dem = Some(d);
-                    }
-                }
-                Ok((g, dem))
-            },
-        )
+        let dem_args = args.dem.clone();
+        let (graph, dem) = tokio::task::spawn_blocking(move || -> Result<(Graph, Option<Dem>)> {
+            eprintln!("Loading graph for {} …", pbf.display());
+            let mut g = graph_cache::build_or_load(&pbf, modes, graph_cache_dir.as_deref())?;
+            let dem = attach_dem(&mut g, load_dem(&dem_args)?);
+            Ok((g, dem))
+        })
         .await??;
-        let real_bbox = graph_bbox(&graph);
-        // Keep only the tiles under the graph; routes never leave its bbox.
-        let dem = dem.map(|mut d| {
-            d.retain_bbox(real_bbox);
-            eprintln!("  keeping {} DEM tile(s) for elevation profiles", d.tiles.len());
-            d
-        });
+        let real_bbox = graph.bbox();
         eprintln!(
             "Graph ready: {} nodes; bbox [{:.3},{:.3}]×[{:.3},{:.3}]",
             graph.graph.node_count(),
@@ -532,35 +568,6 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         }));
         crowfly::server::serve(state, &args.bind).await
     })
-}
-
-fn graph_bbox(g: &crowfly::osm::Graph) -> crowfly::osm::BBox {
-    use crowfly::osm::BBox;
-    let mut lat_min = f64::INFINITY;
-    let mut lat_max = f64::NEG_INFINITY;
-    let mut lon_min = f64::INFINITY;
-    let mut lon_max = f64::NEG_INFINITY;
-    for ni in g.graph.node_indices() {
-        let p = g.graph[ni];
-        if p.lat < lat_min {
-            lat_min = p.lat;
-        }
-        if p.lat > lat_max {
-            lat_max = p.lat;
-        }
-        if p.lon < lon_min {
-            lon_min = p.lon;
-        }
-        if p.lon > lon_max {
-            lon_max = p.lon;
-        }
-    }
-    BBox {
-        lat_min,
-        lat_max,
-        lon_min,
-        lon_max,
-    }
 }
 
 fn main() -> Result<()> {

@@ -24,10 +24,14 @@ jobs:
             label: macos-arm64
             target: aarch64-apple-darwin
             bin: crowfly
-          - os: macos-13
+          # GitHub retired the Intel macOS runners (macos-13 jobs queue
+          # forever), so cross-compile on Apple Silicon. Its x86_64 binaries
+          # can't be assumed to run there, so this leg builds without tests.
+          - os: macos-latest
             label: macos-x86_64
             target: x86_64-apple-darwin
             bin: crowfly
+            test: false
           - os: windows-latest
             label: windows-x86_64
             target: x86_64-pc-windows-msvc
@@ -51,6 +55,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Test (release)
+        if: matrix.test != false
         run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Upload binary
@@ -60,3 +65,45 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.bin }}
           if-no-files-found: error
           retention-days: 30
+
+  # Real-data check: build the Liechtenstein graph (~3 MB extract), serve the
+  # API on an ephemeral port and exercise every endpoint, plus a graph-cache
+  # round trip. See tests/e2e_liechtenstein.rs.
+  e2e:
+    name: e2e (Liechtenstein)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+
+      # Geofabrik updates the extract daily; refreshing weekly keeps runs
+      # reproducible within a week without hammering their servers.
+      - name: ISO week
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache OSM extract
+        uses: actions/cache@v4
+        with:
+          path: osm-cache/liechtenstein-latest.osm.pbf
+          key: osm-liechtenstein-${{ steps.week.outputs.week }}
+
+      - name: Download OSM extract
+        run: |
+          mkdir -p osm-cache
+          [ -f osm-cache/liechtenstein-latest.osm.pbf ] || curl -fsSL --retry 3 \
+            -o osm-cache/liechtenstein-latest.osm.pbf \
+            https://download.geofabrik.de/europe/liechtenstein-latest.osm.pbf
+
+      - name: End-to-end tests
+        env:
+          CROWFLY_E2E_PBF: osm-cache/liechtenstein-latest.osm.pbf
+          CROWFLY_E2E_REQUIRED: "1"
+        run: cargo test --release --locked --test e2e_liechtenstein -- --nocapture

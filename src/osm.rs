@@ -134,6 +134,36 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Wrap a raw routing graph with the indices routing queries depend on
+    /// (connected components + R-tree). Elevations start unset.
+    pub(crate) fn from_graph(graph: UnGraph<LatLon, EdgeData>) -> Self {
+        eprintln!("Computing connected components + spatial index…");
+        let (components, rtree) = Self::build_aux(&graph);
+        Self {
+            graph,
+            components,
+            rtree,
+            elevations_m: None,
+        }
+    }
+
+    /// Bounding box of every node, i.e. the area the graph actually covers.
+    pub fn bbox(&self) -> BBox {
+        let mut b = BBox {
+            lat_min: f64::INFINITY,
+            lat_max: f64::NEG_INFINITY,
+            lon_min: f64::INFINITY,
+            lon_max: f64::NEG_INFINITY,
+        };
+        for p in self.graph.node_weights() {
+            b.lat_min = b.lat_min.min(p.lat);
+            b.lat_max = b.lat_max.max(p.lat);
+            b.lon_min = b.lon_min.min(p.lon);
+            b.lon_max = b.lon_max.max(p.lon);
+        }
+        b
+    }
+
     /// Build the auxiliary structures (union-find + R-tree) that the routing
     /// queries depend on. Called once at graph construction.
     fn build_aux(graph: &UnGraph<LatLon, EdgeData>) -> (Vec<u32>, rstar::RTree<NodePoint>) {
@@ -662,15 +692,7 @@ where
         edges_skipped_glacier,
     );
 
-    eprintln!("Computing connected components + spatial index…");
-    let (components, rtree) = Graph::build_aux(&graph);
-
-    Ok(Graph {
-        graph,
-        components,
-        rtree,
-        elevations_m: None,
-    })
+    Ok(Graph::from_graph(graph))
 }
 
 /// Spatial index over `natural=glacier` polygons. AABB pre-filter via rstar,
