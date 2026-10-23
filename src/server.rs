@@ -9,7 +9,8 @@
 //! The server is single-process, single-graph, single-user — meant to run
 //! on `localhost` while you plan trips.
 
-use crate::elevation::ElevationClient;
+use crate::dem::Dem;
+use crate::elevation::profile_from_dem;
 use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
 use crate::hershey_fonts::Font;
@@ -19,15 +20,15 @@ use crate::text;
 use crate::viability::NoGoZone;
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::State,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -37,38 +38,13 @@ pub struct ServerState {
     pub bbox: BBox,
     pub no_go: Vec<NoGoZone>,
     pub long_edge_threshold_m: f64,
-    pub elevation_cache: PathBuf,
-    /// Mutex around the elevation client (it has on-disk cache and a "go offline
-    /// after first failure" flag, so we serialize access).
-    pub elev: Mutex<ElevationClient>,
+    /// DEM kept resident after stamping node elevations, so route elevation
+    /// profiles are sampled locally (no network, no rate limit). `None` when
+    /// DEM loading is disabled; responses then carry no elevation.
+    pub dem: Option<Dem>,
     /// Latest in-flight search progress. Cleared when no work is running. The
     /// server is single-user (README), so a single slot is enough.
     pub progress: Mutex<Option<ProgressTracker>>,
-    /// Slot for the most recent async job (background elevation + re-rank).
-    /// Single-user assumption: only one outstanding job at a time. Cleared
-    /// when a new search starts; the FE polls `/api/results/:id` to learn
-    /// when re-ranking is finished and pick up the final order.
-    pub async_job: Mutex<Option<AsyncJob>>,
-}
-
-/// Bookkeeping for one in-flight async re-rank. `kind` carries the result
-/// pool typed for either country or shape responses; the BG task fills in
-/// `final_*` once elevation enrichment + re-dedup completes.
-pub struct AsyncJob {
-    pub id: String,
-    pub width_m: f64,
-    pub completed: bool,
-    pub failures: Value,
-    pub kind: AsyncJobKind,
-}
-
-pub enum AsyncJobKind {
-    Country {
-        final_results: Option<Vec<Scored>>,
-    },
-    Shape {
-        final_results: Option<Vec<ScoredShape>>,
-    },
 }
 
 /// Counters bucketing why candidates were rejected during a search. Returned
@@ -398,6 +374,7 @@ async fn handle_between(
     }
     let counter_inner = counter.clone();
     let paved_only = req.paved_only;
+    let elevation_samples = req.elevation_samples;
     let scored_result = tokio::task::spawn_blocking(move || -> (Vec<Scored>, Vec<String>) {
         let mut out = Vec::with_capacity(alphas.len());
         let mut errors: Vec<String> = Vec::new();
@@ -424,6 +401,7 @@ async fn handle_between(
             }
             counter_inner.fetch_add(1, Ordering::Relaxed);
         }
+        enrich_scored(inner.dem.as_ref(), &mut out, elevation_samples);
         (out, errors)
     })
     .await;
@@ -443,8 +421,7 @@ async fn handle_between(
         )));
     }
 
-    let mut deduped = explore::rank_dedup_top(scored, req.alternatives, 0.5);
-    enrich_elevation(&state, &mut deduped, req.elevation_samples).await;
+    let deduped = explore::rank_dedup_top(scored, req.alternatives, 0.5);
 
     let width_m = req.width_m;
     let resp: Vec<Value> = deduped
@@ -504,6 +481,7 @@ async fn handle_country(
     let counter_inner = counter.clone();
     let inner_for_task = inner.clone();
     let paved_only = req.paved_only;
+    let elevation_samples = req.elevation_samples;
     let scored_result = tokio::task::spawn_blocking(move || -> (Vec<Scored>, RejectionStats) {
         let mut all: Vec<Scored> = Vec::new();
         let mut stats = RejectionStats::default();
@@ -571,137 +549,36 @@ async fn handle_country(
                 break;
             }
         }
+        // Elevation is local and cheap, so profile every viable route and
+        // let the ascent term take part in the ranking below.
+        enrich_scored(inner_for_task.dem.as_ref(), &mut all, elevation_samples);
+        all.iter_mut().for_each(explore::rescore_with_elevation);
         (all, stats)
     })
     .await;
     let (scored, stats) = scored_result.map_err(AppError::internal)?;
 
-    if scored.is_empty() {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-        return Ok(Json(json!({
-            "results": Vec::<Value>::new(),
-            "failures": stats.to_json(),
-        })));
-    }
-
-    // Per-section dedup with an over-keep pool so the BG elevation re-rank
-    // has alternatives to promote. The synchronous response shows the top
-    // `count` of each section by *pre-elevation* score.
-    let pool_size = if req.elevation_samples > 0 {
-        (count * 3).max(count + 4)
-    } else {
-        count
-    };
+    // Per-section dedup: routes inside the requested corridor first, then
+    // the ones the retry loop found by widening it.
     let width_m = req.width_m;
     let (tight, loose): (Vec<Scored>, Vec<Scored>) = scored
         .into_iter()
         .partition(|s| s.corridor_used_m <= width_m + 1.0);
-    let tight_pool = explore::rank_dedup_top(tight, pool_size, 8.0);
-    let loose_pool = explore::rank_dedup_top(loose, pool_size, 8.0);
-
-    // Initial display set (no elevation): top `count` of each section.
-    let mut initial: Vec<Scored> = tight_pool.iter().take(count).cloned().collect();
-    initial.extend(loose_pool.iter().take(count).cloned());
-    let resp_initial: Vec<Value> = initial
+    let mut ranked = explore::rank_dedup_top(tight, count, 8.0);
+    ranked.extend(explore::rank_dedup_top(loose, count, 8.0));
+    let resp: Vec<Value> = ranked
         .iter()
         .enumerate()
         .map(|(i, s)| scored_to_json(s, i + 1, width_m))
         .collect();
-
-    // Set up an async job for elevation enrichment + re-rank. The FE polls
-    // /api/results/:id and animates cards into the new order on completion.
-    let elevation_pending = req.elevation_samples > 0;
-    let request_id = next_async_id();
-    let failures_json = stats.to_json();
-    if elevation_pending {
-        {
-            let mut slot = state.0.async_job.lock().unwrap();
-            *slot = Some(AsyncJob {
-                id: request_id.clone(),
-                width_m,
-                completed: false,
-                failures: failures_json.clone(),
-                kind: AsyncJobKind::Country {
-                    final_results: None,
-                },
-            });
-        }
-        let state_for_bg = state.clone();
-        let request_id_bg = request_id.clone();
-        let elevation_samples = req.elevation_samples;
-        tokio::spawn(async move {
-            run_country_rerank(
-                state_for_bg,
-                request_id_bg,
-                tight_pool,
-                loose_pool,
-                count,
-                width_m,
-                elevation_samples,
-            )
-            .await;
-        });
-    } else {
-        // No elevation requested → clear progress, no async job.
+    {
         let mut p = state.0.progress.lock().unwrap();
         *p = None;
     }
-
     Ok(Json(json!({
-        "request_id": request_id,
-        "elevation_pending": elevation_pending,
-        "results": resp_initial,
-        "failures": failures_json,
+        "results": resp,
+        "failures": stats.to_json(),
     })))
-}
-
-/// Background re-rank for country mode: enrich the entire over-keep pool with
-/// elevation, recompute scores, dedup again per-section, and store the final
-/// order in the async-job slot for the FE to poll.
-async fn run_country_rerank(
-    state: AppState,
-    request_id: String,
-    tight_pool: Vec<Scored>,
-    loose_pool: Vec<Scored>,
-    count: usize,
-    width_m: f64,
-    elevation_samples: usize,
-) {
-    let mut combined: Vec<Scored> = Vec::with_capacity(tight_pool.len() + loose_pool.len());
-    combined.extend(tight_pool);
-    combined.extend(loose_pool);
-    enrich_elevation(&state, &mut combined, elevation_samples).await;
-    for s in combined.iter_mut() {
-        explore::rescore_with_elevation(s);
-    }
-    let (tight2, loose2): (Vec<Scored>, Vec<Scored>) = combined
-        .into_iter()
-        .partition(|s| s.corridor_used_m <= width_m + 1.0);
-    let tight_final = explore::rank_dedup_top(tight2, count, 8.0);
-    let loose_final = explore::rank_dedup_top(loose2, count, 8.0);
-    let mut all_final: Vec<Scored> = tight_final;
-    all_final.extend(loose_final);
-    {
-        let mut slot = state.0.async_job.lock().unwrap();
-        if let Some(job) = slot.as_mut() {
-            if job.id == request_id {
-                if let AsyncJobKind::Country { final_results } = &mut job.kind {
-                    *final_results = Some(all_final);
-                }
-                job.completed = true;
-            }
-        }
-    }
-    let mut p = state.0.progress.lock().unwrap();
-    *p = None;
-}
-
-fn next_async_id() -> String {
-    use std::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}", now_ms(), n)
 }
 
 fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
@@ -814,6 +691,7 @@ async fn handle_shape_search(
     let bbox = inner.bbox;
     let perimeter_km = req.perimeter_km;
     let paved_only = req.paved_only;
+    let elevation_samples = req.elevation_samples;
     let routed = tokio::task::spawn_blocking(move || -> (Vec<ScoredShape>, RejectionStats) {
         let mut all: Vec<ScoredShape> = Vec::new();
         let mut stats = RejectionStats::default();
@@ -883,88 +761,37 @@ async fn handle_shape_search(
                 break;
             }
         }
+        // Profile every viable loop so the ascent re-score can promote a
+        // flatter loop over a marginally tighter but climbier one.
+        enrich_shapes(inner_for_task.dem.as_ref(), &mut all, elevation_samples);
+        all.iter_mut()
+            .for_each(explore::rescore_shape_with_elevation);
         (all, stats)
     })
     .await;
     let (scored, stats) = routed.map_err(AppError::internal)?;
 
-    if scored.is_empty() {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = None;
-        return Ok(Json(json!({
-            "results": Vec::<Value>::new(),
-            "failures": stats.to_json(),
-        })));
-    }
     // Dedup by center proximity, scaled to the shape's diameter so two big
     // shapes don't merge unless they really overlap.
     let dedup_sep_km = (req.perimeter_km / std::f64::consts::TAU).max(8.0);
-    // Over-keep ahead of elevation enrichment so the ascent re-score can
-    // promote a flatter loop over a marginally tighter but climbier one.
-    let pool_size = if req.elevation_samples > 0 {
-        (count * 3).max(count + 4)
-    } else {
-        count
-    };
     let width_m = req.width_m;
     let (tight, loose): (Vec<ScoredShape>, Vec<ScoredShape>) = scored
         .into_iter()
         .partition(|s| s.corridor_used_m <= width_m + 1.0);
-    let tight_pool = explore::rank_dedup_top_shapes(tight, pool_size, dedup_sep_km);
-    let loose_pool = explore::rank_dedup_top_shapes(loose, pool_size, dedup_sep_km);
-
-    // Initial display set (no elevation): top `count` of each section.
-    let mut initial: Vec<ScoredShape> = tight_pool.iter().take(count).cloned().collect();
-    initial.extend(loose_pool.iter().take(count).cloned());
-    let resp_initial: Vec<Value> = initial
+    let mut ranked = explore::rank_dedup_top_shapes(tight, count, dedup_sep_km);
+    ranked.extend(explore::rank_dedup_top_shapes(loose, count, dedup_sep_km));
+    let resp: Vec<Value> = ranked
         .iter()
         .enumerate()
         .map(|(i, s)| shape_to_json(s, i + 1, width_m))
         .collect();
-
-    // Spawn background elevation + re-rank (same async-job pattern as country).
-    let elevation_pending = req.elevation_samples > 0;
-    let request_id = next_async_id();
-    let failures_json = stats.to_json();
-    if elevation_pending {
-        {
-            let mut slot = state.0.async_job.lock().unwrap();
-            *slot = Some(AsyncJob {
-                id: request_id.clone(),
-                width_m,
-                completed: false,
-                failures: failures_json.clone(),
-                kind: AsyncJobKind::Shape {
-                    final_results: None,
-                },
-            });
-        }
-        let state_for_bg = state.clone();
-        let request_id_bg = request_id.clone();
-        let elevation_samples = req.elevation_samples;
-        tokio::spawn(async move {
-            run_shape_rerank(
-                state_for_bg,
-                request_id_bg,
-                tight_pool,
-                loose_pool,
-                count,
-                width_m,
-                dedup_sep_km,
-                elevation_samples,
-            )
-            .await;
-        });
-    } else {
+    {
         let mut p = state.0.progress.lock().unwrap();
         *p = None;
     }
-
     Ok(Json(json!({
-        "request_id": request_id,
-        "elevation_pending": elevation_pending,
-        "results": resp_initial,
-        "failures": failures_json,
+        "results": resp,
+        "failures": stats.to_json(),
     })))
 }
 
@@ -1178,8 +1005,8 @@ async fn handle_text(
     let stroke_count: usize = best.letters.iter().map(|l| l.stroke_routes.len()).sum();
     let total_track_m = total_routed_m + total_pen_up_m;
 
-    let elevation_json = if req.elevation_samples > 0 {
-        let inner = state.0.clone();
+    let dem = state.0.dem.as_ref().filter(|_| req.elevation_samples > 0);
+    let elevation_json = if let Some(dem) = dem {
         // Sample over the full rideable track (strokes + pen-ups in order)
         // so the elevation profile matches what someone actually rides.
         let pts: Vec<LatLon> = {
@@ -1200,17 +1027,7 @@ async fn handle_text(
             }
             out
         };
-        let n = req.elevation_samples;
-        let prof = tokio::task::spawn_blocking(move || -> Option<crate::elevation::Profile> {
-            let mut client = inner.elev.lock().unwrap();
-            let p = client.profile(&pts, n);
-            let _ = client.save();
-            p
-        })
-        .await
-        .ok()
-        .flatten();
-        prof.map(|p| {
+        profile_from_dem(dem, &pts, req.elevation_samples).map(|p| {
             json!({
                 "samples_m": p.samples_m,
                 "ascent_m": p.ascent_m,
@@ -1273,153 +1090,27 @@ async fn handle_text(
     })))
 }
 
-async fn run_shape_rerank(
-    state: AppState,
-    request_id: String,
-    tight_pool: Vec<ScoredShape>,
-    loose_pool: Vec<ScoredShape>,
-    count: usize,
-    width_m: f64,
-    dedup_sep_km: f64,
-    elevation_samples: usize,
-) {
-    let mut combined: Vec<ScoredShape> = Vec::with_capacity(tight_pool.len() + loose_pool.len());
-    combined.extend(tight_pool);
-    combined.extend(loose_pool);
-    if !combined.is_empty() {
-        let total = combined.len();
-        let counter = Arc::new(AtomicUsize::new(0));
-        {
-            let mut p = state.0.progress.lock().unwrap();
-            *p = Some(ProgressTracker {
-                kind: "elevation",
-                total,
-                done: counter.clone(),
-                started_ms: now_ms(),
-            });
-        }
-        let inner = state.0.clone();
-        let owned = std::mem::take(&mut combined);
-        let counter_inner = counter.clone();
-        let updated = tokio::task::spawn_blocking(move || -> Vec<ScoredShape> {
-            let mut owned = owned;
-            let mut client = inner.elev.lock().unwrap();
-            for s in owned.iter_mut() {
-                s.elevation = client.profile(&s.route.points, elevation_samples);
-                counter_inner.fetch_add(1, Ordering::Relaxed);
-            }
-            let _ = client.save();
-            owned
-        })
-        .await
-        .unwrap_or_default();
-        combined = updated;
-        for s in combined.iter_mut() {
-            explore::rescore_shape_with_elevation(s);
-        }
-    }
-    let (tight2, loose2): (Vec<ScoredShape>, Vec<ScoredShape>) = combined
-        .into_iter()
-        .partition(|s| s.corridor_used_m <= width_m + 1.0);
-    let tight_final = explore::rank_dedup_top_shapes(tight2, count, dedup_sep_km);
-    let loose_final = explore::rank_dedup_top_shapes(loose2, count, dedup_sep_km);
-    let mut all_final: Vec<ScoredShape> = tight_final;
-    all_final.extend(loose_final);
-    {
-        let mut slot = state.0.async_job.lock().unwrap();
-        if let Some(job) = slot.as_mut() {
-            if job.id == request_id {
-                if let AsyncJobKind::Shape { final_results } = &mut job.kind {
-                    *final_results = Some(all_final);
-                }
-                job.completed = true;
-            }
-        }
-    }
-    let mut p = state.0.progress.lock().unwrap();
-    *p = None;
-}
-
-async fn enrich_elevation(state: &AppState, scored: &mut Vec<Scored>, n_samples: usize) {
-    if n_samples == 0 || scored.is_empty() {
+/// Fill in elevation profiles from the resident DEM. Pure CPU (bilinear grid
+/// lookups every 50 m), so callers run it inside their blocking task and
+/// rayon spreads it across the pool. No-op without a DEM or when the request
+/// asked for 0 samples.
+fn enrich_scored(dem: Option<&Dem>, scored: &mut [Scored], n_samples: usize) {
+    let Some(dem) = dem.filter(|_| n_samples > 0) else {
         return;
-    }
-    let total = scored.len();
-    let counter = Arc::new(AtomicUsize::new(0));
-    {
-        let mut p = state.0.progress.lock().unwrap();
-        *p = Some(ProgressTracker {
-            kind: "elevation",
-            total,
-            done: counter.clone(),
-            started_ms: now_ms(),
-        });
-    }
-    let inner = state.0.clone();
-    let owned = std::mem::take(scored);
-    let counter_inner = counter.clone();
-    let updated = tokio::task::spawn_blocking(move || -> Vec<Scored> {
-        let mut owned = owned;
-        let mut client = inner.elev.lock().unwrap();
-        for s in owned.iter_mut() {
-            s.elevation = client.profile(&s.route.points, n_samples);
-            counter_inner.fetch_add(1, Ordering::Relaxed);
-        }
-        let _ = client.save();
-        owned
-    })
-    .await
-    .unwrap_or_default();
-    *scored = updated;
+    };
+    scored
+        .par_iter_mut()
+        .for_each(|s| s.elevation = profile_from_dem(dem, &s.route.points, n_samples));
 }
 
-async fn handle_results(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Json<Value> {
-    let slot = state.0.async_job.lock().unwrap();
-    let Some(job) = slot.as_ref() else {
-        return Json(json!({ "error": "no active async job" }));
+/// Shape-search counterpart of [`enrich_scored`].
+fn enrich_shapes(dem: Option<&Dem>, shapes: &mut [ScoredShape], n_samples: usize) {
+    let Some(dem) = dem.filter(|_| n_samples > 0) else {
+        return;
     };
-    if job.id != id {
-        return Json(json!({ "error": "unknown request_id" }));
-    }
-    match &job.kind {
-        AsyncJobKind::Country {
-            final_results: Some(rs),
-        } => {
-            let resp: Vec<Value> = rs
-                .iter()
-                .enumerate()
-                .map(|(i, s)| scored_to_json(s, i + 1, job.width_m))
-                .collect();
-            Json(json!({
-                "request_id": job.id,
-                "completed": true,
-                "results": resp,
-                "failures": job.failures,
-            }))
-        }
-        AsyncJobKind::Shape {
-            final_results: Some(rs),
-        } => {
-            let resp: Vec<Value> = rs
-                .iter()
-                .enumerate()
-                .map(|(i, s)| shape_to_json(s, i + 1, job.width_m))
-                .collect();
-            Json(json!({
-                "request_id": job.id,
-                "completed": true,
-                "results": resp,
-                "failures": job.failures,
-            }))
-        }
-        _ => Json(json!({
-            "request_id": job.id,
-            "completed": false,
-        })),
-    }
+    shapes
+        .par_iter_mut()
+        .for_each(|s| s.elevation = profile_from_dem(dem, &s.route.points, n_samples));
 }
 
 async fn handle_progress(State(state): State<AppState>) -> Json<Value> {
@@ -1488,7 +1179,6 @@ pub fn router(state: AppState) -> Router {
         .route("/app.js", get(handle_app_js))
         .route("/api/info", get(handle_info))
         .route("/api/progress", get(handle_progress))
-        .route("/api/results/:id", get(handle_results))
         .route("/api/between", post(handle_between))
         .route("/api/country", post(handle_country))
         .route("/api/shape-search", post(handle_shape_search))

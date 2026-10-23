@@ -10,8 +10,10 @@
 //! lat ∈ [46, 47), lon ∈ [7, 8). We read every `.hgt` under a directory
 //! once at startup, stamp the corresponding graph node elevations, and the
 //! router uses those to penalise descending edges on non-rideable surfaces.
+//! `serve` keeps the grid resident to sample route elevation profiles.
 
 use crate::geodesy::LatLon;
+use crate::osm::BBox;
 use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustc_hash::FxHashMap;
@@ -143,6 +145,18 @@ impl Dem {
         let lon0 = p.lon.floor() as i32;
         let tile = self.tiles.get(&(lat0, lon0))?;
         tile.elevation_at(p)
+    }
+
+    /// Drop tiles that don't overlap `bbox`. DEM packs span 6°×4°, far more
+    /// than most extracts need (Switzerland touches 18 of the 48 tiles in
+    /// L31+L32), and every tile kept resident costs ~2.9 MB.
+    pub fn retain_bbox(&mut self, bbox: BBox) {
+        self.tiles.retain(|&(lat0, lon0), _| {
+            lat0 as f64 <= bbox.lat_max
+                && (lat0 + 1) as f64 > bbox.lat_min
+                && lon0 as f64 <= bbox.lon_max
+                && (lon0 + 1) as f64 > bbox.lon_min
+        });
     }
 }
 

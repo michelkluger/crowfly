@@ -4,10 +4,6 @@ const SURFACE_COLORS = {
 };
 let A = null, B = null, results = [], activeRank = 1, info = null;
 let currentMode = 'between';
-// Async re-rank: most recent request id and its poll handle.
-let asyncRequestId = null;
-let asyncPollTimer = null;
-const ASYNC_POLL_MS = 1500;
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -376,7 +372,6 @@ function startProgressPoll() {
           'shape-search': 'evaluating shapes',
           'between':      'finding alternatives',
           'text':         'evaluating placements',
-          'elevation':    'fetching elevation profiles',
         })[r.kind] || r.kind;
         document.getElementById('progressLabel').textContent =
           `${label}: ${r.done}/${r.total} · ${elapsed}s`;
@@ -418,7 +413,6 @@ function setBusy(busy) {
 }
 
 document.getElementById('btnCancel').addEventListener('click', () => {
-  stopAsyncPoll();
   if (inFlight) {
     inFlight.abort();
     setStatus('cancelled');
@@ -478,7 +472,6 @@ document.getElementById('btnText').addEventListener('click', async () => {
       detour_cap: Number.isFinite(detour) && detour >= 1.0 ? detour : 1.6,
       candidates: Number.isFinite(cands) && cands > 0 ? cands : 200,
     });
-    stopAsyncPoll();
     renderResults(j.results, j.failures);
     if (j.results.length === 0) {
       const m = j.text_render_meta || {};
@@ -520,10 +513,8 @@ document.getElementById('btnShapeSearch').addEventListener('click', async () => 
       count: +document.getElementById('optShapeCount').value,
       ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
     });
-    stopAsyncPoll();
     renderResults(j.results, j.failures);
     setStatus(`got ${j.results.length} ${kind}${j.results.length === 1 ? '' : 's'}`);
-    if (j.elevation_pending && j.request_id) startAsyncPoll(j.request_id);
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
@@ -547,10 +538,8 @@ document.getElementById('btnCountry').addEventListener('click', async () => {
       border_strip_km: +document.getElementById('optStrip').value,
       ...(minViableRaw === '' ? {} : { min_viable: +minViableRaw }),
     });
-    stopAsyncPoll();
     renderResults(j.results, j.failures);
     setStatus(`got ${j.results.length} country-wide suggestions`);
-    if (j.elevation_pending && j.request_id) startAsyncPoll(j.request_id);
   } catch (e) {
     if (isAbort(e)) return;
     setStatus('error: ' + e.message);
@@ -567,10 +556,8 @@ function haversineMeters(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-function renderResults(rs, failures, _opts) {
+function renderResults(rs, failures) {
   results = rs;
-  // Stamp keys so FLIP can match cards across re-renders.
-  rs.forEach(r => { if (!r._key) r._key = routeKey(r); });
   // Build GeoJSON.
   const feats = [];
   const corridorFeats = [];
@@ -753,84 +740,6 @@ function renderResults(rs, failures, _opts) {
   }
 }
 
-// Stable identity for a route — used as `data-key` so FLIP can match cards
-// across re-renders. For point-to-point we use rounded endpoints; for shapes,
-// the center + rotation pair (server-side dedup ensures these are unique).
-function routeKey(r) {
-  if (r.shape) {
-    const c = r.start; // shapes set start = end = center
-    return `s_${c[0].toFixed(4)}_${c[1].toFixed(4)}_${(r.shape.rotation_deg||0).toFixed(0)}`;
-  }
-  return `r_${r.start[0].toFixed(4)}_${r.start[1].toFixed(4)}_${r.end[0].toFixed(4)}_${r.end[1].toFixed(4)}`;
-}
-
-function stopAsyncPoll() {
-  if (asyncPollTimer) { clearInterval(asyncPollTimer); asyncPollTimer = null; }
-  asyncRequestId = null;
-}
-
-function startAsyncPoll(id) {
-  stopAsyncPoll();
-  asyncRequestId = id;
-  asyncPollTimer = setInterval(async () => {
-    if (asyncRequestId !== id) return;
-    try {
-      const r = await fetch('/api/results/' + encodeURIComponent(id))
-        .then(x => x.json());
-      if (asyncRequestId !== id) return;
-      if (r.completed && Array.isArray(r.results)) {
-        stopAsyncPoll();
-        applyRerank(r.results, r.failures);
-      }
-    } catch (_) { /* poll-failure resilience: keep trying */ }
-  }, ASYNC_POLL_MS);
-}
-
-// FLIP animation: capture old card positions, swap DOM, invert each kept
-// card's transform so it visually starts at its old spot, then transition
-// to identity. New cards fade in; removed cards just disappear.
-function applyRerank(newResults, failures) {
-  const container = document.getElementById('cards');
-  const before = new Map();
-  container.querySelectorAll('.card[data-key]').forEach(el => {
-    before.set(el.dataset.key, el.getBoundingClientRect());
-  });
-  renderResults(newResults, failures, /*animate=*/false);
-  const cards = container.querySelectorAll('.card[data-key]');
-  cards.forEach(el => {
-    const key = el.dataset.key;
-    const oldRect = before.get(key);
-    if (!oldRect) {
-      // Promoted from the over-keep pool — fade in.
-      el.style.opacity = '0';
-      requestAnimationFrame(() => {
-        el.style.transition = 'opacity 0.35s ease';
-        el.style.opacity = '1';
-      });
-      return;
-    }
-    const newRect = el.getBoundingClientRect();
-    const dy = oldRect.top - newRect.top;
-    const dx = oldRect.left - newRect.left;
-    if (Math.abs(dy) < 1 && Math.abs(dx) < 1) return;
-    el.style.transition = 'none';
-    el.style.transform = `translate(${dx}px, ${dy}px)`;
-    requestAnimationFrame(() => {
-      el.style.transition = 'transform 0.45s cubic-bezier(0.2, 0.7, 0.2, 1)';
-      el.style.transform = '';
-    });
-  });
-  // Show a quiet "re-ranked by elevation" pill for ~3s.
-  const pill = document.createElement('span');
-  pill.className = 'rerank-pill';
-  pill.textContent = '↗ re-ranked by ascent';
-  const head = container.querySelector('.section-head');
-  if (head) {
-    head.appendChild(pill);
-    setTimeout(() => pill.remove(), 3500);
-  }
-}
-
 function failuresHtml(f) {
   if (!f || !f.total) {
     return '<div class="empty">no viable routes — try relaxing the corridor or modes</div>';
@@ -879,8 +788,6 @@ function cardHtml(r) {
            `<span>max ${Math.round(e.max_m)} m</span>` +
            `<span>min ${Math.round(e.min_m)} m</span></div>` +
            sparklineSvg(e.samples_m, 360, 50);
-  } else if (asyncRequestId) {
-    elev = `<div class="elev-pending">fetching elevation…</div>`;
   }
   const ferryTxt = r.ferry_km > 0.05 ? ` · ferry ${r.ferry_km.toFixed(1)} km` : '';
   // Persistence indicator: when the search loop had to widen the corridor to
@@ -926,7 +833,7 @@ function cardHtml(r) {
         (${detour>=0?'+':''}${detour.toFixed(0)}%) · worst leg +${Math.round(r.shape.max_leg_detour_pct || 0)}%${ferryTxt}</div>`
       : `<div class="row">${r.ref_km.toFixed(1)} → <b>${r.real_km.toFixed(1)} km</b>
         (${detour>=0?'+':''}${detour.toFixed(0)}%) · max dev ${Math.round(r.max_dev_m)} m${ferryTxt}</div>`;
-  return `<div class="card" data-rank="${r.rank}" data-key="${r._key || ''}">
+  return `<div class="card" data-rank="${r.rank}">
     <div class="hd"><b>#${r.rank}</b> &nbsp; ${headerLeft}${widenBadge}
       <span class="score">score ${r.score.toFixed(1)}</span></div>
     ${textRow}

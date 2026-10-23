@@ -91,8 +91,8 @@ leaderboard, basemap toggle, per-card GPX) and `top1.gpx`.
 Builds the graph once at startup (1–2 min for Switzerland), holds it in RAM,
 and serves the frontend at the bind address. Each search reuses the same
 graph + cached components + R-tree, so request latency is ~1 s for "between"
-and ~10–40 s for "country" (depends on candidate count and elevation
-samples).
+and ~10–40 s for "country" (depends on candidate count). Elevation profiles
+come from the DEM tiles loaded at startup and add no network time.
 
 ## OSM data
 
@@ -113,12 +113,20 @@ PBFs are cached in `./osm-cache/`.
 
 ## Elevation
 
-When `--elevation-samples > 0` (or in the web app whenever
-`elevation pts > 0`), crowfly samples `N` points evenly along each route and
-queries OpenTopoData's SRTM 30 m endpoint for elevations. Results are cached
-in `./elevation-cache/cache.json` keyed by `(lat, lon)` rounded to 4 decimals,
-so repeat queries over the same area are free. The free OpenTopoData tier
-allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
+**Web app (`serve`).** The SRTM tiles from `--dem-pack` (default `L31,L32`,
+the Alps) are loaded at startup for slope-aware routing and kept in memory
+(only tiles under the graph). Every route is sampled every 50 m for ascent,
+descent, min and max, ignoring wiggles under 5 m as DEM noise; `elevation
+pts` only sets the chart resolution. No network, no rate limit. For a region
+outside the default packs, pass its pack via `--dem-pack`; startup logs any
+missing tiles. `--dem-pack ""` disables elevation entirely.
+
+**CLI (`plan`, `explore`).** When `--elevation-samples > 0`, crowfly samples
+`N` points evenly along each route and queries OpenTopoData's SRTM 30 m
+endpoint. Results are cached in `./elevation-cache/cache.json` keyed by
+`(lat, lon)` rounded to 4 decimals, so repeat queries over the same area are
+free. The free OpenTopoData tier allows 1 call/sec and 1000 calls/day; one
+batch covers up to 100 points.
 
 ## How it works
 
@@ -147,7 +155,8 @@ allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
    start+end proximity (8 km separation for country, 0.5 km for between).
 8. **Surface + elevation** (`src/viability.rs`, `src/elevation.rs`) — surface
    km per category accumulated from edge tags. Elevation is sampled along
-   the routed polyline and fetched once, with on-disk cache.
+   the routed polyline from the in-memory DEM (`serve`) or OpenTopoData with
+   an on-disk cache (CLI).
 9. **Output** (`src/output.rs`, `assets/index.html`) — static HTML viewers
    for `plan`/`explore`, an interactive single-page app for `serve`. Both
    embed MapLibre GL JS over CartoDB / OpenTopoMap raster tiles. No API key
@@ -161,8 +170,9 @@ allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
 | `--modes` | `foot,bike` (`serve`: `foot,bike,mtb`) | any of `foot`, `bike`, `mtb` |
 | `--osm` / `--region` | — | PBF path or Geofabrik key |
 | `--cache-dir` | `./osm-cache` | downloaded PBF cache |
-| `--elevation-cache` | `./elevation-cache` | elevation lookup cache |
+| `--elevation-cache` | `./elevation-cache` | OpenTopoData lookup cache (`plan`/`explore`) |
 | `--elevation-samples` | 60 (`plan`/`explore`) | per-route samples; 0 disables |
+| `--dem-pack` (`serve`) | `L31,L32` | SRTM packs for slope-aware routing + elevation profiles; `""` disables |
 | `--no-go` | — | repeatable; GeoJSON polygons to forbid |
 | `--alpha` | 4 | deviation penalty: 0 = shortest path, ~10 = sticks tightly |
 | `--long-edge-threshold` | 800 | metres — flags long single edges |
@@ -188,7 +198,8 @@ predicate).
   Valhalla/OSRM ruleset.
 - Switzerland-sized PBFs need ~1 GB RAM during graph construction; the
   resulting in-memory graph for foot+bike+mtb is ~16 M nodes.
-- OpenTopoData free tier rate-limits elevation lookups to 1 batch/sec.
+- In `plan`/`explore`, the OpenTopoData free tier rate-limits elevation
+  lookups to 1 batch/sec.
 - The `serve` mode is single-process, single-user — designed for `localhost`,
   not internet exposure.
 

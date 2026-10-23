@@ -185,7 +185,7 @@
           <option value="foot,bike,mtb">foot+bike+mtb</option>
         </select>
       </label>
-      <label title="Number of points to sample along each route for the elevation profile. 0 disables the elevation lookup. More = smoother profile but more API calls.">
+      <label title="Number of points in each route's elevation chart. 0 disables elevation (and the ascent term in ranking). Ascent/descent always use the full 50 m DEM profile.">
         elev pts <input type="number" id="optElev" value="30" min="0" max="100"></label>
       <label style="grid-column: span 2;" title="Restrict routing to paved surfaces (asphalt, concrete, paving stones). Excludes gravel, paths, unpaved tracks, and ferries — useful for road bikes.">
         <input type="checkbox" id="optPaved"> paved roads only
@@ -219,7 +219,7 @@
       <dt>candidates</dt>
       <dd>How many top suggestions to keep after scoring + deduplication. Country mode generates ~6× this number internally, then prunes near-duplicates so the cards you see are visually distinct lines.</dd>
       <dt>elevation pts</dt>
-      <dd>Samples taken along each route for the elevation chart. 0 skips the lookup entirely (faster). Each batch of up to 100 points is one HTTP call to OpenTopoData (rate-limited to ~1/sec, so high values × many candidates = slower).</dd>
+      <dd>Points in each route's elevation chart. Elevation comes from the SRTM tiles loaded at startup (<code>--dem-pack</code>), sampled every 50 m for the ascent/descent totals, so it needs no network. 0 hides elevation and drops the ascent term from ranking.</dd>
       <dt>distance min/max km</dt>
       <dd>Length range for country-mode candidate lines. The straight-line distance between start and end must fall in this band. Doesn't apply to "between A and B" mode.</dd>
       <dt>border-to-border only</dt>
