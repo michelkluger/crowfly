@@ -846,7 +846,6 @@ mod tests {
     use geo::{Coord, LineString, MultiPolygon, Polygon};
     use petgraph::graph::UnGraph;
     use petgraph::visit::EdgeRef;
-    use rustc_hash::FxHashMap;
 
     fn graph_for_shape(vertices: &[LatLon]) -> Graph {
         let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
@@ -865,7 +864,6 @@ mod tests {
                     modes: MODE_FOOT,
                     surface: SURFACE_PAVED,
                     bike_attrs: BCLASS_RESIDENTIAL,
-                    way_id: 1,
                 },
             );
         }
@@ -884,7 +882,6 @@ mod tests {
         let components: Vec<u32> = (0..g.node_count()).map(|i| uf.find(i) as u32).collect();
         Graph {
             graph: g,
-            osm_to_idx: FxHashMap::default(),
             components,
             rtree: rstar::RTree::bulk_load(pts),
             elevations_m: None,

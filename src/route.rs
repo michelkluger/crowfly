@@ -348,8 +348,7 @@ pub fn prune_geometric_loops(
                 // Spliced gap: synthesize a short bridge edge. We carry
                 // surface/modes/bike_attrs from one of the dropped edges so
                 // the bridge inherits roughly the same character as the
-                // road it was bypassing. `way_id = -1` marks it synthetic
-                // for any tooling that wants to flag bridged routes.
+                // road it was bypassing.
                 let bridge_length = crate::geodesy::haversine(points[prev], points[k]);
                 let template = if prev < edges.len() {
                     edges[prev]
@@ -361,7 +360,6 @@ pub fn prune_geometric_loops(
                     modes: template.modes,
                     surface: template.surface,
                     bike_attrs: template.bike_attrs,
-                    way_id: -1,
                 });
             }
         }
@@ -976,7 +974,6 @@ mod tests {
         MODE_FOOT, MODE_MTB, SURFACE_PATH, SURFACE_PAVED,
     };
     use petgraph::graph::UnGraph;
-    use rustc_hash::FxHashMap;
 
     /// Build a synthetic graph that routes A→B via either an inside-corridor
     /// path or a far detour. Used to verify the corridor cutoff hard-skips
@@ -1000,7 +997,6 @@ mod tests {
                     modes: MODE_FOOT | MODE_BIKE,
                     surface: SURFACE_PAVED,
                     bike_attrs: BCLASS_RESIDENTIAL,
-                    way_id: 1,
                 },
             );
         };
@@ -1020,7 +1016,6 @@ mod tests {
         let components: Vec<u32> = (0..n as u32).map(|_| 0).collect();
         Graph {
             graph: g,
-            osm_to_idx: FxHashMap::default(),
             components,
             rtree,
             elevations_m: None,
@@ -1071,7 +1066,6 @@ mod tests {
         let components: Vec<u32> = (0..n).map(|i| uf.find(i) as u32).collect();
         Graph {
             graph: g,
-            osm_to_idx: FxHashMap::default(),
             components,
             rtree,
             elevations_m: None,
@@ -1121,7 +1115,6 @@ mod tests {
                 modes,
                 surface,
                 bike_attrs,
-                way_id: 1,
             },
         )
     }
@@ -1376,7 +1369,6 @@ mod tests {
             modes: MODE_BIKE,
             surface: SURFACE_PAVED,
             bike_attrs: BCLASS_RESIDENTIAL,
-            way_id: 1,
         };
         let mut edges = vec![dummy; 5];
         let removed = super::prune_revisits(&mut nodes, &mut points, &mut edges);
@@ -1401,7 +1393,6 @@ mod tests {
             modes: MODE_BIKE,
             surface: SURFACE_PAVED,
             bike_attrs: BCLASS_RESIDENTIAL,
-            way_id: 1,
         };
         let mut edges = vec![dummy; 3];
         let removed = super::prune_revisits(&mut nodes, &mut points, &mut edges);
@@ -1444,7 +1435,6 @@ mod tests {
             modes: MODE_BIKE,
             surface: SURFACE_PAVED,
             bike_attrs: BCLASS_RESIDENTIAL,
-            way_id: 1,
         };
         let mut edges = vec![dummy; 20];
         let removed =
@@ -1471,7 +1461,6 @@ mod tests {
             modes: MODE_BIKE,
             surface: SURFACE_PAVED,
             bike_attrs: BCLASS_RESIDENTIAL,
-            way_id: 1,
         };
         let mut edges = vec![dummy; 29];
         let removed =
@@ -1495,7 +1484,6 @@ mod tests {
             modes: MODE_BIKE,
             surface: SURFACE_PAVED,
             bike_attrs: BCLASS_RESIDENTIAL,
-            way_id: 1,
         };
         let mut edges = vec![dummy; nodes.len() - 1];
         let removed = super::prune_revisits(&mut nodes, &mut points, &mut edges);
