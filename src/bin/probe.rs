@@ -393,48 +393,17 @@ fn run_panel(host: &str, label: &str) -> Run {
     match post(host, "/api/shape-search", body) {
         Ok(resp) => {
             let elapsed = t0.elapsed().as_secs_f64();
-            let id = resp.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
             let results = resp
                 .get("results")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
-            if !results.is_empty() {
-                let m = metrics_from_result("shape80", &results[0], elapsed);
+            if let Some(first) = results.first() {
+                let m = metrics_from_result("shape80", first, elapsed);
                 print_row(&m);
                 out.results.push(m);
-            } else if !id.is_empty() {
-                // Result delivered async — poll for completion.
-                let mut tries = 0;
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    let url = format!("/api/results/{}", id);
-                    let r = match get(host, &url) {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-                    if r.get("completed")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        if let Some(arr) = r.get("results").and_then(|v| v.as_array()) {
-                            if let Some(first) = arr.first() {
-                                let elapsed_total = t0.elapsed().as_secs_f64();
-                                let m = metrics_from_result("shape80", first, elapsed_total);
-                                print_row(&m);
-                                out.results.push(m);
-                            }
-                        }
-                        break;
-                    }
-                    tries += 1;
-                    if tries > 60 {
-                        println!("  shape80: timeout waiting for async results");
-                        break;
-                    }
-                }
             } else {
-                println!("  shape80: no results, no job_id");
+                println!("  shape80: no results");
             }
         }
         Err(e) => println!("  shape80: error {}", e),
@@ -450,15 +419,6 @@ fn print_row(m: &CaseMetrics) {
         m.tails, m.detour_loops, m.surface_transitions_per_km,
         m.ascent_m.unwrap_or(0.0), m.elapsed_s,
     );
-}
-
-fn get(host: &str, path: &str) -> Result<Value> {
-    let url = format!("{}{}", host.trim_end_matches('/'), path);
-    let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(60))
-        .call()
-        .with_context(|| format!("GET {}", url))?;
-    Ok(serde_json::from_str(&resp.into_string()?)?)
 }
 
 #[derive(Default)]
