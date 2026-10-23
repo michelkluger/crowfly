@@ -3,6 +3,7 @@ pub mod elevation;
 pub mod explore;
 pub mod fetch;
 pub mod geodesy;
+pub mod graph_cache;
 pub mod hershey_fonts;
 pub mod osm;
 pub mod output;
