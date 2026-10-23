@@ -160,6 +160,7 @@ impl<'a> Outputs<'a> {
         let geojson_str = serde_json::to_string(geojson).unwrap();
 
         HTML_TEMPLATE
+            .replace("/*BASEMAP*/", BASEMAP_JS)
             .replace("/*GEOJSON*/", &geojson_str)
             .replace("/*STATS*/", &serde_json::to_string(&stats).unwrap())
             .replace("/*SWLEGEND*/", &surface_legend_html())
@@ -290,6 +291,7 @@ impl<'a> ExploreOutputs<'a> {
             cards.push_str(&card_html(i + 1, ref_km, s));
         }
         EXPLORE_HTML_TEMPLATE
+            .replace("/*BASEMAP*/", BASEMAP_JS)
             .replace("/*GEOJSON*/", &serde_json::to_string(geojson).unwrap())
             .replace("/*CARDS*/", &serde_json::to_string(&cards).unwrap())
             .replace("/*SWLEGEND*/", &surface_legend_html())
@@ -436,6 +438,8 @@ fn card_html(rank: usize, ref_km: f64, s: &Scored) -> String {
     )
 }
 
+const BASEMAP_JS: &str = include_str!("../assets/basemap.js");
+
 const EXPLORE_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html>
 <head>
@@ -502,7 +506,7 @@ const EXPLORE_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   </header>
   <div class="controls">
     <b>Basemap:</b>
-    <label><input type="radio" name="bm" value="voyager" checked> street</label>
+    <label><input type="radio" name="bm" value="street" checked> street</label>
     <label><input type="radio" name="bm" value="topo"> terrain</label>
   </div>
   <div id="cards"></div>
@@ -520,50 +524,14 @@ function extend(coords) {
 }
 data.features.forEach(f => extend(f.geometry.coordinates));
 
+/*BASEMAP*/
+// Basemap style and street/terrain toggle: assets/basemap.js, inlined above.
 const map = new maplibregl.Map({
   container: 'map',
-  style: {
-    version: 8,
-    sources: {
-      voyager: {
-        type: 'raster',
-        tiles: [
-          'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
-          'https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
-          'https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
-          'https://d.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png'
-        ],
-        tileSize: 256,
-        maxzoom: 19,
-        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
-      },
-      topo: {
-        type: 'raster',
-        tiles: [
-          'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
-          'https://b.tile.opentopomap.org/{z}/{x}/{y}.png',
-          'https://c.tile.opentopomap.org/{z}/{x}/{y}.png'
-        ],
-        tileSize: 256,
-        maxzoom: 17,
-        attribution: 'Map data &copy; OpenStreetMap contributors, SRTM | &copy; OpenTopoMap (CC-BY-SA)'
-      }
-    },
-    layers: [
-      { id: 'bm-voyager', type: 'raster', source: 'voyager', layout: { visibility: 'visible' } },
-      { id: 'bm-topo',    type: 'raster', source: 'topo',    layout: { visibility: 'none' } }
-    ]
-  },
+  style: BASEMAP_STYLE,
   bounds, fitBoundsOptions: { padding: 50 }
 });
-
-document.querySelectorAll('input[name="bm"]').forEach(r => {
-  r.addEventListener('change', () => {
-    const v = r.value;
-    map.setLayoutProperty('bm-voyager', 'visibility', v === 'voyager' ? 'visible' : 'none');
-    map.setLayoutProperty('bm-topo',    'visibility', v === 'topo'    ? 'visible' : 'none');
-  });
-});
+setupBasemaps(map);
 
 let activeRank = 1;
 function buildGpx(name, coords) {
@@ -766,7 +734,7 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 <div class="panel info" id="info">loading…</div>
 <div class="panel controls">
   <div><b>Basemap</b></div>
-  <label><input type="radio" name="bm" value="voyager" checked> Voyager (street)</label>
+  <label><input type="radio" name="bm" value="street" checked> street</label>
   <label><input type="radio" name="bm" value="topo"> OpenTopoMap (terrain)</label>
   <button id="dl">⬇ Download GPX</button>
   <div style="margin-top:6px;"><b>Surface</b></div>
@@ -791,50 +759,14 @@ function extend(coords) {
 }
 data.features.forEach(f => extend(f.geometry.coordinates));
 
+/*BASEMAP*/
+// Basemap style and street/terrain toggle: assets/basemap.js, inlined above.
 const map = new maplibregl.Map({
   container: 'map',
-  style: {
-    version: 8,
-    sources: {
-      voyager: {
-        type: 'raster',
-        tiles: [
-          'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
-          'https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
-          'https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
-          'https://d.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png'
-        ],
-        tileSize: 256,
-        maxzoom: 19,
-        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
-      },
-      topo: {
-        type: 'raster',
-        tiles: [
-          'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
-          'https://b.tile.opentopomap.org/{z}/{x}/{y}.png',
-          'https://c.tile.opentopomap.org/{z}/{x}/{y}.png'
-        ],
-        tileSize: 256,
-        maxzoom: 17,
-        attribution: 'Map data &copy; OpenStreetMap contributors, SRTM | &copy; OpenTopoMap (CC-BY-SA)'
-      }
-    },
-    layers: [
-      { id: 'bm-voyager', type: 'raster', source: 'voyager', layout: { visibility: 'visible' } },
-      { id: 'bm-topo',    type: 'raster', source: 'topo',    layout: { visibility: 'none' } }
-    ]
-  },
+  style: BASEMAP_STYLE,
   bounds, fitBoundsOptions: { padding: 50 }
 });
-
-document.querySelectorAll('input[name="bm"]').forEach(r => {
-  r.addEventListener('change', () => {
-    const v = r.value;
-    map.setLayoutProperty('bm-voyager', 'visibility', v === 'voyager' ? 'visible' : 'none');
-    map.setLayoutProperty('bm-topo',    'visibility', v === 'topo'    ? 'visible' : 'none');
-  });
-});
+setupBasemaps(map);
 
 function buildGpx(name, coords) {
   const pts = coords.map(c =>

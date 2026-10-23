@@ -18,7 +18,7 @@ way), with three ways to use it:
 Suggestions come with: surface breakdown (paved / gravel / path / unpaved /
 ferry), elevation profile (ascent, descent, max, min, sparkline), corridor
 deviation, ferry segments, and a one-click GPX download. The map basemap
-toggles between street (CartoDB Voyager) and terrain (OpenTopoMap).
+toggles between street (OpenFreeMap) and terrain (OpenTopoMap).
 
 ## Quick start — interactive
 
@@ -174,8 +174,9 @@ allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
    on-disk cache (CLI without a DEM).
 9. **Output** (`src/output.rs`, `assets/index.html`) — static HTML viewers
    for `plan`/`explore`, an interactive single-page app for `serve`. Both
-   embed MapLibre GL JS over CartoDB / OpenTopoMap raster tiles. No API key
-   needed for either basemap.
+   embed MapLibre GL JS over OpenFreeMap vector tiles (street) or OpenTopoMap
+   raster tiles (terrain), set up in `assets/basemap.js`. No API key needed
+   for either basemap.
 
 ## Common flags
 
