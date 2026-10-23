@@ -186,64 +186,79 @@ pub fn generate_country_candidates_in_bbox(
     out
 }
 
-/// Sample candidates whose start and end both fall inside a border strip
-/// (within `strip_km` of any bbox edge) and on different sides of the bbox.
-/// Used for "I want lines that cross the country" mode.
-pub fn generate_border_to_border_candidates(
-    bbox: BBox,
+/// A point on the country's outline: the outermost graph node in one bearing
+/// sector around the centre of the region.
+#[derive(Clone, Copy, Debug)]
+pub struct OutlinePoint {
+    /// Compass bearing of the point from the centre, degrees.
+    pub bearing_deg: f64,
+    pub point: LatLon,
+}
+
+/// Approximate the country's border by the outermost graph node in each of
+/// `sectors` equal bearing sectors around the centre of the graph's bbox.
+/// Roads reach the border all round, so these are real, routable border
+/// points — unlike strips along the bbox, which put many "border" endpoints
+/// where the country isn't. Exact for star-shaped countries; a deep
+/// concavity just contributes its outermost road.
+pub fn country_outline(graph: &Graph, sectors: usize) -> Vec<OutlinePoint> {
+    let b = graph.bbox();
+    let centre = LatLon::new((b.lat_min + b.lat_max) * 0.5, (b.lon_min + b.lon_max) * 0.5);
+    let cos_lat = centre.lat.to_radians().cos();
+    // Per sector: (squared local distance, bearing, point) of the farthest node.
+    let mut best: Vec<Option<(f64, f64, LatLon)>> = vec![None; sectors];
+    for &p in graph.graph.node_weights() {
+        // Local equirectangular offsets: plenty for ordering within a sector.
+        let east = (p.lon - centre.lon) * cos_lat;
+        let north = p.lat - centre.lat;
+        let d2 = east * east + north * north;
+        let bearing = east.atan2(north).to_degrees().rem_euclid(360.0);
+        let s = ((bearing / 360.0 * sectors as f64) as usize).min(sectors - 1);
+        match best[s] {
+            Some((farthest, _, _)) if farthest >= d2 => {}
+            _ => best[s] = Some((d2, bearing, p)),
+        }
+    }
+    best.into_iter()
+        .flatten()
+        .map(|(_, bearing_deg, point)| OutlinePoint { bearing_deg, point })
+        .collect()
+}
+
+/// Lines across the country: both ends on its `outline`, at least
+/// `MIN_CROSSING_ANGLE_DEG` apart around the centre — so the line runs
+/// through the country rather than along its edge — with a straight-line
+/// length in `[distance_min_km, distance_max_km]`.
+pub fn generate_crossing_candidates(
+    outline: &[OutlinePoint],
     n: usize,
     distance_min_km: f64,
     distance_max_km: f64,
-    strip_km: f64,
     seed: u64,
 ) -> Vec<Candidate> {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    const MIN_CROSSING_ANGLE_DEG: f64 = 120.0;
+    if outline.len() < 2 {
+        return Vec::new();
+    }
     let mut rng = StdRng::seed_from_u64(seed);
-    // Convert the strip width into degrees. Approximate cos(lat) for the longitude
-    // axis using the bbox midpoint — accurate enough at country scale.
-    let mid_lat = (bbox.lat_min + bbox.lat_max) * 0.5;
-    let strip_lat_deg = strip_km / 111.0;
-    let strip_lon_deg = strip_km / (111.0 * mid_lat.to_radians().cos().max(0.1));
-
-    let pick_on_border = |rng: &mut StdRng| -> (LatLon, u8) {
-        let side: u8 = rng.gen_range(0..4);
-        let (lat, lon) = match side {
-            0 => (
-                rng.gen_range((bbox.lat_max - strip_lat_deg)..bbox.lat_max),
-                rng.gen_range(bbox.lon_min..bbox.lon_max),
-            ),
-            1 => (
-                rng.gen_range(bbox.lat_min..bbox.lat_max),
-                rng.gen_range((bbox.lon_max - strip_lon_deg)..bbox.lon_max),
-            ),
-            2 => (
-                rng.gen_range(bbox.lat_min..(bbox.lat_min + strip_lat_deg)),
-                rng.gen_range(bbox.lon_min..bbox.lon_max),
-            ),
-            _ => (
-                rng.gen_range(bbox.lat_min..bbox.lat_max),
-                rng.gen_range(bbox.lon_min..(bbox.lon_min + strip_lon_deg)),
-            ),
-        };
-        (LatLon::new(lat, lon), side)
-    };
-
     let mut out = Vec::with_capacity(n);
-    let max_attempts = (n * 40).max(200);
-    let mut attempts = 0;
-    while out.len() < n && attempts < max_attempts {
-        attempts += 1;
-        let (start, s1) = pick_on_border(&mut rng);
-        let (end, s2) = pick_on_border(&mut rng);
-        if s1 == s2 {
+    for _ in 0..(n * 80).max(2_000) {
+        if out.len() >= n {
+            break;
+        }
+        let a = outline[rng.gen_range(0..outline.len())];
+        let b = outline[rng.gen_range(0..outline.len())];
+        let gap = (a.bearing_deg - b.bearing_deg).abs();
+        if gap.min(360.0 - gap) < MIN_CROSSING_ANGLE_DEG {
             continue;
         }
-        let d_km = haversine(start, end) / 1000.0;
+        let d_km = haversine(a.point, b.point) / 1000.0;
         if d_km < distance_min_km || d_km > distance_max_km {
             continue;
         }
-        out.push(Candidate::from_endpoints(start, end));
+        out.push(Candidate::from_endpoints(a.point, b.point));
     }
     out
 }
@@ -1023,6 +1038,64 @@ mod tests {
             Some(&cancel),
         );
         assert!(matches!(&r[0], Err((_, m)) if m == CANCELLED));
+    }
+
+    /// A round "country": 36 border nodes (one per 10° sector, mid-sector)
+    /// at ~55 km from the centre, each with an inner node on the same bearing.
+    fn ring_country() -> (Graph, LatLon) {
+        let centre = LatLon::new(46.8, 8.2);
+        let cos_lat = centre.lat.to_radians().cos();
+        let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
+        for i in 0..36 {
+            let a = (i as f64 * 10.0 + 5.0).to_radians();
+            for r in [0.5, 0.2] {
+                g.add_node(LatLon::new(
+                    centre.lat + r * a.cos(),
+                    centre.lon + r * a.sin() / cos_lat,
+                ));
+            }
+        }
+        (Graph::from_graph(g), centre)
+    }
+
+    #[test]
+    fn outline_takes_the_outermost_node_per_bearing() {
+        let (graph, centre) = ring_country();
+        let outline = country_outline(&graph, 36);
+        assert_eq!(outline.len(), 36, "one point per sector");
+        for o in &outline {
+            let d = haversine(centre, o.point);
+            assert!(d > 50_000.0, "inner node picked: {d:.0} m from the centre");
+        }
+    }
+
+    #[test]
+    fn crossings_join_far_apart_outline_points_within_bounds() {
+        let (graph, _) = ring_country();
+        let outline = country_outline(&graph, 36);
+        let bearing_of = |p: LatLon| {
+            outline
+                .iter()
+                .find(|o| o.point == p)
+                .expect("endpoint is an outline point")
+                .bearing_deg
+        };
+        // Chords at least 120° apart on this ring are ~96–111 km long.
+        let cands = generate_crossing_candidates(&outline, 40, 105.0, 110.0, 9);
+        assert_eq!(cands.len(), 40);
+        for c in &cands {
+            let gap = (bearing_of(c.start) - bearing_of(c.end)).abs();
+            assert!(gap.min(360.0 - gap) >= 120.0, "ends only {gap:.0}° apart");
+            assert!(
+                (105.0..=110.0).contains(&c.distance_km),
+                "{} km",
+                c.distance_km
+            );
+        }
+        let again = generate_crossing_candidates(&outline, 40, 105.0, 110.0, 9);
+        let ends = |v: &[Candidate]| v.iter().map(|c| (c.start, c.end)).collect::<Vec<_>>();
+        assert_eq!(ends(&cands), ends(&again), "same seed, same candidates");
+        assert!(generate_crossing_candidates(&outline, 10, 200.0, 300.0, 9).is_empty());
     }
 
     #[test]

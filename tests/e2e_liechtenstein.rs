@@ -15,7 +15,7 @@ use crowfly::route::{self, RouteParams};
 use crowfly::server::{router, AppState, ServerState};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MODES: u8 = MODE_FOOT | MODE_BIKE | MODE_MTB;
@@ -45,16 +45,7 @@ fn extract() -> Option<PathBuf> {
 /// Serve `graph` (no DEM, no no-go zones) on an ephemeral port from a
 /// background runtime and return the base URL once it answers.
 fn spawn_server(graph: Graph) -> String {
-    let bbox = graph.bbox();
-    let state = AppState(Arc::new(ServerState {
-        graph,
-        bbox,
-        no_go: Vec::new(),
-        long_edge_threshold_m: 800.0,
-        dem: None,
-        progress: Mutex::new(None),
-        search_cancel: Default::default(),
-    }));
+    let state = AppState(Arc::new(ServerState::new(graph, Vec::new(), 800.0, None)));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -105,6 +96,16 @@ fn results(j: &Value) -> &Vec<Value> {
 
 fn lonlat(v: &Value) -> LatLon {
     LatLon::new(v[1].as_f64().unwrap(), v[0].as_f64().unwrap())
+}
+
+/// Angle (degrees, 0–180) between `a` and `b` as seen from `centre`.
+fn bearing_gap(centre: LatLon, a: LatLon, b: LatLon) -> f64 {
+    let bearing = |p: LatLon| {
+        let east = (p.lon - centre.lon) * centre.lat.to_radians().cos();
+        east.atan2(p.lat - centre.lat).to_degrees()
+    };
+    let gap = (bearing(a) - bearing(b)).abs() % 360.0;
+    gap.min(360.0 - gap)
 }
 
 #[test]
@@ -182,6 +183,22 @@ fn api_end_to_end() {
         a["results"], again["results"],
         "seeded search must replay exactly"
     );
+
+    // Crossings: no length bounds needed; both ends on the country's
+    // outline, on roughly opposite sides of its centre.
+    let crossing = json!({ "modes": "foot,bike,mtb", "elevation_samples": 0, "width_m": 3000,
+                           "border_to_border": true, "seed": 3 });
+    let (status, j) = post(&base, "/api/country", &crossing);
+    assert_eq!(status, 200, "{j}");
+    assert!(!results(&j).is_empty(), "no crossing found: {j}");
+    let centre = lonlat(&info["center"]);
+    for r in results(&j) {
+        let gap = bearing_gap(centre, lonlat(&r["start"]), lonlat(&r["end"]));
+        assert!(
+            gap >= 119.0,
+            "crossing ends only {gap:.0}° apart around the centre"
+        );
+    }
 
     // Shape: closed loops.
     let shape = json!({ "kind": "circle", "perimeter_km": 10, "width_m": 5000, "count": 2,

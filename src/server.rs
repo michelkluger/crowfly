@@ -47,6 +47,32 @@ pub struct ServerState {
     pub progress: Mutex<Option<ProgressTracker>>,
     /// Cancel flag of the most recent search; see [`Search`].
     pub search_cancel: Mutex<Arc<AtomicBool>>,
+    /// The country's edge — outermost road node per bearing from the centre
+    /// — where crossing ("border to border") searches start and end.
+    pub outline: Vec<explore::OutlinePoint>,
+}
+
+impl ServerState {
+    /// State for serving `graph`: derives its bbox and outline.
+    pub fn new(
+        graph: Graph,
+        no_go: Vec<NoGoZone>,
+        long_edge_threshold_m: f64,
+        dem: Option<Dem>,
+    ) -> Self {
+        let bbox = graph.bbox();
+        let outline = explore::country_outline(&graph, 360);
+        Self {
+            graph,
+            bbox,
+            no_go,
+            long_edge_threshold_m,
+            dem,
+            progress: Mutex::new(None),
+            search_cancel: Default::default(),
+            outline,
+        }
+    }
 }
 
 /// One search's cancel flag and its claim on the shared progress slot.
@@ -134,6 +160,8 @@ pub struct RejectionStats {
     pub no_go: usize,
     pub too_short: usize,
     pub too_long: usize,
+    /// Shape candidates with a leg that detoured past the fidelity cap.
+    pub too_winding: usize,
     pub other: usize,
 }
 
@@ -152,6 +180,8 @@ impl RejectionStats {
             self.too_long += 1;
         } else if m.contains("no route") || m.contains("graph empty") {
             self.no_route += 1;
+        } else if m.contains("shape fidelity cap") {
+            self.too_winding += 1;
         } else {
             self.other += 1;
         }
@@ -163,6 +193,7 @@ impl RejectionStats {
         self.no_go += other.no_go;
         self.too_short += other.too_short;
         self.too_long += other.too_long;
+        self.too_winding += other.too_winding;
         self.other += other.other;
     }
     pub fn total(&self) -> usize {
@@ -172,6 +203,7 @@ impl RejectionStats {
             + self.no_go
             + self.too_short
             + self.too_long
+            + self.too_winding
             + self.other
     }
     pub fn to_json(&self) -> Value {
@@ -182,6 +214,7 @@ impl RejectionStats {
             "no_go":             self.no_go,
             "too_short":         self.too_short,
             "too_long":          self.too_long,
+            "too_winding":       self.too_winding,
             "other":             self.other,
             "total":             self.total(),
         })
@@ -313,20 +346,21 @@ pub struct CountryReq {
     pub width_m: f64,
     #[serde(default = "default_count")]
     pub count: usize,
-    #[serde(default = "default_dist_min")]
-    pub distance_min_km: f64,
-    #[serde(default = "default_dist_max")]
-    pub distance_max_km: f64,
+    /// Straight-line length bounds (km). Both the line and its routed
+    /// distance must fall inside. Optional for crossings, which are bounded
+    /// by the country itself; other lines default to 100–220 km.
+    #[serde(default)]
+    pub distance_min_km: Option<f64>,
+    #[serde(default)]
+    pub distance_max_km: Option<f64>,
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default = "default_elev_samples")]
     pub elevation_samples: usize,
-    /// Restrict to lines whose endpoints both fall inside the border strip,
-    /// on different sides of the bbox.
+    /// Only lines that cross the country: both ends on its outline (the
+    /// outermost roads, i.e. at the border), on roughly opposite sides.
     #[serde(default)]
     pub border_to_border: bool,
-    #[serde(default = "default_border_strip")]
-    pub border_strip_km: f64,
     /// Keep generating fresh batches of candidates until at least this many
     /// viable routes are found, up to `max_batches` attempts. Defaults to
     /// `count` (try to fill the requested number).
@@ -377,9 +411,10 @@ pub struct TextReq {
     #[serde(default = "default_text_letter")]
     pub letter_height_m: f64,
     /// Wrap to a new line when a line's horizontal extent would exceed this
-    /// many metres. 0 disables wrapping.
-    #[serde(default = "default_text_wrap")]
-    pub wrap_m: f64,
+    /// many metres. 0 disables wrapping; omitted = 80 % of the region's
+    /// east–west width, so the message fits the country.
+    #[serde(default)]
+    pub wrap_m: Option<f64>,
     /// Font name: `simplex` or `cursive`.
     #[serde(default = "default_text_font")]
     pub font: String,
@@ -407,9 +442,6 @@ pub struct TextReq {
 fn default_text_letter() -> f64 {
     15_000.0
 }
-fn default_text_wrap() -> f64 {
-    100_000.0
-}
 fn default_text_font() -> String {
     "simplex".into()
 }
@@ -418,10 +450,6 @@ fn default_text_detour_cap() -> f64 {
 }
 fn default_text_candidates() -> usize {
     200
-}
-
-fn default_border_strip() -> f64 {
-    25.0
 }
 
 fn default_modes() -> String {
@@ -572,10 +600,16 @@ async fn handle_country(
     let seed = seed_or_random(req.seed);
     let inner = state.0.clone();
     let bbox = inner.bbox;
-    let dmin = req.distance_min_km;
-    let dmax = req.distance_max_km;
-    let border_strip = req.border_strip_km;
     let border = req.border_to_border;
+    // Crossings are bounded by the country itself; other lines need a range.
+    let (dmin, dmax) = if border {
+        (req.distance_min_km, req.distance_max_km)
+    } else {
+        (
+            Some(req.distance_min_km.unwrap_or_else(default_dist_min)),
+            Some(req.distance_max_km.unwrap_or_else(default_dist_max)),
+        )
+    };
     let long_edge = inner.long_edge_threshold_m;
     let min_viable = req.min_viable.unwrap_or(count).max(1);
     let strict = req.strict_corridor;
@@ -603,22 +637,17 @@ async fn handle_country(
                 paved_only,
             };
             let filter = RouteFilter {
-                distance_min_km: Some(dmin),
-                distance_max_km: Some(dmax),
+                distance_min_km: dmin,
+                distance_max_km: dmax,
                 snap_tolerance_m: b.half_width_m.max(2_000.0),
                 enforce_corridor: true,
             };
+            let (lo, hi) = (dmin.unwrap_or(0.0), dmax.unwrap_or(f64::INFINITY));
             let candidates = if border {
-                explore::generate_border_to_border_candidates(
-                    bbox,
-                    b.n_sample,
-                    dmin,
-                    dmax,
-                    border_strip,
-                    b.seed,
-                )
+                let outline = &inner_for_task.outline;
+                explore::generate_crossing_candidates(outline, b.n_sample, lo, hi, b.seed)
             } else {
-                explore::generate_country_candidates_in_bbox(bbox, b.n_sample, dmin, dmax, b.seed)
+                explore::generate_country_candidates_in_bbox(bbox, b.n_sample, lo, hi, b.seed)
             };
             task.add_total(candidates.len());
             Some(explore::evaluate(
@@ -863,7 +892,16 @@ async fn handle_text(
     let n_candidates = req.candidates.clamp(20, 1000);
     let seed = seed_or_random(req.seed);
     let bbox = state.0.bbox;
-    let wrap_m = if req.wrap_m > 0.0 { req.wrap_m } else { 0.0 };
+    // Default: wrap at 80 % of the region's east–west width, so the message
+    // fits the country instead of running off it.
+    let wrap_m = req
+        .wrap_m
+        .unwrap_or_else(|| {
+            let mid_lat = (bbox.lat_min + bbox.lat_max) * 0.5;
+            let west = LatLon::new(mid_lat, bbox.lon_min);
+            0.8 * haversine(west, LatLon::new(mid_lat, bbox.lon_max))
+        })
+        .max(0.0);
 
     // Total tracked = number of (centre, bearing) candidates the search will
     // visit. The search bumps this counter once per candidate, accept or
@@ -927,7 +965,7 @@ async fn handle_text(
             "text_render_meta": {
                 "evaluated": progress_total,
                 "missing_glyphs": probe.missing_glyphs,
-                "hint": "no placement found where every letter routes within the detour cap — try larger letter_km, shorter text, or higher detour_cap",
+                "hint": "no place found where every letter can be drawn closely enough — try bigger letters or a shorter message",
             },
         })));
     };
@@ -1045,7 +1083,7 @@ async fn handle_text(
             "skipped_strokes": 0,
             "missing_glyphs": probe.missing_glyphs,
             "letter_height_m": req.letter_height_m,
-            "wrap_m": req.wrap_m,
+            "wrap_m": wrap_m,
             "bbox_along_m": best.bbox_along_m,
             "bbox_across_m": best.bbox_across_m,
             "detour_pct": (detour * 100.0).round(),
@@ -1293,3 +1331,42 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 const BASEMAP_JS: &str = include_str!("../assets/basemap.js");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Buckets match on message text, so pin them to the messages the
+    /// routing code actually produces (see explore.rs / route.rs).
+    #[test]
+    fn rejections_land_in_the_right_bucket() {
+        let mut s = RejectionStats::default();
+        for msg in [
+            "endpoint too far from graph: start 3100 m, end 20 m (tolerance 2000 m)",
+            "leg 3: snap displacement too large (2500 m / 10 m)",
+            "max deviation 4100 m exceeds corridor half-width 4000 m",
+            "no-go: national_park",
+            "routed distance 12.0 km below minimum 16.0 km",
+            "routed distance 31.0 km above maximum 24.0 km",
+            "no route found between selected nodes — try a wider corridor or different modes",
+            "leg 2: detour 150% exceeds shape fidelity cap 120%",
+            "cancelled",
+        ] {
+            s.classify(msg);
+        }
+        let j = s.to_json();
+        for (bucket, n) in [
+            ("snap_too_far", 2),
+            ("corridor_violated", 1),
+            ("no_go", 1),
+            ("too_short", 1),
+            ("too_long", 1),
+            ("no_route", 1),
+            ("too_winding", 1),
+            ("other", 1),
+            ("total", 9),
+        ] {
+            assert_eq!(j[bucket], n, "{bucket}");
+        }
+    }
+}
