@@ -155,6 +155,12 @@ fn junction_bits(graph: &UnGraph<LatLon, EdgeData>) -> Vec<u64> {
     bits
 }
 
+/// How many nearest nodes endpoint snapping weighs (K=30 covers OSM's
+/// typical fragmentation around lakes and private property).
+const SNAP_CANDIDATES: usize = 30;
+/// How many nearest nodes snapping scans for ones the activity can use.
+const SNAP_SCAN: usize = 2_000;
+
 pub struct Graph {
     pub graph: UnGraph<LatLon, EdgeData>,
     /// Per-NodeIndex component representative. Computed once at build time so
@@ -340,27 +346,20 @@ impl Graph {
     /// candidates near each endpoint from the R-tree, then keep the cheapest
     /// (start, end) pair whose components match. K=30 covers OSM's typical
     /// fragmentation around lakes / private property without going O(N).
+    ///
+    /// Only nodes with an edge open to `modes` (paved, if `paved_only`) are
+    /// candidates: the nearest node overall is often a footpath or farm
+    /// track that, say, a road bike could never leave, which would fail the
+    /// route before it starts.
     pub fn closest_connected_pair(
         &self,
         start: LatLon,
         end: LatLon,
+        modes: u8,
+        paved_only: bool,
     ) -> Option<(NodeIndex, NodeIndex, f64, f64)> {
-        if self.graph.node_count() == 0 {
-            return None;
-        }
-        let k = 30;
-        let s_cands: Vec<NodePoint> = self
-            .rtree
-            .nearest_neighbor_iter(&[start.lon, start.lat])
-            .take(k)
-            .copied()
-            .collect();
-        let e_cands: Vec<NodePoint> = self
-            .rtree
-            .nearest_neighbor_iter(&[end.lon, end.lat])
-            .take(k)
-            .copied()
-            .collect();
+        let s_cands = self.nearest_usable(start, modes, paved_only, SNAP_CANDIDATES);
+        let e_cands = self.nearest_usable(end, modes, paved_only, SNAP_CANDIDATES);
         let mut best: Option<(f64, NodeIndex, NodeIndex, f64, f64)> = None;
         for s in &s_cands {
             for e in &e_cands {
@@ -370,12 +369,47 @@ impl Graph {
                 let sd = haversine(start, LatLon::new(s.lat, s.lon));
                 let ed = haversine(end, LatLon::new(e.lat, e.lon));
                 let total = sd + ed;
-                if best.map_or(true, |(bt, ..)| total < bt) {
+                if best.is_none_or(|(bt, ..)| total < bt) {
                     best = Some((total, s.idx, e.idx, sd, ed));
                 }
             }
         }
         best.map(|(_, si, ei, sd, ed)| (si, ei, sd, ed))
+    }
+
+    /// Whether `n` has an edge open to `modes` (paved, if `paved_only`).
+    pub fn usable_by(&self, n: NodeIndex, modes: u8, paved_only: bool) -> bool {
+        self.graph.edges(n).any(|e| {
+            let d = e.weight();
+            (d.modes & modes) != 0 && (!paved_only || d.surface == SURFACE_PAVED)
+        })
+    }
+
+    /// Up to `k` nodes nearest to `p` that `usable_by` accepts, among the
+    /// `SNAP_SCAN` nearest overall (so a spot far from any usable way stays
+    /// cheap: it just yields nothing).
+    pub fn nearest_usable(
+        &self,
+        p: LatLon,
+        modes: u8,
+        paved_only: bool,
+        k: usize,
+    ) -> Vec<NodePoint> {
+        self.rtree
+            .nearest_neighbor_iter(&[p.lon, p.lat])
+            .take(SNAP_SCAN)
+            .filter(|np| self.usable_by(np.idx, modes, paved_only))
+            .take(k)
+            .copied()
+            .collect()
+    }
+
+    /// Distance (m) from `p` to the nearest node usable by the activity, if
+    /// any is within the `SNAP_SCAN` nearest nodes.
+    pub fn snap_distance_m(&self, p: LatLon, modes: u8, paved_only: bool) -> Option<f64> {
+        self.nearest_usable(p, modes, paved_only, 1)
+            .first()
+            .map(|np| haversine(p, LatLon::new(np.lat, np.lon)))
     }
 }
 
@@ -960,6 +994,45 @@ mod tests {
             junction,
             [true, true, false, false, true, false, true, true]
         );
+    }
+
+    #[test]
+    fn snapping_skips_ways_the_activity_cannot_use() {
+        // A footpath 0-1 right at the query points, a gravel bike track 2-3
+        // ~220 m north and a paved bike road 4-5 ~440 m north, all joined.
+        let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
+        let n: Vec<NodeIndex> = [0.0, 0.002, 0.004]
+            .iter()
+            .flat_map(|&lat| [LatLon::new(lat, 0.0), LatLon::new(lat, 0.001)])
+            .map(|p| g.add_node(p))
+            .collect();
+        let edge = |modes, surface| EdgeData {
+            length_m: 100.0,
+            modes,
+            surface,
+            bike_attrs: BCLASS_RESIDENTIAL,
+        };
+        g.add_edge(n[0], n[1], edge(MODE_FOOT, SURFACE_PAVED));
+        g.add_edge(n[2], n[3], edge(MODE_BIKE, SURFACE_GRAVEL));
+        g.add_edge(n[4], n[5], edge(MODE_BIKE, SURFACE_PAVED));
+        g.add_edge(n[1], n[3], edge(MODE_FOOT, SURFACE_PAVED));
+        g.add_edge(n[3], n[5], edge(MODE_FOOT, SURFACE_PAVED));
+        let graph = Graph::from_graph(g);
+        let (a, b) = (LatLon::new(0.0, 0.0), LatLon::new(0.0, 0.001));
+        let pair = |modes, paved| {
+            let (s, e, _, _) = graph.closest_connected_pair(a, b, modes, paved).unwrap();
+            (s.index(), e.index())
+        };
+        assert_eq!(pair(MODE_FOOT, false), (0, 1));
+        assert_eq!(pair(MODE_BIKE, false), (2, 3));
+        assert_eq!(pair(MODE_BIKE, true), (4, 5));
+        let d = graph.snap_distance_m(a, MODE_BIKE, true).unwrap();
+        assert!((440.0..450.0).contains(&d), "{d}");
+        // Nothing here is open to mountain bikes.
+        assert!(graph
+            .closest_connected_pair(a, b, MODE_MTB, false)
+            .is_none());
+        assert!(graph.snap_distance_m(a, MODE_MTB, false).is_none());
     }
 
     #[test]

@@ -842,12 +842,14 @@ pub fn route_loop(
     // hairpin "tail" pattern at shape vertices.
     let mut start_prev: Option<NodeIndex> = None;
     for (i, w) in vertices.windows(2).enumerate() {
-        let pair = graph.closest_connected_pair(w[0], w[1]).ok_or(LegFailure {
-            leg_index: i,
-            from: w[0],
-            to: w[1],
-            message: "graph empty for leg endpoints".into(),
-        })?;
+        let pair = graph
+            .closest_connected_pair(w[0], w[1], params.modes, params.paved_only)
+            .ok_or(LegFailure {
+                leg_index: i,
+                from: w[0],
+                to: w[1],
+                message: "no usable road near the leg endpoints".into(),
+            })?;
         let (s_idx, e_idx, _, _) = pair;
         // Only thread `start_prev` when the next leg's start coincides with
         // the previous leg's end node — otherwise the predecessor refers to

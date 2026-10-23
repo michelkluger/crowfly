@@ -464,8 +464,8 @@ pub fn route_stroke(
     let mut intended = 0.0_f64;
     for (i, w) in waypoints.windows(2).enumerate() {
         let pair = graph
-            .closest_connected_pair(w[0], w[1])
-            .ok_or_else(|| format!("leg {}: graph empty", i + 1))?;
+            .closest_connected_pair(w[0], w[1], params.modes, params.paved_only)
+            .ok_or_else(|| format!("leg {}: no usable road nearby", i + 1))?;
         let (s_idx, e_idx, sd, ed) = pair;
         if sd > snap_tolerance_m || ed > snap_tolerance_m {
             return Err(format!(
@@ -577,7 +577,7 @@ fn route_pen_up(
             length_m: 0.0,
         });
     }
-    let pair = graph.closest_connected_pair(from, to)?;
+    let pair = graph.closest_connected_pair(from, to, modes, paved_only)?;
     let (s_idx, e_idx, _, _) = pair;
     // Corridor wide enough that "shortest path" basically wins; α small so
     // we don't bend the connector toward the straight line and waste km.

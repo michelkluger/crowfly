@@ -305,8 +305,8 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         }
         let dem = attach_dem(&mut graph, load_dem(&args.common.dem)?);
         let (start_idx, end_idx, sd, ed) = graph
-            .closest_connected_pair(start, end)
-            .ok_or_else(|| anyhow!("graph empty"))?;
+            .closest_connected_pair(start, end, modes, args.common.paved_only)
+            .ok_or_else(|| anyhow!("no road for these modes near the endpoints"))?;
         println!(
             "Snapped to a connected component: start {:.0} m, end {:.0} m",
             sd, ed

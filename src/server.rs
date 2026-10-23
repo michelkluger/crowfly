@@ -14,7 +14,7 @@ use crate::elevation::profile_from_dem;
 use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
 use crate::hershey_fonts::Font;
-use crate::osm::{self, BBox, Graph, SURFACE_LABELS, SURFACE_PAVED};
+use crate::osm::{self, BBox, Graph, SURFACE_LABELS};
 use crate::route::RouteParams;
 use crate::text;
 use crate::viability::NoGoZone;
@@ -87,12 +87,9 @@ impl ServerState {
         if let Some(outline) = self.outlines.lock().unwrap().get(&key) {
             return outline.clone();
         }
-        let g = &self.graph.graph;
-        let outline = Arc::new(explore::country_outline(&self.graph, 360, |n| {
-            g.edges(n).any(|e| {
-                let d = e.weight();
-                (d.modes & modes) != 0 && (!paved_only || d.surface == SURFACE_PAVED)
-            })
+        let graph = &self.graph;
+        let outline = Arc::new(explore::country_outline(graph, 360, |n| {
+            graph.usable_by(n, modes, paved_only)
         }));
         self.outlines.lock().unwrap().insert(key, outline.clone());
         outline
@@ -265,13 +262,19 @@ const SHAPE_SCHEDULE: [(f64, f64); 5] =
 /// Inputs of the persistence loop shared by country and shape search.
 struct Retry<'a> {
     schedule: &'a [(f64, f64)],
+    /// How many times to run the schedule, with fresh candidates each time,
+    /// before settling for fewer results than asked for.
+    rounds: usize,
     /// Never widen the corridor.
     strict: bool,
     base_half_m: f64,
     base_sample: usize,
     seed: u64,
-    min_viable: usize,
 }
+
+/// Rounds of the retry schedule: thorough by default, since users would
+/// rather wait a little longer and pick from more routes.
+const SEARCH_ROUNDS: usize = 3;
 
 /// One batch of [`run_batches`].
 struct Batch {
@@ -285,18 +288,26 @@ struct Batch {
     seed: u64,
 }
 
-/// Run `retry`'s batches until `min_viable` results are found, the schedule
-/// runs out, the search is cancelled, or `route` returns None (nothing left
-/// to sample). Rejections are bucketed for the empty-state UI.
+/// Run `retry`'s batches until `enough` accepts the results, the schedule
+/// has run `rounds` times, the search is cancelled, or `route` returns None
+/// (nothing left to sample). Rejections are bucketed for the empty-state UI.
+/// How much is searched depends on the seed and the results, never on the
+/// clock, so a permalink replays the same search.
 fn run_batches<T, C>(
     task: &Search,
     label: &str,
     retry: &Retry,
+    enough: impl Fn(&[T]) -> bool,
     mut route: impl FnMut(&Batch) -> Option<Vec<Result<T, (C, String)>>>,
 ) -> (Vec<T>, RejectionStats) {
     let mut all = Vec::new();
     let mut stats = RejectionStats::default();
-    for (i, &(sample_factor, widen_km)) in retry.schedule.iter().enumerate() {
+    let steps = retry
+        .schedule
+        .iter()
+        .cycle()
+        .take(retry.schedule.len() * retry.rounds);
+    for (i, &(sample_factor, widen_km)) in steps.enumerate() {
         if task.cancelled() {
             break;
         }
@@ -326,7 +337,7 @@ fn run_batches<T, C>(
             all.len(),
             started.elapsed().as_secs_f64()
         );
-        if all.len() >= retry.min_viable {
+        if enough(&all) {
             break;
         }
     }
@@ -385,9 +396,9 @@ pub struct CountryReq {
     /// outermost roads, i.e. at the border), on roughly opposite sides.
     #[serde(default)]
     pub border_to_border: bool,
-    /// Keep generating fresh batches of candidates until at least this many
-    /// viable routes are found, up to `max_batches` attempts. Defaults to
-    /// `count` (try to fill the requested number).
+    /// Keep generating fresh batches of candidates until this many distinct
+    /// routes fit the requested corridor, or the retry budget runs out.
+    /// Defaults to `count` (try to fill the requested number).
     #[serde(default)]
     pub min_viable: Option<usize>,
     #[serde(default)]
@@ -483,10 +494,10 @@ fn default_width() -> f64 {
     8000.0
 }
 fn default_alts() -> usize {
-    3
+    5
 }
 fn default_count() -> usize {
-    8
+    12
 }
 fn default_dist_min() -> f64 {
     100.0
@@ -602,7 +613,8 @@ async fn handle_between(
         )));
     }
 
-    let deduped = explore::rank_dedup_top(scored, req.alternatives, 0.5);
+    // Every alternative shares A and B, so tell them apart by path.
+    let deduped = explore::rank_dedup_routes(scored, req.alternatives, 0.8);
 
     let width_m = req.width_m;
     let resp: Vec<Value> = deduped
@@ -637,6 +649,7 @@ async fn handle_country(
     let long_edge = inner.long_edge_threshold_m;
     let min_viable = req.min_viable.unwrap_or(count).max(1);
     let strict = req.strict_corridor;
+    let width_m = req.width_m;
 
     let search = Search::begin(&inner, "country", 0);
     let task = search.task();
@@ -646,14 +659,22 @@ async fn handle_country(
     let scored_result = tokio::task::spawn_blocking(move || -> (Vec<Scored>, RejectionStats) {
         let retry = Retry {
             schedule: &COUNTRY_SCHEDULE,
+            rounds: SEARCH_ROUNDS,
             strict,
             base_half_m: base_half,
             base_sample,
             seed,
-            min_viable,
+        };
+        let enough = |all: &[Scored]| {
+            let tight: Vec<&Scored> = all
+                .iter()
+                .filter(|s| in_corridor(s.corridor_used_m, width_m))
+                .collect();
+            explore::count_distinct(&tight, COUNTRY_DEDUP_KM) >= min_viable
         };
         let outline = border.then(|| inner_for_task.outline_for(modes, paved_only));
-        let (mut all, stats) = run_batches(&task, "country", &retry, |b| {
+        let graph = &inner_for_task.graph;
+        let (mut all, stats) = run_batches(&task, "country", &retry, enough, |b| {
             let params = RouteParams {
                 modes,
                 half_width_m: b.half_width_m,
@@ -671,7 +692,16 @@ async fn handle_country(
             let candidates = match &outline {
                 Some(o) => explore::generate_crossing_candidates(o, b.n_sample, lo, hi, b.seed),
                 None => {
-                    explore::generate_country_candidates_in_bbox(bbox, b.n_sample, lo, hi, b.seed)
+                    // Only endpoints that will snap to a road this activity
+                    // can use: the rest of the bbox can only fail.
+                    let near_road = |p: LatLon| {
+                        graph
+                            .snap_distance_m(p, modes, paved_only)
+                            .is_some_and(|d| d <= filter.snap_tolerance_m)
+                    };
+                    explore::generate_country_candidates_in_bbox(
+                        bbox, b.n_sample, lo, hi, b.seed, near_road,
+                    )
                 }
             };
             task.add_total(candidates.len());
@@ -700,12 +730,11 @@ async fn handle_country(
 
     // Per-section dedup: routes inside the requested corridor first, then
     // the ones the retry loop found by widening it.
-    let width_m = req.width_m;
     let (tight, loose): (Vec<Scored>, Vec<Scored>) = scored
         .into_iter()
-        .partition(|s| s.corridor_used_m <= width_m + 1.0);
-    let mut ranked = explore::rank_dedup_top(tight, count, 8.0);
-    ranked.extend(explore::rank_dedup_top(loose, count, 8.0));
+        .partition(|s| in_corridor(s.corridor_used_m, width_m));
+    let mut ranked = explore::rank_dedup_top(tight, count, COUNTRY_DEDUP_KM);
+    ranked.extend(explore::rank_dedup_top(loose, count, COUNTRY_DEDUP_KM));
     let resp: Vec<Value> = ranked
         .iter()
         .enumerate()
@@ -787,6 +816,10 @@ async fn handle_shape_search(
     let seed = seed_or_random(req.seed);
     let min_viable = req.min_viable.unwrap_or(count).max(1);
     let strict = req.strict_corridor;
+    let width_m = req.width_m;
+    // Dedup by center proximity, scaled to the shape's diameter so two big
+    // shapes don't merge unless they really overlap.
+    let dedup_sep_km = (req.perimeter_km / std::f64::consts::TAU).max(8.0);
 
     let inner = state.0.clone();
     let search = Search::begin(&inner, "shape-search", 0);
@@ -799,13 +832,20 @@ async fn handle_shape_search(
     let routed = tokio::task::spawn_blocking(move || -> (Vec<ScoredShape>, RejectionStats) {
         let retry = Retry {
             schedule: &SHAPE_SCHEDULE,
+            rounds: SEARCH_ROUNDS,
             strict,
             base_half_m: base_half,
             base_sample,
             seed,
-            min_viable,
         };
-        let (mut all, stats) = run_batches(&task, "shape", &retry, |b| {
+        let enough = |all: &[ScoredShape]| {
+            let tight: Vec<&ScoredShape> = all
+                .iter()
+                .filter(|s| in_corridor(s.corridor_used_m, width_m))
+                .collect();
+            explore::count_distinct_shapes(&tight, dedup_sep_km) >= min_viable
+        };
+        let (mut all, stats) = run_batches(&task, "shape", &retry, enough, |b| {
             let params = RouteParams {
                 modes,
                 half_width_m: b.half_width_m,
@@ -858,13 +898,9 @@ async fn handle_shape_search(
         return Err(AppError::cancelled());
     }
 
-    // Dedup by center proximity, scaled to the shape's diameter so two big
-    // shapes don't merge unless they really overlap.
-    let dedup_sep_km = (req.perimeter_km / std::f64::consts::TAU).max(8.0);
-    let width_m = req.width_m;
     let (tight, loose): (Vec<ScoredShape>, Vec<ScoredShape>) = scored
         .into_iter()
-        .partition(|s| s.corridor_used_m <= width_m + 1.0);
+        .partition(|s| in_corridor(s.corridor_used_m, width_m));
     let mut ranked = explore::rank_dedup_top_shapes(tight, count, dedup_sep_km);
     ranked.extend(explore::rank_dedup_top_shapes(loose, count, dedup_sep_km));
     let resp: Vec<Value> = ranked
@@ -1334,6 +1370,15 @@ impl IntoResponse for AppError {
     }
 }
 
+/// Whether a result used the requested corridor, rather than one the retry
+/// loop widened.
+fn in_corridor(corridor_used_m: f64, width_m: f64) -> bool {
+    corridor_used_m <= width_m + 1.0
+}
+
+/// Endpoint separation below which two country lines count as the same one.
+const COUNTRY_DEDUP_KM: f64 = 8.0;
+
 fn pick_alphas(n: usize) -> Vec<f64> {
     match n {
         1 => vec![4.0],
@@ -1369,6 +1414,8 @@ mod tests {
         for msg in [
             "endpoint too far from graph: start 3100 m, end 20 m (tolerance 2000 m)",
             "leg 3: snap displacement too large (2500 m / 10 m)",
+            "endpoint too far from graph: no connected road for this activity nearby",
+            "leg 1: snap displacement too large: no usable road nearby",
             "max deviation 4100 m exceeds corridor half-width 4000 m",
             "no-go: national_park",
             "routed distance 12.0 km below minimum 16.0 km",
@@ -1381,7 +1428,7 @@ mod tests {
         }
         let j = s.to_json();
         for (bucket, n) in [
-            ("snap_too_far", 2),
+            ("snap_too_far", 4),
             ("corridor_violated", 1),
             ("no_go", 1),
             ("too_short", 1),
@@ -1389,9 +1436,54 @@ mod tests {
             ("no_route", 1),
             ("too_winding", 1),
             ("other", 1),
-            ("total", 9),
+            ("total", 11),
         ] {
             assert_eq!(j[bucket], n, "{bucket}");
         }
+    }
+
+    fn test_search() -> SearchGuard {
+        let mut g = petgraph::graph::UnGraph::new_undirected();
+        g.add_node(LatLon::new(47.0, 8.0));
+        g.add_node(LatLon::new(47.1, 8.1));
+        let state = ServerState::new(Graph::from_graph(g), Vec::new(), 1_000.0, None);
+        Search::begin(&Arc::new(state), "test", 0)
+    }
+
+    #[test]
+    fn retries_repeat_the_schedule_until_enough() {
+        let search = test_search();
+        let schedule = [(1.0, 0.0), (2.0, 1.0)];
+        let retry = Retry {
+            schedule: &schedule,
+            rounds: 3,
+            strict: false,
+            base_half_m: 1_000.0,
+            base_sample: 10,
+            seed: 7,
+        };
+        let two = |all: &[u32]| all.len() >= 2;
+
+        // Nothing routes: every round runs, each batch on a fresh seed.
+        let mut batches = Vec::new();
+        let (found, stats) = run_batches(&search.task(), "test", &retry, two, |b| {
+            batches.push((b.n_sample, b.widen_km, b.seed));
+            let fail: Result<u32, ((), String)> = Err(((), "no route found".into()));
+            Some(vec![fail])
+        });
+        assert!(found.is_empty());
+        assert_eq!(stats.no_route, 6);
+        let steps: Vec<(usize, f64)> = batches.iter().map(|b| (b.0, b.1)).collect();
+        assert_eq!(steps, [(10, 0.0), (20, 1.0)].repeat(3));
+        let seeds: std::collections::HashSet<u64> = batches.iter().map(|b| b.2).collect();
+        assert_eq!(seeds.len(), 6);
+
+        // One result per batch: stops as soon as `enough` holds.
+        let mut n = 0;
+        let (found, _) = run_batches(&search.task(), "test", &retry, two, |_| {
+            n += 1;
+            Some(vec![Ok::<u32, ((), String)>(n)])
+        });
+        assert_eq!(found, [1, 2]);
     }
 }
