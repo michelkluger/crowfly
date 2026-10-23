@@ -874,10 +874,9 @@ fn fmt_m(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::osm::{NodePoint, BCLASS_RESIDENTIAL, MODE_FOOT, SURFACE_PAVED};
+    use crate::osm::{BCLASS_RESIDENTIAL, MODE_FOOT, SURFACE_PAVED};
     use geo::{Coord, LineString, MultiPolygon, Polygon};
     use petgraph::graph::UnGraph;
-    use petgraph::visit::EdgeRef;
 
     fn graph_for_shape(vertices: &[LatLon]) -> Graph {
         let mut g: UnGraph<LatLon, EdgeData> = UnGraph::new_undirected();
@@ -899,25 +898,9 @@ mod tests {
                 },
             );
         }
-        let pts: Vec<NodePoint> = g
-            .node_indices()
-            .map(|ni| NodePoint {
-                idx: ni,
-                lat: g[ni].lat,
-                lon: g[ni].lon,
-            })
-            .collect();
-        let mut uf = petgraph::unionfind::UnionFind::new(g.node_count());
-        for er in g.edge_references() {
-            uf.union(er.source().index(), er.target().index());
-        }
-        let components: Vec<u32> = (0..g.node_count()).map(|i| uf.find(i) as u32).collect();
-        Graph {
-            graph: g,
-            components,
-            rtree: rstar::RTree::bulk_load(pts),
-            elevations_m: None,
-        }
+        // A pure ring: every node is a shape point, so this also exercises
+        // routing between two shape points with no junction anywhere.
+        Graph::from_graph(g)
     }
 
     fn no_go_around_segment(name: &str, a: LatLon, b: LatLon) -> NoGoZone {

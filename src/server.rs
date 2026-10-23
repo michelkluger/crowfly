@@ -14,7 +14,7 @@ use crate::elevation::profile_from_dem;
 use crate::explore::{self, Candidate, RouteFilter, Scored, ScoredShape};
 use crate::geodesy::{corridor_polygon, haversine, LatLon};
 use crate::hershey_fonts::Font;
-use crate::osm::{BBox, Graph, MODE_BIKE, MODE_FOOT, MODE_MTB, SURFACE_LABELS};
+use crate::osm::{self, BBox, Graph, SURFACE_LABELS};
 use crate::route::RouteParams;
 use crate::text;
 use crate::viability::NoGoZone;
@@ -188,6 +188,94 @@ impl RejectionStats {
     }
 }
 
+/// Retry schedule steps: (candidate sample factor, full-corridor widening
+/// km). Country search grows its oversample late so the first attempts stay
+/// snappy, and widens by an absolute delta so the worst case is request
+/// +2 km — never a multiplicative blow-up. Shape search widens from batch 2.
+const COUNTRY_SCHEDULE: [(f64, f64); 8] = [
+    (1.0, 0.0),
+    (1.0, 0.0),
+    (1.5, 0.0),
+    (1.5, 0.5),
+    (2.0, 1.0),
+    (2.0, 1.5),
+    (2.5, 2.0),
+    (2.5, 2.0),
+];
+const SHAPE_SCHEDULE: [(f64, f64); 5] =
+    [(1.0, 0.0), (1.5, 0.5), (2.0, 1.0), (2.5, 1.5), (3.0, 2.0)];
+
+/// Inputs of the persistence loop shared by country and shape search.
+struct Retry<'a> {
+    schedule: &'a [(f64, f64)],
+    /// Never widen the corridor.
+    strict: bool,
+    base_half_m: f64,
+    base_sample: usize,
+    seed: u64,
+    min_viable: usize,
+}
+
+/// One batch of [`run_batches`].
+struct Batch {
+    /// Corridor half-width: the request's plus half the widening.
+    half_width_m: f64,
+    /// Full-corridor widening applied, km (0 when strict).
+    widen_km: f64,
+    n_sample: usize,
+    /// Per-batch seed, so a retry doesn't redraw candidates it already
+    /// proved infeasible.
+    seed: u64,
+}
+
+/// Run `retry`'s batches until `min_viable` results are found, the schedule
+/// runs out, the search is cancelled, or `route` returns None (nothing left
+/// to sample). Rejections are bucketed for the empty-state UI.
+fn run_batches<T, C>(
+    task: &Search,
+    label: &str,
+    retry: &Retry,
+    mut route: impl FnMut(&Batch) -> Option<Vec<Result<T, (C, String)>>>,
+) -> (Vec<T>, RejectionStats) {
+    let mut all = Vec::new();
+    let mut stats = RejectionStats::default();
+    for (i, &(sample_factor, widen_km)) in retry.schedule.iter().enumerate() {
+        if task.cancelled() {
+            break;
+        }
+        let started = std::time::Instant::now();
+        let widen_km = if retry.strict { 0.0 } else { widen_km };
+        let batch = Batch {
+            half_width_m: retry.base_half_m + widen_km * 500.0,
+            widen_km,
+            n_sample: ((retry.base_sample as f64) * sample_factor).round() as usize,
+            seed: retry
+                .seed
+                .wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+        };
+        let Some(results) = route(&batch) else {
+            break;
+        };
+        for r in results {
+            match r {
+                Ok(s) => all.push(s),
+                Err((_, msg)) => stats.classify(&msg),
+            }
+        }
+        eprintln!(
+            "{label} batch {}: {} candidates, {} viable total, {:.1}s",
+            i + 1,
+            batch.n_sample,
+            all.len(),
+            started.elapsed().as_secs_f64()
+        );
+        if all.len() >= retry.min_viable {
+            break;
+        }
+    }
+    (all, stats)
+}
+
 /// In-flight search progress. `done` is mutated lock-free from the rayon worker
 /// pool; the HTTP read-side reads the atomic.
 pub struct ProgressTracker {
@@ -358,21 +446,14 @@ fn default_elev_samples() -> usize {
     30
 }
 
-fn parse_modes(s: &str) -> Result<u8> {
-    let mut m = 0u8;
-    for tok in s.split(',') {
-        match tok.trim().to_ascii_lowercase().as_str() {
-            "foot" | "walk" | "hike" => m |= MODE_FOOT,
-            "bike" | "cycle" | "bicycle" => m |= MODE_BIKE,
-            "mtb" | "gravel" => m |= MODE_MTB,
-            "" => {}
-            other => return Err(anyhow!("unknown mode: {other}")),
-        }
-    }
-    if m == 0 {
-        return Err(anyhow!("no modes"));
-    }
-    Ok(m)
+/// `[{label, km}]` for every surface category the route uses.
+fn surface_json(surface_km: &[f64; 6]) -> Vec<Value> {
+    SURFACE_LABELS
+        .iter()
+        .zip(surface_km)
+        .filter(|(_, &km)| km > 0.001)
+        .map(|(label, km)| json!({ "label": label, "km": km }))
+        .collect()
 }
 
 fn scored_to_json(s: &Scored, rank: usize, width_m: f64) -> Value {
@@ -382,27 +463,6 @@ fn scored_to_json(s: &Scored, rank: usize, width_m: f64) -> Value {
         .into_iter()
         .map(|p| [p.lon, p.lat])
         .collect();
-    let surface_breakdown: Vec<Value> = SURFACE_LABELS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| r.surface_km[*i] > 0.001)
-        .map(|(i, label)| {
-            json!({
-                "label": label,
-                "km": r.surface_km[i],
-            })
-        })
-        .collect();
-    let elev = s.elevation.as_ref().map(|p| {
-        json!({
-            "samples_m": p.samples_m,
-            "ascent_m": p.ascent_m,
-            "descent_m": p.descent_m,
-            "max_m": p.max_m,
-            "min_m": p.min_m,
-        })
-    });
-    let ferry_km = r.ferry_km;
     let ref_km = haversine(s.candidate.start, s.candidate.end) / 1000.0;
     json!({
         "rank": rank,
@@ -413,9 +473,9 @@ fn scored_to_json(s: &Scored, rank: usize, width_m: f64) -> Value {
         "ref_km": ref_km,
         "real_km": r.total_km,
         "max_dev_m": r.max_deviation_m,
-        "ferry_km": ferry_km,
-        "surface": surface_breakdown,
-        "elevation": elev,
+        "ferry_km": r.ferry_km,
+        "surface": surface_json(&r.surface_km),
+        "elevation": s.elevation,
         "coords": coords,
         "corridor": corridor,
         "width_m": width_m,
@@ -427,7 +487,7 @@ async fn handle_between(
     State(state): State<AppState>,
     Json(req): Json<BetweenReq>,
 ) -> Result<Json<Value>, AppError> {
-    let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
+    let modes = osm::parse_modes(&req.modes).map_err(AppError::bad)?;
     let start = LatLon::new(req.start[0], req.start[1]);
     let end = LatLon::new(req.end[0], req.end[1]);
     let half = req.width_m / 2.0;
@@ -505,7 +565,7 @@ async fn handle_country(
     State(state): State<AppState>,
     Json(req): Json<CountryReq>,
 ) -> Result<Json<Value>, AppError> {
-    let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
+    let modes = osm::parse_modes(&req.modes).map_err(AppError::bad)?;
     let base_half = req.width_m / 2.0;
     let count = req.count.clamp(1, 50);
     let base_sample = (count * 6).max(20); // oversample, then dedupe to top N
@@ -518,13 +578,6 @@ async fn handle_country(
     let border = req.border_to_border;
     let long_edge = inner.long_edge_threshold_m;
     let min_viable = req.min_viable.unwrap_or(count).max(1);
-    // Persistence schedule: more batches than before, oversample grows late so
-    // the first few attempts stay snappy, and the corridor widens by an
-    // absolute delta (km of full corridor) so the worst case is request +2 km
-    // — never a multiplicative blow-up. Strict mode zeroes out the deltas.
-    const SAMPLE_FACTORS: [f64; 8] = [1.0, 1.0, 1.5, 1.5, 2.0, 2.0, 2.5, 2.5];
-    const WIDEN_DELTA_KM: [f64; 8] = [0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0];
-    const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
     let strict = req.strict_corridor;
 
     let search = Search::begin(&inner, "country", 0);
@@ -533,52 +586,42 @@ async fn handle_country(
     let paved_only = req.paved_only;
     let elevation_samples = req.elevation_samples;
     let scored_result = tokio::task::spawn_blocking(move || -> (Vec<Scored>, RejectionStats) {
-        let mut all: Vec<Scored> = Vec::new();
-        let mut stats = RejectionStats::default();
-        for batch in 0..MAX_BATCHES {
-            if task.cancelled() {
-                break;
-            }
-            let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
-            let sample_mul = SAMPLE_FACTORS[batch];
-            // Half-width grows by half of the full-corridor delta.
-            let half = base_half + delta_km * 500.0;
-            let n_sample = ((base_sample as f64) * sample_mul).round() as usize;
+        let retry = Retry {
+            schedule: &COUNTRY_SCHEDULE,
+            strict,
+            base_half_m: base_half,
+            base_sample,
+            seed,
+            min_viable,
+        };
+        let (mut all, stats) = run_batches(&task, "country", &retry, |b| {
             let params = RouteParams {
                 modes,
-                half_width_m: half,
+                half_width_m: b.half_width_m,
                 alpha: 4.0,
-                corridor_max_m: half,
+                corridor_max_m: b.half_width_m,
                 paved_only,
             };
             let filter = RouteFilter {
                 distance_min_km: Some(dmin),
                 distance_max_km: Some(dmax),
-                snap_tolerance_m: half.max(2_000.0),
+                snap_tolerance_m: b.half_width_m.max(2_000.0),
                 enforce_corridor: true,
             };
-            // Each batch uses a different seed so we don't redraw the same
-            // candidates we already proved infeasible.
-            let batch_seed = seed.wrapping_add((batch as u64).wrapping_mul(0x9E3779B97F4A7C15));
             let candidates = if border {
                 explore::generate_border_to_border_candidates(
                     bbox,
-                    n_sample,
+                    b.n_sample,
                     dmin,
                     dmax,
                     border_strip,
-                    batch_seed,
+                    b.seed,
                 )
             } else {
-                explore::generate_country_candidates_in_bbox(bbox, n_sample, dmin, dmax, batch_seed)
+                explore::generate_country_candidates_in_bbox(bbox, b.n_sample, dmin, dmax, b.seed)
             };
-            if candidates.is_empty() {
-                continue;
-            }
-            // Publish the new batch's size before evaluation so the progress
-            // bar's denominator grows visibly when we retry.
             task.add_total(candidates.len());
-            let results = explore::evaluate(
+            Some(explore::evaluate(
                 &inner_for_task.graph,
                 candidates,
                 &inner_for_task.no_go,
@@ -587,17 +630,8 @@ async fn handle_country(
                 long_edge,
                 Some(&task.done),
                 Some(&task.cancel),
-            );
-            for r in results {
-                match r {
-                    Ok(s) => all.push(s),
-                    Err((_, msg)) => stats.classify(&msg),
-                }
-            }
-            if all.len() >= min_viable {
-                break;
-            }
-        }
+            ))
+        });
         // Elevation is local and cheap, so profile every viable route and
         // let the ascent term take part in the ranking below.
         enrich_scored(inner_for_task.dem.as_ref(), &mut all, elevation_samples);
@@ -632,21 +666,6 @@ async fn handle_country(
 
 fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
     let coords: Vec<[f64; 2]> = s.route.points.iter().map(|p| [p.lon, p.lat]).collect();
-    let surface_breakdown: Vec<Value> = SURFACE_LABELS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| s.surface_km[*i] > 0.001)
-        .map(|(i, label)| json!({ "label": label, "km": s.surface_km[i] }))
-        .collect();
-    let elev = s.elevation.as_ref().map(|p| {
-        json!({
-            "samples_m": p.samples_m,
-            "ascent_m": p.ascent_m,
-            "descent_m": p.descent_m,
-            "max_m": p.max_m,
-            "min_m": p.min_m,
-        })
-    });
     let vertex_coords: Vec<[f64; 2]> = s.vertices.iter().map(|v| [v.lon, v.lat]).collect();
     let real_km = s.route.total_length_m / 1000.0;
     json!({
@@ -662,8 +681,8 @@ fn shape_to_json(s: &ScoredShape, rank: usize, width_m: f64) -> Value {
         "real_km": real_km,
         "max_dev_m": 0.0,
         "ferry_km": s.ferry_km,
-        "surface": surface_breakdown,
-        "elevation": elev,
+        "surface": surface_json(&s.surface_km),
+        "elevation": s.elevation,
         "coords": coords,
         "corridor": Vec::<[f64; 2]>::new(),
         "width_m": width_m,
@@ -684,7 +703,7 @@ async fn handle_shape_search(
     Json(req): Json<ShapeSearchReq>,
 ) -> Result<Json<Value>, AppError> {
     use crate::shape::ShapeKind;
-    let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
+    let modes = osm::parse_modes(&req.modes).map_err(AppError::bad)?;
     let kind = ShapeKind::parse(&req.kind)
         .ok_or_else(|| AppError::bad(anyhow!("unknown shape: {}", req.kind)))?;
     if !req.perimeter_km.is_finite() || req.perimeter_km <= 0.0 {
@@ -713,9 +732,6 @@ async fn handle_shape_search(
     let base_sample = (count * sample_factor).max(count + 8).max(16);
     let seed = seed_or_random(req.seed);
     let min_viable = req.min_viable.unwrap_or(count).max(1);
-    const SAMPLE_FACTORS: [f64; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
-    const WIDEN_DELTA_KM: [f64; 5] = [0.0, 0.5, 1.0, 1.5, 2.0];
-    const MAX_BATCHES: usize = SAMPLE_FACTORS.len();
     let strict = req.strict_corridor;
 
     let inner = state.0.clone();
@@ -727,47 +743,44 @@ async fn handle_shape_search(
     let paved_only = req.paved_only;
     let elevation_samples = req.elevation_samples;
     let routed = tokio::task::spawn_blocking(move || -> (Vec<ScoredShape>, RejectionStats) {
-        let mut all: Vec<ScoredShape> = Vec::new();
-        let mut stats = RejectionStats::default();
-        for batch in 0..MAX_BATCHES {
-            if task.cancelled() {
-                break;
-            }
-            let batch_started = std::time::Instant::now();
-            let delta_km = if strict { 0.0 } else { WIDEN_DELTA_KM[batch] };
-            let sample_mul = SAMPLE_FACTORS[batch];
-            let half = base_half + delta_km * 500.0;
-            let n_sample = ((base_sample as f64) * sample_mul).round() as usize;
+        let retry = Retry {
+            schedule: &SHAPE_SCHEDULE,
+            strict,
+            base_half_m: base_half,
+            base_sample,
+            seed,
+            min_viable,
+        };
+        let (mut all, stats) = run_batches(&task, "shape", &retry, |b| {
             let params = RouteParams {
                 modes,
-                half_width_m: half,
+                half_width_m: b.half_width_m,
                 alpha: 4.0,
-                corridor_max_m: half,
+                corridor_max_m: b.half_width_m,
                 paved_only,
             };
             let filter = RouteFilter {
                 distance_min_km: None,
                 distance_max_km: None,
-                snap_tolerance_m: half.max(2_000.0),
+                snap_tolerance_m: b.half_width_m.max(2_000.0),
                 enforce_corridor: true,
             };
             // Abort bad shape candidates early. A single leg >120% longer
             // than intended creates the visible tails/kinks we don't want, and
             // continuing to route the remaining 20-30 legs is wasted work.
-            let max_leg_detour_cap = Some(1.2 + delta_km * 0.15);
-            let batch_seed = seed.wrapping_add((batch as u64).wrapping_mul(0x9E3779B97F4A7C15));
+            let max_leg_detour_cap = Some(1.2 + b.widen_km * 0.15);
             let candidates = explore::generate_shape_candidates_in_bbox(
                 bbox,
                 kind,
                 perimeter_km,
-                n_sample,
-                batch_seed,
+                b.n_sample,
+                b.seed,
             );
             if candidates.is_empty() {
-                break; // shape doesn't fit in bbox
+                return None; // shape doesn't fit in bbox
             }
             task.add_total(candidates.len());
-            let results = explore::evaluate_shapes_with_limits(
+            Some(explore::evaluate_shapes_with_limits(
                 &inner_for_task.graph,
                 candidates,
                 &inner_for_task.no_go,
@@ -776,24 +789,8 @@ async fn handle_shape_search(
                 Some(&task.done),
                 Some(&task.cancel),
                 max_leg_detour_cap,
-            );
-            for r in results {
-                match r {
-                    Ok(s) => all.push(s),
-                    Err((_, msg)) => stats.classify(&msg),
-                }
-            }
-            eprintln!(
-                "shape batch {}: {} candidates, {} viable total, {:.1}s",
-                batch + 1,
-                n_sample,
-                all.len(),
-                batch_started.elapsed().as_secs_f64()
-            );
-            if all.len() >= min_viable {
-                break;
-            }
-        }
+            ))
+        });
         // Profile every viable loop so the ascent re-score can promote a
         // flatter loop over a marginally tighter but climbier one.
         enrich_shapes(inner_for_task.dem.as_ref(), &mut all, elevation_samples);
@@ -837,7 +834,7 @@ async fn handle_text(
     State(state): State<AppState>,
     Json(req): Json<TextReq>,
 ) -> Result<Json<Value>, AppError> {
-    let modes = parse_modes(&req.modes).map_err(AppError::bad)?;
+    let modes = osm::parse_modes(&req.modes).map_err(AppError::bad)?;
     if req.text.trim().is_empty() {
         return Err(AppError::bad(anyhow!("text is empty")));
     }
@@ -963,12 +960,6 @@ async fn handle_text(
             }
         }
     }
-    let surface_breakdown: Vec<Value> = SURFACE_LABELS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| surface[*i] > 0.001)
-        .map(|(i, label)| json!({ "label": label, "km": surface[i] }))
-        .collect();
 
     // Build per-letter JSON (each letter contains its character + array of
     // routed strokes) and a parallel array of pen-up polylines. The FE
@@ -998,65 +989,35 @@ async fn handle_text(
         .map(|p| p.points.iter().map(|q| [q.lon, q.lat]).collect())
         .collect();
 
-    // For map fitBounds + GPX flattening, concatenate letters + pen-ups in
-    // ride order (letter[0].strokes ++ pen_up[0..k0] ++ letter[1].strokes …).
-    let mut all_coords: Vec<[f64; 2]> = Vec::new();
-    let mut pu_idx = 0usize;
-    let mut first_stroke_overall = true;
-    for letter in &best.letters {
-        for sr in &letter.stroke_routes {
-            if !first_stroke_overall {
-                if let Some(pu) = best.pen_ups.get(pu_idx) {
-                    for p in &pu.points {
-                        all_coords.push([p.lon, p.lat]);
-                    }
-                }
-                pu_idx += 1;
+    // The whole rideable track in ride order: strokes interleaved with the
+    // pen-ups between them (letter[0].stroke[0], pen_up[0], …). It is the
+    // result's `coords` (map fit, GPX) and what the elevation profile samples.
+    let mut ride: Vec<LatLon> = Vec::new();
+    let mut pen_ups = best.pen_ups.iter();
+    for (i, sr) in best
+        .letters
+        .iter()
+        .flat_map(|l| &l.stroke_routes)
+        .enumerate()
+    {
+        if i > 0 {
+            if let Some(pu) = pen_ups.next() {
+                ride.extend_from_slice(&pu.points);
             }
-            for p in &sr.points {
-                all_coords.push([p.lon, p.lat]);
-            }
-            first_stroke_overall = false;
         }
+        ride.extend_from_slice(&sr.points);
     }
+    let all_coords: Vec<[f64; 2]> = ride.iter().map(|p| [p.lon, p.lat]).collect();
 
     let stroke_count: usize = best.letters.iter().map(|l| l.stroke_routes.len()).sum();
     let total_track_m = total_routed_m + total_pen_up_m;
 
-    let dem = state.0.dem.as_ref().filter(|_| req.elevation_samples > 0);
-    let elevation_json = if let Some(dem) = dem {
-        // Sample over the full rideable track (strokes + pen-ups in order)
-        // so the elevation profile matches what someone actually rides.
-        let pts: Vec<LatLon> = {
-            let mut out: Vec<LatLon> = Vec::new();
-            let mut pu_idx = 0usize;
-            let mut first = true;
-            for letter in &best.letters {
-                for sr in &letter.stroke_routes {
-                    if !first {
-                        if let Some(pu) = best.pen_ups.get(pu_idx) {
-                            out.extend_from_slice(&pu.points);
-                        }
-                        pu_idx += 1;
-                    }
-                    out.extend_from_slice(&sr.points);
-                    first = false;
-                }
-            }
-            out
-        };
-        profile_from_dem(dem, &pts, req.elevation_samples).map(|p| {
-            json!({
-                "samples_m": p.samples_m,
-                "ascent_m": p.ascent_m,
-                "descent_m": p.descent_m,
-                "max_m": p.max_m,
-                "min_m": p.min_m,
-            })
-        })
-    } else {
-        None
-    };
+    let elevation = state
+        .0
+        .dem
+        .as_ref()
+        .filter(|_| req.elevation_samples > 0)
+        .and_then(|dem| profile_from_dem(dem, &ride, req.elevation_samples));
 
     let result = json!({
         "rank": 1,
@@ -1070,8 +1031,8 @@ async fn handle_text(
         "real_km": total_track_m / 1000.0,
         "max_dev_m": 0.0,
         "ferry_km": ferry_km,
-        "surface": surface_breakdown,
-        "elevation": elevation_json,
+        "surface": surface_json(&surface),
+        "elevation": elevation,
         "coords": all_coords,
         "corridor": Vec::<[f64; 2]>::new(),
         "width_m": stroke_half_m * 2.0,
@@ -1101,11 +1062,7 @@ async fn handle_text(
     Ok(Json(json!({
         "seed": seed,
         "results": [result],
-        "failures": json!({
-            "snap_too_far": 0, "corridor_violated": 0, "no_route": 0,
-            "no_go": 0, "too_short": 0, "too_long": 0, "other": 0,
-            "total": 0,
-        }),
+        "failures": RejectionStats::default().to_json(),
     })))
 }
 

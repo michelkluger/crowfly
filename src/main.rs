@@ -186,23 +186,6 @@ fn parse_latlon(s: &str) -> Result<LatLon> {
     Ok(LatLon::new(lat, lon))
 }
 
-fn parse_modes(s: &str) -> Result<u8> {
-    let mut m = 0u8;
-    for tok in s.split(',') {
-        match tok.trim().to_ascii_lowercase().as_str() {
-            "foot" | "walk" | "hike" => m |= MODE_FOOT,
-            "bike" | "cycle" | "bicycle" => m |= MODE_BIKE,
-            "mtb" | "gravel" => m |= MODE_MTB,
-            "" => {}
-            other => return Err(anyhow!("unknown mode: {other}")),
-        }
-    }
-    if m == 0 {
-        return Err(anyhow!("no modes selected"));
-    }
-    Ok(m)
-}
-
 /// Resolve --osm / --region into a PBF path, downloading if needed.
 fn resolve_pbf(common: &CommonArgs) -> Result<Option<PathBuf>> {
     if let Some(p) = &common.osm {
@@ -293,7 +276,7 @@ fn attach_dem(graph: &mut Graph, dem: Option<Dem>) -> Option<Dem> {
 fn run_plan(args: PlanArgs) -> Result<()> {
     let start = parse_latlon(&args.start)?;
     let end = parse_latlon(&args.end)?;
-    let modes = parse_modes(&args.common.modes)?;
+    let modes = osm::parse_modes(&args.common.modes)?;
     let total_km = haversine(start, end) / 1000.0;
     let half = args.common.width / 2.0;
 
@@ -402,7 +385,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
 
 fn run_explore(args: ExploreArgs) -> Result<()> {
     let start = parse_latlon(&args.start)?;
-    let modes = parse_modes(&args.common.modes)?;
+    let modes = osm::parse_modes(&args.common.modes)?;
     let half = args.common.width / 2.0;
 
     println!("Mode     : explore");
@@ -521,7 +504,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
 }
 
 fn run_serve(args: ServeArgs) -> Result<()> {
-    let modes = parse_modes(&args.modes)?;
+    let modes = osm::parse_modes(&args.modes)?;
     let pbf = if let Some(p) = &args.osm {
         p.clone()
     } else if let Some(region) = &args.region {
