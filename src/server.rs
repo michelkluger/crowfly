@@ -1183,12 +1183,20 @@ async fn handle_style() -> Response {
 }
 
 async fn handle_app_js() -> Response {
+    javascript(APP_JS)
+}
+
+async fn handle_basemap_js() -> Response {
+    javascript(BASEMAP_JS)
+}
+
+fn javascript(body: &'static str) -> Response {
     (
         [(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
-        APP_JS,
+        body,
     )
         .into_response()
 }
@@ -1199,6 +1207,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(handle_index))
         .route("/style.css", get(handle_style))
         .route("/app.js", get(handle_app_js))
+        .route("/basemap.js", get(handle_basemap_js))
         .route("/api/info", get(handle_info))
         .route("/api/progress", get(handle_progress))
         .route("/api/cancel", post(handle_cancel))
@@ -1283,3 +1292,4 @@ fn pick_alphas(n: usize) -> Vec<f64> {
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const APP_JS: &str = include_str!("../assets/app.js");
+const BASEMAP_JS: &str = include_str!("../assets/basemap.js");
