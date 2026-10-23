@@ -1005,60 +1005,67 @@ function selectRank(rank) {
   }
 }
 
-function downloadGpx(rank) {
+function xmlEscape(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function slug(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+}
+
+// Track name (shown in GPS device / app lists) and download filename.
+function gpxNames(r) {
+  const km = Math.round(r.real_km);
+  if (r.kind === 'text') {
+    const t = (r.text || '').trim();
+    return { name: `crowfly "${t}" (${km} km)`, file: `crowfly-text-${slug(t) || 'message'}.gpx` };
+  }
+  if (r.shape) {
+    return { name: `crowfly ${r.shape.kind} #${r.rank} (${km} km)`,
+             file: `crowfly-${slug(r.shape.kind)}-${r.rank}-${km}km.gpx` };
+  }
+  const deg = Math.round(r.bearing_deg);
+  return { name: `crowfly line #${r.rank}: ${deg}°, ${km} km`,
+           file: `crowfly-line-${r.rank}-${deg}deg-${km}km.gpx` };
+}
+
+// One continuous <trkseg>: `coords` is already in ride order for every
+// result kind (text mode interleaves strokes and pen-ups server-side).
+// Elevations come from the server's DEM; without one the track simply has
+// no <ele>. The metadata link is the permalink that reproduces the search.
+async function downloadGpx(rank) {
   const r = results.find(x => x.rank === rank);
   if (!r) return;
-  // Text mode: bundle every letter stroke + pen-up connector into ONE
-  // continuous <trkseg> in ride order so the rider's GPS plays the message
-  // as one continuous track. Pen-ups are still part of the rideable line.
-  let trkBody;
-  if (r.kind === 'text' && r.text_render && Array.isArray(r.text_render.letters)) {
-    const ordered = [];
-    let puIdx = 0;
-    let first = true;
-    for (const letter of r.text_render.letters) {
-      for (const stroke of (letter.strokes || [])) {
-        if (!stroke || stroke.length < 1) continue;
-        if (!first) {
-          const pu = (r.text_render.pen_ups || [])[puIdx++];
-          if (pu && pu.length >= 2) {
-            for (const c of pu) ordered.push(c);
-          }
-        }
-        for (const c of stroke) ordered.push(c);
-        first = false;
-      }
-    }
-    const pts = ordered.map(c =>
-      `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
-    ).join('\n');
-    trkBody = `    <trkseg>\n${pts}\n    </trkseg>`;
-  } else if (r.kind === 'text' && r.text_render && Array.isArray(r.text_render.strokes)) {
-    // Backward-compat for any old shape — should not be hit any more.
-    trkBody = r.text_render.strokes.map(stroke => {
-      const pts = stroke.map(c =>
-        `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
-      ).join('\n');
-      return `    <trkseg>\n${pts}\n    </trkseg>`;
-    }).join('\n');
-  } else {
-    const pts = r.coords.map(c =>
-      `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}"/>`
-    ).join('\n');
-    trkBody = `    <trkseg>\n${pts}\n    </trkseg>`;
-  }
+  let ele = null;
+  try {
+    const res = await fetch('/api/elevations', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coords: r.coords }),
+    });
+    if (res.ok) ele = (await res.json()).ele;
+  } catch (_) { /* export without elevation */ }
+  const pts = r.coords.map((c, i) => {
+    const z = ele && Number.isFinite(ele[i]) ? `<ele>${ele[i].toFixed(1)}</ele>` : '';
+    return `      <trkpt lat="${(+c[1]).toFixed(7)}" lon="${(+c[0]).toFixed(7)}">${z}</trkpt>`;
+  }).join('\n');
+  const { name, file } = gpxNames(r);
   const gpx = `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="crowfly" xmlns="http://www.topografix.com/GPX/1/1">
-  <metadata><name>rank ${rank}</name></metadata>
-  <trk><name>rank ${rank}</name>
-${trkBody}
+  <metadata>
+    <name>${xmlEscape(name)}</name>
+    <link href="${xmlEscape(location.href)}"><text>crowfly search</text></link>
+  </metadata>
+  <trk><name>${xmlEscape(name)}</name>
+    <trkseg>
+${pts}
+    </trkseg>
   </trk>
 </gpx>
 `;
   const blob = new Blob([gpx], { type: 'application/gpx+xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = `rank${rank}.gpx`; a.click();
+  a.href = url; a.download = file; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 500);
 }
 

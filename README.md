@@ -42,7 +42,8 @@ In the browser:
    endpoints both land near opposite bbox edges (true country traversals).
 4. **⨯ Cancel** stops a running search instantly.
 5. Click any card → it highlights on the map. **⬇ GPX** downloads that
-   specific candidate as a GPX track.
+   specific candidate as a GPX track, with DEM elevations (`<ele>`), a
+   descriptive name, and a link back to the search.
 6. After each search the URL records the mode, inputs, A/B and random seed
    (**copy link** in the status bar). Opening it re-runs the same search with
    the same results, as long as the server has the same graph loaded.

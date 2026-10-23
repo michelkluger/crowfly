@@ -20,7 +20,7 @@ use crate::text;
 use crate::viability::NoGoZone;
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -1129,6 +1129,32 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+#[derive(Deserialize)]
+pub struct ElevationsReq {
+    /// Route coordinates as `[lon, lat]`, as returned in a result's `coords`.
+    pub coords: Vec<[f64; 2]>,
+}
+
+/// Per-point DEM elevations (0.1 m) for GPX `<ele>` tags. `ele` is null when
+/// no DEM is loaded; single points outside DEM coverage are null.
+async fn handle_elevations(
+    State(state): State<AppState>,
+    Json(req): Json<ElevationsReq>,
+) -> Json<Value> {
+    let Some(dem) = state.0.dem.as_ref() else {
+        return Json(json!({ "ele": null }));
+    };
+    let ele: Vec<Option<f64>> = req
+        .coords
+        .iter()
+        .map(|c| {
+            dem.elevation_at(LatLon::new(c[1], c[0]))
+                .map(|z| (z * 10.0).round() / 10.0)
+        })
+        .collect();
+    Json(json!({ "ele": ele }))
+}
+
 async fn handle_info(State(state): State<AppState>) -> Json<Value> {
     let b = state.0.bbox;
     let center = LatLon::new((b.lat_min + b.lat_max) * 0.5, (b.lon_min + b.lon_max) * 0.5);
@@ -1178,6 +1204,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/country", post(handle_country))
         .route("/api/shape-search", post(handle_shape_search))
         .route("/api/text", post(handle_text))
+        // A long route's coords can exceed axum's 2 MB default body limit.
+        .route(
+            "/api/elevations",
+            post(handle_elevations).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .with_state(state)
 }
 
