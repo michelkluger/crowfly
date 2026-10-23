@@ -43,6 +43,9 @@ In the browser:
 4. **⨯ Cancel** stops a running search instantly.
 5. Click any card → it highlights on the map. **⬇ GPX** downloads that
    specific candidate as a GPX track.
+6. After each search the URL records the mode, inputs, A/B and random seed
+   (**copy link** in the status bar). Opening it re-runs the same search with
+   the same results, as long as the server has the same graph loaded.
 
 The **"What do these parameters mean?"** drawer in the side panel explains
 every option (`corridor`, `modes`, `alpha`, `score`, ...).
