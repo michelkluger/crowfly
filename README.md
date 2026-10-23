@@ -40,7 +40,9 @@ In the browser:
    cards.
 3. Tick **"border-to-border only"** to restrict country mode to lines whose
    endpoints both land near opposite bbox edges (true country traversals).
-4. **⨯ Cancel** stops a running search instantly.
+4. **⨯ Cancel** stops a running search, on the server too (within about one
+   route calculation). Starting a new search, or closing the tab, also
+   cancels the running one.
 5. Click any card → it highlights on the map. **⬇ GPX** downloads that
    specific candidate as a GPX track, with DEM elevations (`<ele>`), a
    descriptive name, and a link back to the search.
@@ -205,7 +207,8 @@ predicate).
 - In `plan`/`explore`, the OpenTopoData free tier rate-limits elevation
   lookups to 1 batch/sec.
 - The `serve` mode is single-process, single-user — designed for `localhost`,
-  not internet exposure.
+  not internet exposure. A new search cancels any search still running, so
+  two tabs searching at once interrupt each other.
 
 ## License
 

@@ -34,6 +34,7 @@ use crate::hershey_fonts::{Font, Glyph};
 use crate::osm::{BBox, EdgeData, Graph};
 use crate::route::{self, RouteParams};
 use crate::viability::NoGoZone;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Vertical spacing between successive baselines, as a multiple of cap height.
 /// 1.5× keeps descenders on one line clear of ascenders on the next without
@@ -615,6 +616,7 @@ fn search_letter_placement(
     bearing_jitter_rad: f64,
     n_candidates: usize,
     seed: u64,
+    cancel: Option<&AtomicBool>,
 ) -> Option<LetterRoute> {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -648,6 +650,9 @@ fn search_letter_placement(
 
     let mut best: Option<LetterRoute> = None;
     for (centre, bearing) in tried {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return None;
+        }
         // Layout this single character at the candidate centre/bearing. The
         // glyph table data is identical to what the message-level layout
         // produced; this re-runs the projection at the new anchor.
@@ -741,6 +746,7 @@ fn place_message_greedy(
     detour_cap: f64,
     n_local_candidates: usize,
     seed: u64,
+    cancel: Option<&AtomicBool>,
 ) -> Option<MessagePlacement> {
     let layout = layout_text(
         text,
@@ -803,6 +809,7 @@ fn place_message_greedy(
             bearing_jitter_rad,
             n_local_candidates,
             letter_seed,
+            cancel,
         )?;
         // Update the accumulated offset based on actual vs nominal for THIS
         // letter (using the original glyph_nom, not the shifted one — we
@@ -860,7 +867,8 @@ fn place_message_greedy(
 /// run the greedy per-letter placement. Returns successful placements
 /// ranked by total detour. Per-letter local search makes individual letters
 /// nearly always succeed — so the outer search converges fast: usually the
-/// first few anchors that land in viable terrain give a result.
+/// first few anchors that land in viable terrain give a result. Once
+/// `cancel` is set, remaining anchors are skipped and returns are empty.
 #[allow(clippy::too_many_arguments)]
 pub fn search_text_placements(
     graph: &Graph,
@@ -874,12 +882,12 @@ pub fn search_text_placements(
     n_candidates: usize,
     seed: u64,
     progress: Option<&std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    cancel: Option<&AtomicBool>,
     _no_go: &[NoGoZone],
 ) -> Vec<MessagePlacement> {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use rayon::prelude::*;
-    use std::sync::atomic::Ordering;
 
     // Probe layout to read out the message's bounding box; used to shrink
     // the sampling bbox so the whole block stays inside the loaded graph.
@@ -939,6 +947,9 @@ pub fn search_text_placements(
     let placements: Vec<MessagePlacement> = anchors
         .par_iter()
         .filter_map(|&(centre, bearing, anchor_seed)| {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return None;
+            }
             let result = place_message_greedy(
                 graph,
                 text,
@@ -952,6 +963,7 @@ pub fn search_text_placements(
                 detour_cap,
                 n_local,
                 anchor_seed,
+                cancel,
             );
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);

@@ -397,6 +397,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         &filter,
         args.common.long_edge_threshold,
         None,
+        None,
     );
 
     let mut viable: Vec<explore::Scored> = Vec::new();
@@ -527,6 +528,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             long_edge_threshold_m: args.long_edge_threshold,
             dem,
             progress: std::sync::Mutex::new(None),
+            search_cancel: Default::default(),
         }));
         crowfly::server::serve(state, &args.bind).await
     })
