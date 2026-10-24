@@ -19,6 +19,7 @@ use crate::shape::{place_shape, unit_max_radius, unit_shape_perimeter, ShapeKind
 use crate::viability::{self, NoGoZone, Report};
 use anyhow::Result;
 use petgraph::graph::NodeIndex;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
@@ -155,12 +156,16 @@ pub fn generate_country_candidates(
 /// fits. This prevents country mode from proposing lines whose `end` falls
 /// outside the OSM data — those used to be silently snapped to a node back
 /// near `start`, producing the bogus "ref 390 km → real 3 km" suggestions.
+/// Both endpoints must also pass `accept` — callers keep only points near a
+/// road the activity can use, since much of a country's bbox is abroad or
+/// roadless and those lines can only fail.
 pub fn generate_country_candidates_in_bbox(
     bbox: BBox,
     n: usize,
     distance_min_km: f64,
     distance_max_km: f64,
     seed: u64,
+    accept: impl Fn(LatLon) -> bool,
 ) -> Vec<Candidate> {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -180,6 +185,9 @@ pub fn generate_country_candidates_in_bbox(
         );
         let d_km = haversine(start, end) / 1000.0;
         if d_km < distance_min_km || d_km > distance_max_km {
+            continue;
+        }
+        if !accept(start) || !accept(end) {
             continue;
         }
         out.push(Candidate::from_endpoints(start, end));
@@ -355,9 +363,17 @@ pub fn route_one(
     filter: &RouteFilter,
     long_edge_threshold_m: f64,
 ) -> Result<Scored, (Candidate, String)> {
-    let pair = graph.closest_connected_pair(candidate.start, candidate.end);
+    let pair = graph.closest_connected_pair(
+        candidate.start,
+        candidate.end,
+        params.modes,
+        params.paved_only,
+    );
     let Some((s_idx, e_idx, sd, ed)) = pair else {
-        return Err((candidate, "graph empty".into()));
+        return Err((
+            candidate,
+            "endpoint too far from graph: no connected road for this activity nearby".into(),
+        ));
     };
     if sd > filter.snap_tolerance_m || ed > filter.snap_tolerance_m {
         return Err((
@@ -598,9 +614,15 @@ pub fn route_one_shape_with_limits(
         if is_cancelled(cancel) {
             return Err((candidate, CANCELLED.into()));
         }
-        let pair = match graph.closest_connected_pair(w[0], w[1]) {
+        let pair = match graph.closest_connected_pair(w[0], w[1], params.modes, params.paved_only) {
             Some(p) => p,
-            None => return Err((candidate, format!("leg {}: graph empty", i + 1))),
+            None => {
+                let msg = format!(
+                    "leg {}: snap displacement too large: no usable road nearby",
+                    i + 1
+                );
+                return Err((candidate, msg));
+            }
         };
         let (s_idx, e_idx, sd, ed) = pair;
         if sd > filter.snap_tolerance_m || ed > filter.snap_tolerance_m {
@@ -814,6 +836,24 @@ pub fn rank_dedup_top_shapes(
     out
 }
 
+/// How many of `scored` survive [`rank_dedup_top_shapes`]: the number of
+/// distinct loops a search has found so far.
+pub fn count_distinct_shapes(scored: &[&ScoredShape], min_sep_km: f64) -> usize {
+    let mut by_score = scored.to_vec();
+    by_score.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+    let sep_m = min_sep_km * 1000.0;
+    let mut kept: Vec<&ScoredShape> = Vec::new();
+    for s in by_score {
+        if !kept
+            .iter()
+            .any(|k| haversine(k.candidate.center, s.candidate.center) < sep_m)
+        {
+            kept.push(s);
+        }
+    }
+    kept.len()
+}
+
 /// Sort the surviving Scored entries by ascending score (easiest first).
 pub fn rank(mut scored: Vec<Scored>) -> Vec<Scored> {
     scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
@@ -830,15 +870,70 @@ pub fn rank_dedup_top(mut scored: Vec<Scored>, n: usize, min_sep_km: f64) -> Vec
         if out.len() >= n {
             break;
         }
-        let dup = out.iter().any(|kept| {
-            haversine(kept.candidate.start, s.candidate.start) < sep_m
-                && haversine(kept.candidate.end, s.candidate.end) < sep_m
-        });
+        let dup = out
+            .iter()
+            .any(|kept| same_endpoints(&kept.candidate, &s.candidate, sep_m));
         if !dup {
             out.push(s);
         }
     }
     out
+}
+
+fn same_endpoints(a: &Candidate, b: &Candidate, sep_m: f64) -> bool {
+    haversine(a.start, b.start) < sep_m && haversine(a.end, b.end) < sep_m
+}
+
+/// Rank and take the top `n` routes that differ in path, not just in
+/// endpoints: a route is a duplicate when more than `max_shared` of its
+/// length runs over edges an already-kept route uses. For A/B, where every
+/// alternative shares both endpoints.
+pub fn rank_dedup_routes(mut scored: Vec<Scored>, n: usize, max_shared: f64) -> Vec<Scored> {
+    scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+    let mut out: Vec<Scored> = Vec::with_capacity(n);
+    let mut kept_edges: Vec<HashSet<(NodeIndex, NodeIndex)>> = Vec::with_capacity(n);
+    for s in scored {
+        if out.len() >= n {
+            break;
+        }
+        let nodes = &s.route.node_indices;
+        let edge = |i: usize| {
+            let (a, b) = (nodes[i], nodes[i + 1]);
+            (a.min(b), a.max(b))
+        };
+        let seg_m = |i: usize| haversine(s.route.points[i], s.route.points[i + 1]);
+        let total: f64 = (0..nodes.len().saturating_sub(1)).map(seg_m).sum();
+        let dup = kept_edges.iter().any(|kept| {
+            let shared: f64 = (0..nodes.len().saturating_sub(1))
+                .filter(|&i| kept.contains(&edge(i)))
+                .map(seg_m)
+                .sum();
+            total <= 0.0 || shared > max_shared * total
+        });
+        if !dup {
+            kept_edges.push((0..nodes.len().saturating_sub(1)).map(edge).collect());
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// How many of `scored` survive [`rank_dedup_top`]'s endpoint dedup: the
+/// number of distinct results a search has found so far.
+pub fn count_distinct(scored: &[&Scored], min_sep_km: f64) -> usize {
+    let mut by_score = scored.to_vec();
+    by_score.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+    let sep_m = min_sep_km * 1000.0;
+    let mut kept: Vec<&Scored> = Vec::new();
+    for s in by_score {
+        if !kept
+            .iter()
+            .any(|k| same_endpoints(&k.candidate, &s.candidate, sep_m))
+        {
+            kept.push(s);
+        }
+    }
+    kept.len()
 }
 
 /// Fill in elevation profiles for each surviving candidate. Soft-fails if
@@ -900,6 +995,7 @@ fn fmt_m(v: f64) -> String {
 mod tests {
     use super::*;
     use crate::osm::{BCLASS_RESIDENTIAL, MODE_FOOT, SURFACE_PAVED};
+    use crate::viability::Report;
     use geo::{Coord, LineString, MultiPolygon, Polygon};
     use petgraph::graph::UnGraph;
 
@@ -962,6 +1058,67 @@ mod tests {
                 vec![],
             )]),
         }
+    }
+
+    /// A routed result over `nodes`: ids below 100 sit along the equator,
+    /// 100 and up on a parallel row ~55 m north, 0.001° (~111 m) apart.
+    fn routed(nodes: &[usize], score: f64) -> Scored {
+        let at = |i: usize| match i {
+            0..=99 => LatLon::new(0.0, i as f64 * 0.001),
+            _ => LatLon::new(0.0005, (i - 100) as f64 * 0.001),
+        };
+        let points: Vec<LatLon> = nodes.iter().map(|&i| at(i)).collect();
+        Scored {
+            candidate: Candidate::from_endpoints(points[0], *points.last().unwrap()),
+            route: RouteResult {
+                total_length_m: points.windows(2).map(|w| haversine(w[0], w[1])).sum(),
+                points,
+                edges: Vec::new(),
+                node_indices: nodes.iter().map(|&i| NodeIndex::new(i)).collect(),
+            },
+            report: Report {
+                total_km: 0.0,
+                max_deviation_m: 0.0,
+                avg_deviation_m: 0.0,
+                foot_km: 0.0,
+                bike_km: 0.0,
+                mtb_km: 0.0,
+                ferry_km: 0.0,
+                surface_km: [0.0; 6],
+                violations: Vec::new(),
+                long_edges: Vec::new(),
+            },
+            score,
+            elevation: None,
+            corridor_used_m: 0.0,
+        }
+    }
+
+    #[test]
+    fn alternatives_dedup_by_shared_path() {
+        let straight: Vec<usize> = (0..=10).collect();
+        // Same road but for a ~180 m jog at the end: 85 % shared.
+        let jog: Vec<usize> = (0..=9).chain([110, 10]).collect();
+        // The parallel row all the way: shares no edge.
+        let parallel: Vec<usize> = [0].into_iter().chain(101..=109).chain([10]).collect();
+        let kept = rank_dedup_routes(
+            vec![
+                routed(&parallel, 3.0),
+                routed(&jog, 2.0),
+                routed(&straight, 1.0),
+            ],
+            5,
+            0.8,
+        );
+        let scores: Vec<f64> = kept.iter().map(|s| s.score).collect();
+        assert_eq!(scores, [1.0, 3.0]);
+        // Endpoint dedup would have merged all three: they share A and B.
+        let all = [
+            routed(&straight, 1.0),
+            routed(&jog, 2.0),
+            routed(&parallel, 3.0),
+        ];
+        assert_eq!(count_distinct(&all.iter().collect::<Vec<_>>(), 0.5), 1);
     }
 
     #[test]

@@ -35,14 +35,17 @@ In the browser:
 1. Pick how you travel — **activity** (hike, road bike, paved only, gravel /
    MTB, …) and **corridor width** — then a mode tab.
 2. **A/B**: click the map to drop **A** (blue), click again for **B** (red),
-   then hit **"Find routes A → B"** — up to 3 alternatives, from loose to
-   strict.
+   then hit **"Find routes A → B"** — up to 5 alternatives, from loose to
+   strict, each taking a noticeably different way (routes sharing over 80 %
+   of their length with a better one are dropped).
 3. **Country**: **cross the country** (default) suggests lines from border to
    border on opposite sides — the endpoints are the outermost roads of the
    loaded map, so every suggestion is a real crossing. **Any line, about N
-   km** samples lines anywhere instead. The 8 easiest come back as cards;
-   if nothing fits the corridor, slightly wider-corridor alternatives are
-   listed separately.
+   km** samples lines anywhere instead, with both ends near a road your
+   activity can use. The search keeps drawing fresh lines until 12 distinct
+   ones fit the corridor (or its budget runs out), and the 12 easiest come
+   back as cards; if nothing fits the corridor, slightly wider-corridor
+   alternatives are listed separately.
 4. **Shapes** traces a loop (circle, heart, Swiss outline, …) of a given
    length; **Text** writes a message with routes. Lengths and letter sizes
    default to fit the loaded region.
@@ -160,9 +163,11 @@ allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
    labels every node with its component, and an `rstar::RTree` indexes node
    coordinates. Both are reused across all subsequent routing queries.
 4. **Endpoint snapping** (`Graph::closest_connected_pair`) — for an A → B
-   query, take the K=30 nearest nodes to each endpoint via the R-tree, keep
-   the cheapest pair whose components match. Catches the common OSM case
-   where naïve closest-node would put A and B on different islands.
+   query, take the K=30 nearest nodes to each endpoint that the activity can
+   use (an edge open to its modes, paved for *paved only*) via the R-tree,
+   and keep the cheapest pair whose components match. Catches the common OSM
+   case where naïve closest-node would put A and B on different islands, or
+   start a road bike on a footpath it can never leave.
 5. **A\* routing** (`src/route.rs`) — a custom A\* with a haversine
    heuristic. Edge cost = `length · (1 + α · (deviation/half_width)²)` plus
    bike class / surface / turn / slope terms; deviation is computed at the
@@ -174,8 +179,9 @@ allows 1 call/sec and 1000 calls/day; one batch covers up to 100 points.
    A\* searches via rayon; on a multicore box this is the dominant speedup
    for country mode.
 7. **Scoring** — `100·(real/ref − 1) + 5·long-edge km + 8·max-dev km`
-   (lower = easier). After ranking, deduplicate near-duplicates by
-   start+end proximity (8 km separation for country, 0.5 km for between).
+   (lower = easier). After ranking, deduplicate near-duplicates: country
+   lines by start+end proximity (8 km), shapes by centre, A/B alternatives
+   (which all share their ends) by shared path length.
 8. **Surface + elevation** (`src/viability.rs`, `src/elevation.rs`) — surface
    km per category accumulated from edge tags. Elevation is sampled along
    the routed polyline from the in-memory DEM, or from OpenTopoData with an

@@ -275,7 +275,9 @@ fn graph_cache_round_trip_on_real_data() {
         LatLon::new(MALBUN[0], MALBUN[1]),
     );
     let route_on = |g: &Graph| {
-        let (s, e, _, _) = g.closest_connected_pair(a, b).unwrap();
+        let (s, e, _, _) = g
+            .closest_connected_pair(a, b, params.modes, params.paved_only)
+            .unwrap();
         route::shortest(g, s, e, a, b, &params).unwrap().points
     };
     assert_eq!(
